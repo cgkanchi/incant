@@ -102,6 +102,7 @@ def ensure_bootstrap_admin(session: Session, raw_key: str) -> None:
     pid = "p_bootstrap_admin"
     if session.get(models.Principal, pid) is None:
         session.add(models.Principal(id=pid, kind="service", subject="bootstrap", name="bootstrap-admin"))
+        session.flush()  # parent row must exist before FK-bearing children insert
     session.add(models.ApiKey(
         principal_id=pid, prefix=key_prefix(raw_key), hash=hash_key(raw_key), name="bootstrap admin",
     ))

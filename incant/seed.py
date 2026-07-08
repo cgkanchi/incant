@@ -181,6 +181,7 @@ def seed() -> str:
         if s.get(models.Principal, pid) is None:
             s.add(models.Principal(id=pid, kind="service", subject="support-service",
                                    name="support-service"))
+            s.flush()  # parent row before FK-bearing children
             s.add(models.ApiKey(principal_id=pid, prefix=key_prefix(raw), hash=hash_key(raw),
                                 name="support renderer"))
             s.add(models.RoleBinding(principal_id=pid, role="renderer",

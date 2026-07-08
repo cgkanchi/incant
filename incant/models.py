@@ -32,7 +32,7 @@ class Project(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)          # == name / top dir
     name: Mapped[str] = mapped_column(String)
     review_policy: Mapped[int] = mapped_column(Integer, default=0)     # approvals to commit
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class Prompt(Base):
@@ -40,7 +40,7 @@ class Prompt(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)          # path, e.g. support/system
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"))
     description: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     versions: Mapped[list["Version"]] = relationship(back_populates="prompt")
 
@@ -55,7 +55,7 @@ class Version(Base):
     status: Mapped[str] = mapped_column(String, default="active")      # active | archived
     notes: Mapped[str] = mapped_column(Text, default="")
     created_by: Mapped[str] = mapped_column(String, default="")
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     prompt: Mapped[Prompt] = relationship(back_populates="versions")
 
@@ -72,7 +72,7 @@ class CommitValidation(Base):
     status: Mapped[str] = mapped_column(String)                        # valid | invalid
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     extracted_variables: Mapped[dict] = mapped_column(JSON, default=dict)
-    validated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    validated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class VariableRefinement(Base):
@@ -111,8 +111,8 @@ class Draft(Base):
     title: Mapped[str] = mapped_column(String, default="")
     author: Mapped[str] = mapped_column(String, default="")
     status: Mapped[str] = mapped_column(String, default="open")        # open | approved | committed | abandoned
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
 class Review(Base):
@@ -121,7 +121,7 @@ class Review(Base):
     draft_id: Mapped[str] = mapped_column(ForeignKey("drafts.id"), index=True)
     reviewer: Mapped[str] = mapped_column(String)
     state: Mapped[str] = mapped_column(String, default="pending")      # pending | approved | changes
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class ReviewComment(Base):
@@ -131,7 +131,7 @@ class ReviewComment(Base):
     author: Mapped[str] = mapped_column(String)
     anchor: Mapped[str] = mapped_column(String, default="")            # "source:4" | "rendered"
     body: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class Environment(Base):
@@ -154,7 +154,7 @@ class PointerMove(Base):
     from_sha: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     to_sha: Mapped[str] = mapped_column(String)
     moved_by: Mapped[str] = mapped_column(String, default="")
-    moved_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    moved_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     comment: Mapped[str] = mapped_column(Text, default="")
 
 
@@ -175,7 +175,7 @@ class KillSwitch(Base):
     prompt_id: Mapped[str] = mapped_column(String, index=True)
     engaged: Mapped[bool] = mapped_column(Boolean, default=False)
     by: Mapped[str] = mapped_column(String, default="")
-    at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class Segment(Base):
@@ -209,7 +209,7 @@ class RuleRevision(Base):
     kind: Mapped[str] = mapped_column(String)                           # rule | segment | pointer | default | kill
     snapshot: Mapped[Any] = mapped_column(JSON)
     actor: Mapped[str] = mapped_column(String, default="")
-    at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     comment: Mapped[str] = mapped_column(Text, default="")
 
 
@@ -220,7 +220,7 @@ class Remote(Base):
     auth_ref: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     last_pushed_sha: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    last_push_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+    last_push_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Principal(Base):
@@ -229,7 +229,7 @@ class Principal(Base):
     kind: Mapped[str] = mapped_column(String)                           # user | service
     subject: Mapped[str] = mapped_column(String, index=True)            # OIDC subject / key label
     name: Mapped[str] = mapped_column(String, default="")
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class ApiKey(Base):
@@ -239,8 +239,8 @@ class ApiKey(Base):
     prefix: Mapped[str] = mapped_column(String, index=True)             # incant_sk_xxxx lookup prefix
     hash: Mapped[str] = mapped_column(String)                           # salted hash of full key
     name: Mapped[str] = mapped_column(String, default="")
-    expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
-    last_used_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -261,7 +261,7 @@ class Approval(Base):
     proposed_by: Mapped[str] = mapped_column(String)
     approved_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, default="pending")      # pending | approved | rejected
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class AuditLog(Base):
@@ -273,4 +273,4 @@ class AuditLog(Base):
     object_id: Mapped[str] = mapped_column(String)
     before: Mapped[Any] = mapped_column(JSON, nullable=True)
     after: Mapped[Any] = mapped_column(JSON, nullable=True)
-    at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now, index=True)
+    at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)

@@ -21,10 +21,17 @@ _SessionLocal: sessionmaker | None = None
 
 def _make_engine():
     url = get_settings().database_url
-    kwargs: dict = {"future": True}
+    kwargs: dict = {"future": True, "pool_pre_ping": True}
     if url.startswith("sqlite"):
-        # Allow use across FastAPI's threadpool; serialize writes at the app layer.
+        # SQLite is supported only for isolated single-process unit tests, never
+        # for serving — its serialized writer masks the concurrency this app is
+        # built for. FastAPI runs sync endpoints in a threadpool, so allow the
+        # connection to cross threads.
         kwargs["connect_args"] = {"check_same_thread": False}
+    else:
+        # Real pool for the multi-user control plane. Sized for a threadpool plus
+        # headroom; pre-ping survives Postgres restarts.
+        kwargs.update(pool_size=10, max_overflow=20, pool_recycle=1800)
     return create_engine(url, **kwargs)
 
 

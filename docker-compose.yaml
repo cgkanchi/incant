@@ -21,6 +21,7 @@ services:
       retries: 12
   db:
     image: postgres:17
+    ports: ["5432:5432"]                           # host access for tests/psql
     volumes: [pgdata:/var/lib/postgresql/data]
     environment:
       POSTGRES_DB: incant

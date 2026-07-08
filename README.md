@@ -15,16 +15,27 @@ See [DESIGN.md](./DESIGN.md) for the full design. This repository implements it.
 - **Memory is the serving plane.** Compiled templates + rule snapshots; the render
   path touches no git, no disk, no DB.
 
-## Quick start
+## Quick start (Docker + Postgres)
+
+Incant is multi-user from the ground up: the control plane runs on **Postgres**, not
+SQLite (SQLite's serialized writer masks the concurrency this app is built for). The
+supported way to run it is Docker Compose, which brings up the app plus Postgres:
 
 ```bash
-uv sync
-uv run incant seed         # seed the example dataset (prints a renderer key)
-uv run incant serve        # API + UI on http://localhost:8080
+docker compose up -d --build
+docker compose exec incant uv run incant seed   # example dataset (prints a renderer key)
 ```
 
 Open <http://localhost:8080> for the UI. The bootstrap admin key is
 `incant_sk_dev_admin` (override with `INCANT_BOOTSTRAP_ADMIN_KEY`).
+
+To run outside Docker, point `INCANT_DATABASE_URL` at a Postgres you manage:
+
+```bash
+uv sync
+INCANT_DATABASE_URL=postgresql+psycopg://incant:incant@localhost:5432/incant \
+  uv run incant serve
+```
 
 Render a prompt:
 
@@ -64,15 +75,23 @@ fragment — `versions` map + `rules_version` is the reproducibility tuple.
 
 ## Testing
 
+Pure-logic tests run anywhere. The DB-touching tests default to a throwaway SQLite
+file for a quick local pass, but the real target is Postgres — point
+`INCANT_TEST_DATABASE_URL` at one (the compose `db` publishes `localhost:5432`) to run
+the full suite, including the concurrency tests that prove no lost `rules_version`
+bumps under parallel writes:
+
 ```bash
-uv run pytest          # 63 tests: core semantics, git store, end-to-end, HTTP API
+uv run pytest                                    # quick local pass
+INCANT_TEST_DATABASE_URL=postgresql+psycopg://incant:incant@localhost:5432/incant \
+  uv run pytest                                  # full suite incl. concurrency (65 tests)
 ```
 
 ## Config (`INCANT_*` env vars)
 
 | Var | Default | Meaning |
 |---|---|---|
-| `INCANT_DATABASE_URL` | `sqlite:///./incant.db` | control plane (Postgres in prod) |
+| `INCANT_DATABASE_URL` | `postgresql+psycopg://incant:incant@localhost:5432/incant` | control plane (Postgres) |
 | `INCANT_REPO_PATH` | `./var/repo` | canonical bare git repo |
 | `INCANT_DEFAULT_ENVIRONMENT` | `prod` | default serving environment |
 | `INCANT_MODE` | `full` | `full` (API + mgmt + UI) or `serve` (read-only) |

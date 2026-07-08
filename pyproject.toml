@@ -11,12 +11,10 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
     "prometheus-client>=0.21",
     "python-multipart>=0.0.12",
 ]
-
-[project.optional-dependencies]
-postgres = ["psycopg[binary]>=3.2"]
 
 [dependency-groups]
 dev = [

@@ -757,6 +757,7 @@ def create_key(
     pid = "p_" + uuid.uuid4().hex[:8]
     session.add(models.Principal(id=pid, kind="service", subject=req.principal_name,
                                  name=req.principal_name))
+    session.flush()  # parent row before FK-bearing children
     session.add(models.ApiKey(principal_id=pid, prefix=key_prefix(raw), hash=hash_key(raw),
                               name=req.principal_name))
     session.add(models.RoleBinding(principal_id=pid, role=req.role,

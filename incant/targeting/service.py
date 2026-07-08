@@ -44,12 +44,17 @@ class TargetingService:
 
     def _bump(self, env: models.Environment, kind: str, snapshot: dict,
               rule_id: str | None = None, comment: str = "") -> int:
-        env.rules_version += 1
+        # Atomic increment at the database, not a Python read-modify-write: two
+        # operators mutating targeting concurrently must both advance the counter.
+        # Assigning a SQL expression emits `SET rules_version = rules_version + 1`,
+        # which Postgres serializes under the row lock (no lost update).
+        env.rules_version = models.Environment.rules_version + 1
         self.s.add(models.RuleRevision(
             environment_id=env.id, rule_id=rule_id, kind=kind,
             snapshot=snapshot, actor=self.actor, comment=comment,
         ))
         self.s.flush()
+        self.s.refresh(env)  # load the DB-computed value back onto the instance
         return env.rules_version
 
     def is_validated(self, sha: str) -> bool:

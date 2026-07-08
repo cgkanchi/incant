@@ -10,8 +10,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="INCANT_", env_file=".env", extra="ignore")
 
-    # Storage
-    database_url: str = "sqlite:///./incant.db"
+    # Storage. Postgres is the control plane — Incant is multi-user from the ground
+    # up, and a real connection pool is where concurrency bugs surface (SQLite's
+    # serialized writer hides them). Point this at your Postgres; docker-compose
+    # wires the bundled `db` service automatically.
+    database_url: str = "postgresql+psycopg://incant:incant@localhost:5432/incant"
     repo_path: str = "./var/repo"          # canonical git repository (bare)
 
     # Serving

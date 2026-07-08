@@ -10,18 +10,21 @@ from incant.config import Settings, set_settings
 from incant.seed import seed
 from incant.service import reset_app
 
+from .conftest import db_url_for, reset_schema
+
 ADMIN = "incant_sk_dev_admin"
 
 
 @pytest.fixture()
 def client(tmp_path):
     set_settings(Settings(
-        database_url=f"sqlite:///{tmp_path/'incant.db'}",
+        database_url=db_url_for(tmp_path),
         repo_path=str(tmp_path / "repo"),
         bootstrap_admin_key=ADMIN,
     ))
     db.reset_engine()
     reset_app()
+    reset_schema()
     renderer_key = seed()
     from incant.server.app import create_app
     with TestClient(create_app()) as c:

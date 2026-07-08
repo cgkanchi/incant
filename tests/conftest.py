@@ -3,9 +3,28 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 
 from incant.core import ContentBlob, EnvSnapshot, VersionInfo
+
+# DB-touching tests run against whatever INCANT_TEST_DATABASE_URL points at (a real
+# Postgres in CI/Docker), falling back to a throwaway SQLite file only for quick
+# local unit runs. Serving always uses Postgres.
+TEST_DATABASE_URL = os.environ.get("INCANT_TEST_DATABASE_URL")
+
+
+def db_url_for(tmp_path) -> str:
+    return TEST_DATABASE_URL or f"sqlite:///{tmp_path/'incant.db'}"
+
+
+def reset_schema() -> None:
+    """Drop + recreate all tables so a shared Postgres is isolated per test."""
+    from incant import models  # noqa: F401 — register tables
+    from incant.db import Base, engine
+
+    Base.metadata.drop_all(engine())
+    Base.metadata.create_all(engine())
 
 
 def blob_sha(source: str) -> str:

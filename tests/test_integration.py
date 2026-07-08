@@ -10,15 +10,18 @@ from incant.db import session_scope
 from incant.registry import ReviewRequired
 from incant.service import AppContext, ServingError, reset_app
 
+from .conftest import db_url_for, reset_schema
+
 
 @pytest.fixture()
 def app(tmp_path):
     set_settings(Settings(
-        database_url=f"sqlite:///{tmp_path/'incant.db'}",
+        database_url=db_url_for(tmp_path),
         repo_path=str(tmp_path / "repo"),
     ))
     db.reset_engine()
     reset_app()
+    reset_schema()
     ctx = AppContext()
     ctx.initialize()
     with session_scope() as s:
