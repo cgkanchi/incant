@@ -37,7 +37,7 @@ from .model import (
     VersionInfo,
 )
 from .parse import parse_condition, parse_rule, parse_segment, parse_serve
-from .render import RenderResult, precompile, render
+from .render import RenderResult, precompile, render, render_source
 from .rollout import bucket_point, pick_band
 from .variables import ExtractedVars, extract
 
@@ -50,5 +50,5 @@ __all__ = [
     "Skip", "Unservable", "UnresolvedPrompt", "VersionInfo",
     "bucket_point", "extract", "parse_condition", "parse_rule",
     "parse_segment", "parse_serve", "pick_band", "precompile", "render",
-    "resolve",
+    "render_source", "resolve",
 ]

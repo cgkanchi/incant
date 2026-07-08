@@ -65,7 +65,7 @@ class _IncantEnvironment(SandboxedEnvironment):
         ctx.contributions[name] = res
         if res.content_fallback:
             ctx.fallback = True
-        blob = ctx.content.get(name, res.commit)
+        blob = ctx.content.get(name, res.version, res.commit)
         base = _compile(self, blob.blob_sha, blob.source, name)
         return _stack_wrapped(base, name)
 
@@ -172,8 +172,44 @@ def render(
     if root.content_fallback:
         ctx.fallback = True
 
-    blob = content.get(prompt_id, root.commit)
-    base = _compile(_ENV, blob.blob_sha, blob.source, prompt_id)
+    blob = content.get(prompt_id, root.version, root.commit)
+    return _render_compiled(ctx, prompt_id, blob.blob_sha, blob.source, variables, defaults, root)
+
+
+def render_source(
+    snapshot: EnvSnapshot,
+    prompt_id: str,
+    source: str,
+    flags: Mapping[str, Any],
+    variables: Mapping[str, Any],
+    content: ContentProvider,
+    *,
+    defaults: Mapping[str, Any] | None = None,
+) -> RenderResult:
+    """Render an explicit top-level ``source`` (e.g. a draft), resolving its
+    ``{% include %}`` targets through targeting. Used for draft/preview renders
+    where the top template is not yet a committed SHA.
+    """
+
+    import hashlib
+
+    ctx = _RenderCtx(snapshot=snapshot, flags=flags, content=content)
+    root = Resolution(prompt_id, 0, "draft", "live", "default", None, None)
+    ctx.contributions[prompt_id] = root
+    blob_sha = "draft:" + hashlib.sha256(source.encode()).hexdigest()[:16]
+    return _render_compiled(ctx, prompt_id, blob_sha, source, variables, defaults, root)
+
+
+def _render_compiled(
+    ctx: _RenderCtx,
+    prompt_id: str,
+    blob_sha: str,
+    source: str,
+    variables: Mapping[str, Any],
+    defaults: Mapping[str, Any] | None,
+    root: Resolution,
+) -> RenderResult:
+    base = _compile(_ENV, blob_sha, source, prompt_id)
     tmpl = _stack_wrapped(base, prompt_id)
 
     render_vars: dict[str, Any] = {}

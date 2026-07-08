@@ -18,7 +18,7 @@ class DictContent:
 
     sources: dict[tuple[str, str], str]
 
-    def get(self, prompt_id: str, commit_sha: str) -> ContentBlob:
+    def get(self, prompt_id: str, version: int, commit_sha: str) -> ContentBlob:
         source = self.sources[(prompt_id, commit_sha)]
         return ContentBlob(blob_sha=blob_sha(source), source=source)
 

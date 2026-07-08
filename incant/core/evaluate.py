@@ -163,7 +163,9 @@ def resolve(
     if skips is None:
         skips = []
 
-    for rule in snap.global_rules():
+    killed = prompt_id in snap.killed
+
+    for rule in () if killed else snap.global_rules():
         if not eval_condition(rule.when, flags, snap.segments):
             continue
         res, reason = _resolve_serve(snap, prompt_id, flags, rule)
@@ -172,7 +174,7 @@ def resolve(
         if reason is not None:
             skips.append(Skip(rule.id, prompt_id, reason))
 
-    for rule in snap.prompt_rules(prompt_id):
+    for rule in () if killed else snap.prompt_rules(prompt_id):
         if not eval_condition(rule.when, flags, snap.segments):
             continue
         res, reason = _resolve_serve(snap, prompt_id, flags, rule)

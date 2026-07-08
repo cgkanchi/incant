@@ -158,6 +158,8 @@ class EnvSnapshot:
     versions: dict[str, dict[int, VersionInfo]] = field(default_factory=dict)
     track_tip: bool = False
     stale: bool = False  # true iff serving frozen at last-known-good (DB outage)
+    # Prompts whose kill switch is engaged: force the environment default, bypass rules.
+    killed: set[str] = field(default_factory=set)
     # (prompt_id, sha) -> bool; default: everything is servable.
     servable: Callable[[str, str], bool] = lambda _p, _s: True
 
@@ -218,10 +220,10 @@ class ContentBlob:
 
 
 class ContentProvider(Protocol):
-    """Maps a resolved (prompt_id, commit_sha) to its template blob + source.
+    """Maps a resolved (prompt_id, version, commit_sha) to its template blob + source.
 
     The git store implements this; tests pass a dict-backed stub. Pure core never
     reads from disk — it only calls this protocol.
     """
 
-    def get(self, prompt_id: str, commit_sha: str) -> ContentBlob: ...
+    def get(self, prompt_id: str, version: int, commit_sha: str) -> ContentBlob: ...
