@@ -66,6 +66,21 @@ def _require(ident: Identity, role: str, *, project=None, environment=None) -> N
         raise HTTPException(status_code=exc.status, detail=exc.detail)
 
 
+def _confirm_lock(session: Session, env: str, expected: str, provided: str | None) -> None:
+    """Guard mutations to a *locked* (protected) environment: the caller must echo
+    `expected` (the prompt id for prompt-scoped acts, the env name for env-scoped
+    ones) in the request's `confirm` field — LaunchDarkly-style type-to-confirm.
+    A no-op for unprotected environments."""
+    e = session.get(models.Environment, env)
+    if e and e.protected and (provided or "").strip() != expected:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "confirmation_required", "environment": env,
+                    "expected": expected,
+                    "message": f"'{env}' is locked — retype '{expected}' to confirm"},
+        )
+
+
 # ── read helpers ─────────────────────────────────────────────────────
 
 def _validated_newest_first(session: Session, prompt_id: str, version: int) -> list[models.CommitValidation]:
@@ -668,6 +683,7 @@ def rollback_targeting(
 ):
     # Rollback can touch global rules, so it needs env-wide operator.
     _require(ident, "operator", environment=env)
+    _confirm_lock(session, env, env, req.confirm)
     tgt = app.targeting(session, ident.name)
     try:
         result = tgt.rollback(env, req.to_rules_version)
@@ -750,6 +766,7 @@ def make_live(
 ):
     # Pointer moves are unilateral and releaser-gated — no propose→approve ceremony.
     _require(ident, "releaser", project=_project_of(req.prompt_id), environment=env)
+    _confirm_lock(session, env, req.prompt_id, req.confirm)
     tgt = app.targeting(session, ident.name)
     try:
         outcome = tgt.make_live(
@@ -773,6 +790,7 @@ def set_default(
     e = session.get(models.Environment, env)
     if e and e.protected:
         _require(ident, "releaser", environment=env)
+    _confirm_lock(session, env, req.prompt_id, req.confirm)
     tgt = app.targeting(session, ident.name)
     tgt.set_default(env, req.prompt_id, req.version_number)
     app.invalidate(env)

@@ -75,6 +75,26 @@ function closeModal() {
   const m = el("modal");
   if (m) m.remove();
 }
+function isLocked() {
+  return !!(State.envs.find((e) => e.id === State.env) || {}).protected;
+}
+// LaunchDarkly-style "type the name to confirm" modal for locked (protected) envs.
+// `body` is trusted HTML — callers must esc() any interpolated values.
+function typeToConfirm({ title, body, token, confirmLabel, act, data }) {
+  const attrs = Object.entries(data || {}).map(([k, v]) => `data-${esc(k)}="${esc(v)}"`).join(" ");
+  return `
+    <h3>${esc(title)}</h3>
+    <p class="hint">${body}</p>
+    <div style="margin:6px 0 2px;font-size:11px;color:var(--faint)">Type <span class="mono" style="color:var(--mut)">${esc(token)}</span> to confirm:</div>
+    <input id="confirmInput" data-token="${esc(token)}" spellcheck="false" autocomplete="off"
+      placeholder="${esc(token)}"
+      style="width:100%;font-family:'IBM Plex Mono',monospace"
+      oninput="var b=document.getElementById('confirmBtn');b.disabled=(this.value.trim()!==this.dataset.token)">
+    <div class="modal-actions">
+      <button class="btn" data-act="closeModal">Cancel</button>
+      <button id="confirmBtn" class="btn primary" disabled data-act="${esc(act)}" ${attrs}>${esc(confirmLabel)}</button>
+    </div>`;
+}
 
 // ── describe rules ───────────────────────────────────────────────────
 const OPSYM = { eq: "=", neq: "≠", in: "∈", not_in: "∉", contains: "⊇", starts_with: "starts", ends_with: "ends",
@@ -557,7 +577,7 @@ async function screenPointers() {
 
   const advance = (vrow.tip_ahead > 0 && vrow.tip_full_sha)
     ? `<button class="tweak-btn" style="width:auto;display:inline-flex" data-act="makeLive" data-sha="${vrow.tip_full_sha}" data-v="${version}">✦ Advance to tip → ${esc(vrow.tip_sha)}</button>
-       <span class="faint" style="font-size:11px">releaser-gated, applied immediately — pointer moves are unilateral</span>`
+       <span class="faint" style="font-size:11px">releaser-gated, applied immediately${State.envs.find((e) => e.id === State.env)?.protected ? " — locked env: type the prompt id to confirm" : " — pointer moves are unilateral"}</span>`
     : `<span style="font-size:12px;color:var(--live);font-weight:600">✓ Tip is live — nothing to advance.</span>`;
 
   el("main").innerHTML = `<div class="screen">
@@ -789,11 +809,20 @@ const Actions = {
     catch (e) { toast(errText(e), true); }
   },
   rollback(ds) {
+    const body = `Restore <b>${esc(State.env)}</b>'s rule set to <span class="mono">rules_version ${esc(ds.rv)}</span>.
+      Rules created after that version are archived (they stop serving). This is itself
+      a change and bumps the rules_version — history stays append-only.`;
+    // A locked env asks you to type the env name; rollback is env-scoped.
+    if (isLocked()) {
+      openModal(typeToConfirm({
+        title: "Roll back targeting", body, token: State.env,
+        confirmLabel: "Roll back to rv" + ds.rv, act: "rollbackConfirm", data: { rv: ds.rv },
+      }));
+      return;
+    }
     openModal(`
       <h3>Roll back targeting</h3>
-      <p class="hint">Restore <b>${esc(State.env)}</b>'s rule set to <span class="mono">rules_version ${esc(ds.rv)}</span>.
-        Rules created after that version are archived (they stop serving). This is itself
-        a change and bumps the rules_version — history stays append-only.</p>
+      <p class="hint">${body}</p>
       <div class="modal-actions">
         <button class="btn" data-act="closeModal">Cancel</button>
         <button class="btn primary" data-act="rollbackConfirm" data-rv="${esc(ds.rv)}">Roll back to rv${esc(ds.rv)}</button>
@@ -801,7 +830,8 @@ const Actions = {
   },
   async rollbackConfirm(ds) {
     try {
-      const r = await POST(`/mgmt/envs/${enc(State.env)}/rollback`, { to_rules_version: parseInt(ds.rv) });
+      const r = await POST(`/mgmt/envs/${enc(State.env)}/rollback`,
+                           { to_rules_version: parseInt(ds.rv), confirm: State.env });
       closeModal();
       toast(`Rolled back to rv${ds.rv} — ${r.rules_changed} rule(s) changed`);
       render();
@@ -812,21 +842,50 @@ const Actions = {
     try { await POST(`/mgmt/envs/${enc(State.env)}/kill?prompt_id=${enc(ds.pid)}`, { engaged: engage }); toast(engage ? "Kill switch engaged" : "Rules restored"); render(); }
     catch (e) { toast(errText(e), true); }
   },
-  async makeLive(ds) {
+  makeLive(ds) {
+    // Pointer moves are unilateral (releaser); a locked env asks you to type the
+    // prompt id first, LaunchDarkly-style.
+    if (isLocked()) {
+      openModal(typeToConfirm({
+        title: "Advance the live pointer",
+        body: `<b>${esc(State.env)}</b> is locked. This immediately changes what <b>${esc(State.route.pid)}</b> serves.`,
+        token: State.route.pid, confirmLabel: "Make live",
+        act: "makeLiveConfirm", data: { sha: ds.sha, v: ds.v },
+      }));
+      return;
+    }
+    Actions.makeLiveConfirm(ds);
+  },
+  async makeLiveConfirm(ds) {
     try {
-      // Pointer moves are unilateral — a releaser advances the pointer directly.
       await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
-        prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha, comment: "make live via UI",
+        prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha,
+        comment: "make live via UI", confirm: State.route.pid,
       });
+      closeModal();
       toast("Pointer advanced — tip is live");
       render();
     } catch (e) { toast(errText(e), true); }
   },
-  async revert(ds) {
+  revert(ds) {
+    if (isLocked()) {
+      openModal(typeToConfirm({
+        title: "Revert the live pointer",
+        body: `<b>${esc(State.env)}</b> is locked. This moves <b>${esc(State.route.pid)}</b> back to a previous version, live.`,
+        token: State.route.pid, confirmLabel: "Revert",
+        act: "revertConfirm", data: { sha: ds.sha, v: ds.v },
+      }));
+      return;
+    }
+    Actions.revertConfirm(ds);
+  },
+  async revertConfirm(ds) {
     try {
       await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
-        prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha, comment: "revert via UI",
+        prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha,
+        comment: "revert via UI", confirm: State.route.pid,
       });
+      closeModal();
       toast("Reverted — pointer moved");
       render();
     } catch (e) { toast(errText(e), true); }

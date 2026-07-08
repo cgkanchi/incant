@@ -29,6 +29,15 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
     review, and commit. Set it `False` (admin `PATCH /mgmt/projects/{id}`, or the
     Review-screen toggle) to require a distinct reviewer. The recorded reviewer is always
     the authenticated principal, never a body-supplied name.
+  - **Locked-env type-to-confirm** (LaunchDarkly-style): a protected environment is a
+    *locked* environment — the high-consequence mutations must echo a confirmation
+    token in the request `confirm` field, or the route returns `409
+    confirmation_required`. Make-live and set-default require the **prompt id**;
+    rollback requires the **env name**. Kill switches, rule edits, and segments stay
+    instant (per the design's low-friction contract). The UI shows a type-the-name modal
+    with the confirm button disabled until the text matches. `_confirm_lock` is a
+    route-level guard only — internal service calls (track_tip auto-advance, seed) are
+    unaffected.
 
 - **Batch 1 — P0 one-liners (done)**: git commit dates now real wall-clock, pinned
   only under the `INCANT_FIXED_GIT_DATE` test hook (§1.3); `commit_version` writes

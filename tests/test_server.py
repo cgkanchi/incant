@@ -60,14 +60,40 @@ def test_releaser_moves_pointer_directly(client):
     sha = _tip_sha(client)
     rel = make_key(client, "releaser", env="prod")
     # Pointer moves are unilateral — a releaser advances the live pointer directly,
-    # no propose→approve ceremony.
+    # no propose→approve ceremony. prod is locked, so echo the prompt id to confirm.
     r = client.post("/mgmt/envs/prod/pointers",
-                    json={"prompt_id": "support/system", "version_number": 2, "to_sha": sha},
+                    json={"prompt_id": "support/system", "version_number": 2,
+                          "to_sha": sha, "confirm": "support/system"},
                     headers=auth(rel))
     assert r.status_code == 200 and r.json()["status"] == "live", r.text
     tl = client.get("/mgmt/envs/prod/pointers?prompt_id=support/system&version=2",
                     headers=auth()).json()
     assert tl["moves"][0]["full_sha"] == sha
+
+
+def test_locked_env_requires_typed_confirmation(client):
+    sha = _tip_sha(client)
+    base = {"prompt_id": "support/system", "version_number": 2, "to_sha": sha}
+    # No confirm on locked prod -> refused with a confirmation-required error.
+    r = client.post("/mgmt/envs/prod/pointers", json=base, headers=auth())
+    assert r.status_code == 409 and r.json()["detail"]["error"] == "confirmation_required"
+    assert r.json()["detail"]["expected"] == "support/system"
+    # Wrong token -> still refused.
+    r = client.post("/mgmt/envs/prod/pointers", json={**base, "confirm": "prod"}, headers=auth())
+    assert r.status_code == 409
+    # Correct token (the prompt id) -> applied.
+    r = client.post("/mgmt/envs/prod/pointers", json={**base, "confirm": "support/system"},
+                    headers=auth())
+    assert r.status_code == 200 and r.json()["status"] == "live", r.text
+
+
+def test_unlocked_env_needs_no_confirmation(client):
+    # staging is not protected -> pointer move applies with no confirm token.
+    sha = _tip_sha(client)
+    r = client.post("/mgmt/envs/staging/pointers",
+                    json={"prompt_id": "support/system", "version_number": 2, "to_sha": sha},
+                    headers=auth())
+    assert r.status_code == 200 and r.json()["status"] == "live", r.text
 
 
 def test_operator_cannot_move_pointer(client):
@@ -202,10 +228,11 @@ def test_tweak_flow_over_http(client):
     new_sha = r.json()["full_sha"]
 
     # 4. make live directly — pointer moves are unilateral and releaser-gated
-    # (admin implies releaser); no force, no approval ceremony.
+    # (admin implies releaser). prod is locked, so confirm with the prompt id.
     r = client.post("/mgmt/envs/prod/pointers",
                     json={"prompt_id": "support/system", "version_number": 2,
-                          "to_sha": new_sha, "comment": "tweak live"},
+                          "to_sha": new_sha, "comment": "tweak live",
+                          "confirm": "support/system"},
                     headers=auth())
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "live"
@@ -259,12 +286,13 @@ def test_create_new_prompt_flow(client):
     assert r.status_code == 200, r.text
     sha = r.json()["full_sha"]
 
-    # Make it live + default, then it serves.
+    # Make it live + default (prod is locked -> confirm with the prompt id), then it serves.
     client.post("/mgmt/envs/prod/defaults",
-                json={"prompt_id": "growth/welcome", "version_number": 1}, headers=auth())
+                json={"prompt_id": "growth/welcome", "version_number": 1,
+                      "confirm": "growth/welcome"}, headers=auth())
     client.post("/mgmt/envs/prod/pointers",
                 json={"prompt_id": "growth/welcome", "version_number": 1,
-                      "to_sha": sha}, headers=auth())
+                      "to_sha": sha, "confirm": "growth/welcome"}, headers=auth())
     r = client.post("/prompt/growth/welcome", json={"variables": {"name": "Kai"}}, headers=auth())
     assert r.status_code == 200 and r.json()["prompt"] == "Welcome, Kai!"
 

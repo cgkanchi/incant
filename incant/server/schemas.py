@@ -102,6 +102,7 @@ class SegmentRequest(BaseModel):
 
 class RollbackRequest(BaseModel):
     to_rules_version: int
+    confirm: Optional[str] = None  # locked env: must echo the env name
 
 
 class PointerRequest(BaseModel):
@@ -109,11 +110,13 @@ class PointerRequest(BaseModel):
     version_number: int
     to_sha: str
     comment: str = ""
+    confirm: Optional[str] = None  # locked env: must echo the prompt id
 
 
 class DefaultRequest(BaseModel):
     prompt_id: str
     version_number: int
+    confirm: Optional[str] = None  # locked env: must echo the prompt id
 
 
 class KillRequest(BaseModel):
