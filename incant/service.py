@@ -8,7 +8,7 @@ is unreachable, serving continues on the last-known-good snapshot with
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from sqlalchemy import select
@@ -84,12 +84,12 @@ class AppContext:
             return cached.snapshot
         except SQLAlchemyError:
             # DB unreachable — freeze on last-known-good targeting (stale_rules).
+            # Return a stale-flagged *copy*; never mutate the cached snapshot, so
+            # the flag clears automatically once the DB recovers.
             cached = self._snapshots.get(env_id)
             if cached is None:
                 raise ServingError(503, "node not ready: no cached targeting")
-            frozen = cached.snapshot
-            frozen.stale = True
-            return frozen
+            return replace(cached.snapshot, stale=True)
 
     def invalidate(self, env_id: str | None = None) -> None:
         if env_id is None:

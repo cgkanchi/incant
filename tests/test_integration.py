@@ -47,6 +47,49 @@ def _author_version(ctx, prompt_id, version, content, *, seed=None, make_live=Tr
     return outcome
 
 
+def test_rule_cannot_be_captured_across_environments(app):
+    from incant.targeting.service import TargetingError
+
+    with session_scope() as s:
+        s.add(models.Environment(id="staging", name="staging", protected=False, track_tip=False))
+    # A rule 'r1' lives in prod.
+    with session_scope() as s:
+        app.targeting(s, "op").upsert_rule("prod", {
+            "id": "r1", "scope": "prompt", "prompt_id": "support/system",
+            "priority": 1, "when": None, "serve": {"version": 1}})
+    # An operator scoped to staging cannot edit or archive the prod rule via staging.
+    with session_scope() as s:
+        with pytest.raises(TargetingError):
+            app.targeting(s, "op").upsert_rule("staging", {
+                "id": "r1", "scope": "prompt", "prompt_id": "support/system",
+                "priority": 9, "when": None, "serve": {"version": 1}})
+    with session_scope() as s:
+        with pytest.raises(TargetingError):
+            app.targeting(s, "op").set_rule_status("staging", "r1", "archived")
+    with session_scope() as s:
+        r = s.get(models.Rule, "r1")
+        assert r.environment_id == "prod" and r.priority == 1 and r.status == "active"
+
+
+def test_stale_flag_clears_after_db_recovery(app):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    with session_scope() as s:
+        primed = app.get_snapshot(s, "prod")
+    assert primed.stale is False
+
+    class BoomSession:
+        def get(self, *a, **k):
+            raise SQLAlchemyError("db down")
+
+    frozen = app.get_snapshot(BoomSession(), "prod")
+    assert frozen.stale is True  # serving continues on a stale-flagged copy
+
+    with session_scope() as s:
+        recovered = app.get_snapshot(s, "prod")
+    assert recovered.stale is False  # flag clears once the DB is back (no sticky mutation)
+
+
 def test_full_loop_render(app):
     _author_version(app, "shared/style/language-rules", 1, "Write in plain English.")
     _author_version(

@@ -5,9 +5,13 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from incant import db
+import datetime as dt
+
+from incant import db, models
 from incant.config import Settings, set_settings
+from incant.db import session_scope
 from incant.seed import seed
+from incant.server.auth import hash_key, key_prefix
 from incant.service import reset_app
 
 from .conftest import db_url_for, reset_schema
@@ -220,6 +224,26 @@ def test_rendered_diff_missing_vars_is_graceful_not_500(client):
     r = client.get(f"/mgmt/prompts/support/novars/diff?{q}", headers=auth())
     assert r.status_code == 200
     assert "error" in r.json()  # graceful render-failed note, not a 500
+
+
+def test_expired_key_is_rejected(client):
+    raw = "incant_sk_expired_000000000000000000"
+    with session_scope() as s:
+        s.add(models.Principal(id="p_exp", kind="service", subject="exp", name="exp"))
+        s.flush()
+        s.add(models.ApiKey(principal_id="p_exp", prefix=key_prefix(raw), hash=hash_key(raw),
+                            name="exp",
+                            expires_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)))
+        s.add(models.RoleBinding(principal_id="p_exp", role="admin"))
+    r = client.get("/mgmt/overview?environment=prod", headers=auth(raw))
+    assert r.status_code == 401
+
+
+def test_unknown_environment_is_404_not_500(client):
+    r = client.post("/evaluate", json={"flags": {}, "environment": "ghost"}, headers=auth())
+    assert r.status_code == 404, r.text
+    r = client.get("/prompts?environment=ghost", headers=auth())
+    assert r.status_code == 404, r.text
 
 
 def test_kill_switch_over_http(client):

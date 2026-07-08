@@ -79,6 +79,11 @@ class TargetingService:
         parse_core_rule({**rule, "id": rule.get("id", "tmp")})
         rid = rule["id"]
         existing = self.s.get(models.Rule, rid)
+        if existing is not None and existing.environment_id != env_id:
+            # Rule ids are globally unique; refuse to edit a rule that lives in
+            # another environment via this env's URL (cross-env capture).
+            raise TargetingError(
+                f"rule {rid!r} belongs to environment {existing.environment_id!r}, not {env_id!r}")
         if existing is None:
             existing = models.Rule(id=rid, environment_id=env_id)
             self.s.add(existing)
@@ -98,8 +103,8 @@ class TargetingService:
     def set_rule_status(self, env_id: str, rule_id: str, status: str) -> models.Rule:
         env = self._env(env_id)
         r = self.s.get(models.Rule, rule_id)
-        if r is None:
-            raise TargetingError(f"unknown rule {rule_id!r}")
+        if r is None or r.environment_id != env_id:
+            raise TargetingError(f"unknown rule {rule_id!r} in {env_id!r}")
         before = _rule_snapshot(r)
         r.status = status
         self.s.flush()

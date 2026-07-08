@@ -83,7 +83,15 @@ def authenticate(session: Session, authorization: str | None) -> Identity:
     if key is None or key.hash != hash_key(raw):
         raise AuthError(401, "invalid credential")
     import datetime as dt
-    key.last_used_at = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.timezone.utc)
+    if key.expires_at is not None:
+        # SQLite returns naive datetimes; treat stored times as UTC.
+        exp = key.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=dt.timezone.utc)
+        if exp <= now:
+            raise AuthError(401, "credential expired")
+    key.last_used_at = now
     bindings = list(session.execute(
         select(models.RoleBinding).where(models.RoleBinding.principal_id == key.principal_id)
     ).scalars())

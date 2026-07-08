@@ -12,12 +12,17 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 
 class GitError(RuntimeError):
     pass
+
+
+class ConcurrentUpdate(GitError):
+    """A ref moved out from under a compare-and-swap update-ref."""
 
 
 @dataclass
@@ -32,6 +37,9 @@ class CommitInfo:
 class GitStore:
     def __init__(self, repo_path: str | os.PathLike) -> None:
         self.repo = Path(repo_path).resolve()
+        # Serialize commits to main within this process so the CAS retry loop only
+        # ever has to defend against *other* processes (uvicorn workers/replicas).
+        self._main_lock = threading.Lock()
 
     # ── low-level git ────────────────────────────────────────────────
 
@@ -83,15 +91,18 @@ class GitStore:
         self._git("update-ref", "refs/heads/main", commit)
 
     def _author_env(self, name: str, email: str) -> dict:
-        # Deterministic committer date for reproducibility in tests; git still
-        # records real wall-clock in normal use if these are unset. We fix them to
-        # a stable epoch so seeded repos are byte-identical across runs.
-        stamp = "1700000000 +0000"
-        return {
-            "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_DATE": stamp,
+        # The acting user is the author; Incant is the committer. Dates are real
+        # wall-clock. A test hook (INCANT_FIXED_GIT_DATE) can pin them so seeded
+        # repos are byte-identical across runs — never set in normal operation.
+        env = {
+            "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
             "GIT_COMMITTER_NAME": "Incant", "GIT_COMMITTER_EMAIL": "incant@localhost",
-            "GIT_COMMITTER_DATE": stamp,
         }
+        stamp = os.environ.get("INCANT_FIXED_GIT_DATE")
+        if stamp:
+            env["GIT_AUTHOR_DATE"] = stamp
+            env["GIT_COMMITTER_DATE"] = stamp
+        return env
 
     # ── reads ────────────────────────────────────────────────────────
 
@@ -150,6 +161,22 @@ class GitStore:
     def _hash_object(self, content: str) -> str:
         return self._git("hash-object", "-w", "--stdin", input=content).strip()
 
+    def _update_ref_cas(self, ref: str, new: str, expected_old: str | None) -> None:
+        """update-ref with an optional expected-old (compare-and-swap)."""
+        args = ["update-ref", ref, new]
+        if expected_old is not None:
+            args.append(expected_old)
+        proc = subprocess.run(
+            ["git", "--git-dir", str(self.repo), *args],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            # With expected_old set, a non-zero exit is (almost always) the ref
+            # having moved concurrently — surface it as retryable.
+            if expected_old is not None:
+                raise ConcurrentUpdate(f"update-ref {ref} CAS failed: {proc.stderr.strip()}")
+            raise GitError(f"update-ref {ref} failed: {proc.stderr.strip()}")
+
     def _commit_file(
         self,
         path: str,
@@ -159,6 +186,7 @@ class GitStore:
         author_name: str,
         author_email: str,
         update_ref: str,
+        expected_old: str | None = None,
     ) -> str:
         """Commit a single file onto ``parent`` via a temporary index. Returns commit sha."""
 
@@ -188,7 +216,7 @@ class GitStore:
             "commit-tree", tree, "-p", parent, "-m", message,
             env=self._author_env(author_name, author_email),
         ).strip()
-        self._git("update-ref", update_ref, commit)
+        self._update_ref_cas(update_ref, commit, expected_old)
         return commit
 
     def commit_version(
@@ -202,7 +230,12 @@ class GitStore:
         message: str,
         draft_id: str | None = None,
     ) -> str:
-        """Commit a version file onto main. Returns the new commit sha."""
+        """Commit a version file onto main. Returns the new commit sha.
+
+        Uses compare-and-swap on ``refs/heads/main``: if a concurrent publisher
+        advances main between our read and write, retry onto the new tip rather
+        than stranding a validated commit unreachable from the branch.
+        """
 
         path = f"{prompt_id}/v{version_number}.j2"
         trailers = [
@@ -212,11 +245,18 @@ class GitStore:
         if draft_id:
             trailers.append(f"Incant-Draft: {draft_id}")
         full_message = message.rstrip() + "\n\n" + "\n".join(trailers) + "\n"
-        parent = self.head()
-        return self._commit_file(
-            path, content, parent, full_message, author_name, author_email,
-            "refs/heads/main",
-        )
+        last: ConcurrentUpdate | None = None
+        with self._main_lock:
+            for _ in range(16):
+                parent = self.head()
+                try:
+                    return self._commit_file(
+                        path, content, parent, full_message, author_name, author_email,
+                        "refs/heads/main", expected_old=parent,
+                    )
+                except ConcurrentUpdate as exc:
+                    last = exc
+        raise last or GitError("commit_version: exhausted CAS retries")
 
     # ── drafts ───────────────────────────────────────────────────────
 

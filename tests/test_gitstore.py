@@ -1,3 +1,5 @@
+import concurrent.futures as cf
+
 from incant.gitstore import ContentStore, GitStore, validate_source
 
 
@@ -5,6 +7,25 @@ def make_store(tmp_path):
     g = GitStore(tmp_path / "repo")
     g.init()
     return g
+
+
+def test_concurrent_commits_all_reachable_from_main(tmp_path):
+    # Compare-and-swap on refs/heads/main: concurrent publishers must not strand a
+    # validated commit unreachable from the branch (prunable by git gc).
+    g = make_store(tmp_path)
+    N = 12
+
+    def commit(i: int):
+        g.commit_version(f"p/a{i}", 1, f"content {i}",
+                         author_name="A", author_email="a@x", message=f"c{i}")
+
+    with cf.ThreadPoolExecutor(max_workers=N) as ex:
+        errs = [f.exception() for f in [ex.submit(commit, i) for i in range(N)]]
+    assert not any(errs), [e for e in errs if e]
+
+    reachable = int(g._git("rev-list", "--count", "main").strip())
+    assert reachable == 1 + N            # initial commit + every version, none lost
+    assert len(g.list_files()) == N
 
 
 def test_init_creates_bare_repo_with_main(tmp_path):

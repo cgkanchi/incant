@@ -6,6 +6,10 @@ import hashlib
 import os
 from dataclasses import dataclass
 
+# Pin git commit dates so seeded test repos are byte-identical across runs.
+# Production uses real wall-clock (this env var is never set there).
+os.environ.setdefault("INCANT_FIXED_GIT_DATE", "1700000000 +0000")
+
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url

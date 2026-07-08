@@ -84,7 +84,10 @@ def evaluate_all(
     ident: Identity = Depends(identity),
 ):
     env = _env(app, req.environment)
-    results = app.evaluate_all(session, env, req.flags)
+    try:
+        results = app.evaluate_all(session, env, req.flags)
+    except ServingError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
     out = {}
     for pid, res in results.items():
         if not ident.has("renderer", project=_project_of(pid), environment=env):
@@ -105,7 +108,10 @@ def list_prompts(
     ident: Identity = Depends(identity),
 ):
     env = _env(app, environment)
-    snap = app.get_snapshot(session, env)
+    try:
+        snap = app.get_snapshot(session, env)
+    except ServingError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
     out = []
     for pid in snap.all_prompt_ids():
         if not ident.has("viewer", project=_project_of(pid), environment=env):
