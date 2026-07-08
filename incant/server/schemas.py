@@ -13,6 +13,9 @@ class RenderRequest(BaseModel):
     flags: dict[str, Any] = Field(default_factory=dict)
     variables: dict[str, Any] = Field(default_factory=dict)
     environment: Optional[str] = None
+    # §9 reproducibility: feed a prior response's `versions` (+ rules_version) back
+    # to replay it exactly. Shape: {"versions": {prompt_id: {"version", "commit"}}}.
+    pin: Optional[dict[str, Any]] = None
 
 
 class EvaluateRequest(BaseModel):
@@ -95,6 +98,10 @@ class RuleStatusRequest(BaseModel):
 class SegmentRequest(BaseModel):
     name: str
     when: Any = None
+
+
+class RollbackRequest(BaseModel):
+    to_rules_version: int
 
 
 class PointerRequest(BaseModel):

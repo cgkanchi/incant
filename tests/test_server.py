@@ -369,6 +369,48 @@ def test_unknown_environment_is_404_not_500(client):
     assert r.status_code == 404, r.text
 
 
+def test_pin_replay_roundtrip(client):
+    # Capture a targeted response (u_12 gets v2@tip via team-x-tip), then replay it
+    # with a pin under DIFFERENT flags — the pin reproduces the exact output (§9).
+    r1 = client.post("/prompt/support/system",
+                     json={"flags": {"user_id": "u_12"},
+                           "variables": {"customer_name": "Acme", "history": []}},
+                     headers=auth(client.renderer_key))
+    b1 = r1.json()
+    assert b1["versions"]["support/system"]["version"] == 2
+
+    pin = {"versions": b1["versions"], "rules_version": b1["rules_version"]}
+    r2 = client.post("/prompt/support/system",
+                     json={"variables": {"customer_name": "Acme", "history": []}, "pin": pin},
+                     headers=auth(client.renderer_key))
+    assert r2.status_code == 200, r2.text
+    b2 = r2.json()
+    # Without the pin these differ (default = v2@live, no fragment); with it they match.
+    assert b2["prompt"] == b1["prompt"]
+    assert b2["versions"]["support/system"]["commit"] == b1["versions"]["support/system"]["commit"]
+
+
+def test_effective_schema_unions_include_closure(client):
+    # §2.10/§4: a fragment's required variable must surface in the parent's schema.
+    reviewer = make_key(client, "editor", project="support")
+
+    def author(pid, content):
+        client.post("/mgmt/prompts", json={"prompt_id": pid}, headers=auth())
+        d = client.post(f"/mgmt/prompts/{pid}/drafts",
+                        json={"version_number": 1, "content": content}, headers=auth()).json()
+        client.post(f"/mgmt/drafts/{d['id']}/review", json={}, headers=auth(reviewer))
+        r = client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth())
+        assert r.json()["validation"]["status"] == "valid", r.text
+
+    author("support/frag", "tone: {{ brand }}")                       # fragment requires brand
+    author("support/parent", 'Hi {{ who }} {% include "support/frag" %}')
+
+    v = client.get("/mgmt/prompts/support/parent/variables?version=1", headers=auth()).json()
+    names = {x["name"]: x for x in v["variables"]}
+    assert "who" in names and "brand" in names                        # union over closure
+    assert names["brand"]["required"] is True                         # surfaced from fragment
+
+
 def test_kill_switch_over_http(client):
     r = client.post("/mgmt/envs/prod/kill?prompt_id=support/system",
                     json={"engaged": True}, headers=auth())

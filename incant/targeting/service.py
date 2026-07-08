@@ -49,12 +49,15 @@ class TargetingService:
         # Assigning a SQL expression emits `SET rules_version = rules_version + 1`,
         # which Postgres serializes under the row lock (no lost update).
         env.rules_version = models.Environment.rules_version + 1
-        self.s.add(models.RuleRevision(
+        rev = models.RuleRevision(
             environment_id=env.id, rule_id=rule_id, kind=kind,
             snapshot=snapshot, actor=self.actor, comment=comment,
-        ))
+        )
+        self.s.add(rev)
         self.s.flush()
         self.s.refresh(env)  # load the DB-computed value back onto the instance
+        rev.rules_version = env.rules_version  # stamp the revision with its version
+        self.s.flush()
         return env.rules_version
 
     def is_validated(self, sha: str) -> bool:
@@ -205,6 +208,71 @@ class TargetingService:
                      f"{env.id}/{prompt_id}/v{version_number}",
                      before={"sha": from_sha}, after={"sha": to_sha})
         return move.id, rv
+
+    # ── revisions & rollback ─────────────────────────────────────────
+
+    def list_revisions(self, env_id: str, limit: int = 100) -> list[models.RuleRevision]:
+        return list(self.s.execute(
+            select(models.RuleRevision).where(models.RuleRevision.environment_id == env_id)
+            .order_by(models.RuleRevision.id.desc()).limit(limit)
+        ).scalars())
+
+    def rollback(self, env_id: str, to_rules_version: int) -> dict:
+        """Restore the environment's *rule* set to its state as of ``to_rules_version``.
+
+        Reconstructs each rule from the latest rule-kind revision at or before the
+        target version; rules first created after the target are archived (so they
+        stop serving). Segments/defaults/pointers/kills are not rolled back here.
+        The rollback is itself a change and bumps ``rules_version``.
+        """
+        env = self._env(env_id)
+        revs = self.s.execute(
+            select(models.RuleRevision).where(
+                models.RuleRevision.environment_id == env_id,
+                models.RuleRevision.kind == "rule",
+                models.RuleRevision.rules_version <= to_rules_version,
+            ).order_by(models.RuleRevision.rules_version, models.RuleRevision.id)
+        ).scalars().all()
+        target: dict[str, dict] = {}
+        for r in revs:
+            if r.rule_id:
+                target[r.rule_id] = r.snapshot
+
+        changed = 0
+        existing = {r.id: r for r in self.list_rules(env_id)}
+        for rid, rule in existing.items():
+            snap = target.get(rid)
+            if snap is None:
+                if rule.status != "archived":
+                    rule.status = "archived"  # created after target -> stop serving
+                    changed += 1
+            else:
+                rule.scope = snap.get("scope", rule.scope)
+                rule.prompt_id = snap.get("prompt_id")
+                rule.priority = snap.get("priority", rule.priority)
+                rule.clauses = snap.get("when")
+                rule.serve = snap.get("serve")
+                rule.status = snap.get("status", "active")
+                rule.comment = snap.get("comment", "")
+                changed += 1
+        # Recreate rules that existed at the target but are somehow gone now.
+        for rid, snap in target.items():
+            if rid not in existing:
+                self.s.add(models.Rule(
+                    id=rid, environment_id=env_id, scope=snap.get("scope", "prompt"),
+                    prompt_id=snap.get("prompt_id"), priority=snap.get("priority", 10),
+                    clauses=snap.get("when"), serve=snap.get("serve"),
+                    status=snap.get("status", "active"), comment=snap.get("comment", ""),
+                ))
+                changed += 1
+        self.s.flush()
+        rv = self._bump(env, "rollback",
+                        {"to_rules_version": to_rules_version, "rules_changed": changed},
+                        comment=f"rollback to rules_version {to_rules_version}")
+        record_audit(self.s, self.actor, "targeting.rollback", "environment", env_id,
+                     after={"to_rules_version": to_rules_version, "rules_changed": changed})
+        return {"to_rules_version": to_rules_version, "rules_changed": changed,
+                "rules_version": rv}
 
     # ── approvals (protected-env propose→approve) ────────────────────
 

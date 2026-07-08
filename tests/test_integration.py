@@ -141,6 +141,75 @@ def test_validation_passes_when_context_supplies_vars(app):
     assert outcome.validation["status"] == "valid", outcome.validation
 
 
+def test_targeting_revisions_and_rollback(app):
+    # §2.4: build up rule history, then roll targeting back to an earlier version.
+    _author_version(app, "support/system", 1, "v1 {{ x }}")
+    _author_version(app, "support/system", 2, "v2 {{ x }}", make_live=False)
+
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.upsert_rule("prod", {"id": "r1", "scope": "prompt", "prompt_id": "support/system",
+                                 "priority": 5, "when": None, "serve": {"version": 1}})
+        rv_after_r1 = s.get(models.Environment, "prod").rules_version
+    # Now add a second rule and edit the first.
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.upsert_rule("prod", {"id": "r2", "scope": "prompt", "prompt_id": "support/system",
+                                 "priority": 1, "when": None, "serve": {"version": 2}})
+        tgt.upsert_rule("prod", {"id": "r1", "scope": "prompt", "prompt_id": "support/system",
+                                 "priority": 9, "when": None, "serve": {"version": 2}})
+
+    # Revisions record each change, stamped with the rules_version.
+    with session_scope() as s:
+        revs = app.targeting(s, "op").list_revisions("prod")
+        assert any(r.rule_id == "r2" for r in revs) and any(r.rule_id == "r1" for r in revs)
+
+    # Roll back to just after r1 was first created: r2 gone (archived), r1 restored.
+    with session_scope() as s:
+        result = app.targeting(s, "op").rollback("prod", rv_after_r1)
+        assert result["rules_changed"] >= 1
+    with session_scope() as s:
+        r1 = s.get(models.Rule, "r1")
+        r2 = s.get(models.Rule, "r2")
+        assert r1.priority == 5 and r1.serve == {"version": 1}  # restored to original
+        assert r2.status == "archived"                           # created after target
+
+
+def test_track_tip_auto_advances_live_pointer(app):
+    # §2.3/§7: staging tracks tips. With a live pointer on staging, a new validated
+    # commit auto-advances the pointer to the new tip.
+    with session_scope() as s:
+        s.add(models.Environment(id="staging", name="staging", protected=False, track_tip=True))
+    _author_version(app, "support/system", 1, "v1a", env="staging")   # default + live on staging
+    with session_scope() as s:
+        first = app.targeting(s, "sam").current_live("staging", "support/system", 1)
+
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        d = reg.create_draft("support/system", version_number=1, author="sam", content="v1b")
+        out = reg.commit_draft(d.id, author="sam")
+
+    with session_scope() as s:
+        advanced = app.auto_advance_tips(s, "sam", "support/system", 1, out.sha)
+    assert "staging" in advanced
+    with session_scope() as s:
+        now = app.targeting(s, "sam").current_live("staging", "support/system", 1)
+    assert now == out.sha and now != first  # pointer followed the new tip
+
+
+def test_track_tip_no_advance_without_live_pointer(app):
+    # No existing live pointer -> nothing to follow, no auto-advance.
+    with session_scope() as s:
+        s.add(models.Environment(id="staging", name="staging", protected=False, track_tip=True))
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        reg.create_prompt("support/x")
+        d = reg.create_draft("support/x", version_number=1, author="sam", content="hi")
+        out = reg.commit_draft(d.id, author="sam")
+    with session_scope() as s:
+        assert app.auto_advance_tips(s, "sam", "support/x", 1, out.sha) == []
+
+
 def test_full_loop_render(app):
     _author_version(app, "shared/style/language-rules", 1, "Write in plain English.")
     _author_version(

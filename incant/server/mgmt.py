@@ -36,6 +36,7 @@ from .schemas import (
     ProjectRequest,
     RefinementRequest,
     ReviewRequest,
+    RollbackRequest,
     RuleRequest,
     RuleStatusRequest,
     SegmentRequest,
@@ -93,11 +94,44 @@ def _current_live(session, env_id, prompt_id, version) -> models.PointerMove | N
     ).scalars().first()
 
 
-def _effective_variables(session, prompt_id, version) -> list[dict]:
-    validated = _validated_newest_first(session, prompt_id, version)
-    ev = validated[0].extracted_variables if validated else {"names": [], "required": [], "optional": []}
-    required = set(ev.get("required", []))
-    names = set(ev.get("names", []))
+def _newest_version(session, prompt_id: str):
+    v = session.execute(
+        select(models.Version).where(models.Version.prompt_id == prompt_id)
+        .order_by(models.Version.number.desc())
+    ).scalars().first()
+    return v.number if v else None
+
+
+def _closure_variables(app, session, prompt_id: str, version: int):
+    """Union the inferred variable sets over the whole static include closure (§4).
+
+    Included fragments are followed at their newest version. Returns
+    ``(names, required)`` where a name is required if any contributor requires it —
+    so a fragment's required variable surfaces in the parent's effective schema.
+    """
+    names: set[str] = set()
+    required: set[str] = set()
+    seen: set[tuple[str, int]] = set()
+
+    def walk(pid: str, ver) -> None:
+        if ver is None or (pid, ver) in seen:
+            return
+        seen.add((pid, ver))
+        source = app.git.read(f"{pid}/v{ver}.j2")
+        if not source:
+            return
+        ev = extract(source)
+        names.update(ev.names)
+        required.update(ev.required)
+        for inc in ev.includes:
+            walk(inc, _newest_version(session, inc))
+
+    walk(prompt_id, version)
+    return names, required
+
+
+def _effective_variables(app, session, prompt_id, version) -> list[dict]:
+    names, required = _closure_variables(app, session, prompt_id, version)
     refinements = {
         r.name: r for r in session.execute(
             select(models.VariableRefinement).where(
@@ -217,7 +251,7 @@ def get_versions(
         "prompt_id": prompt_id,
         "environment": environment,
         "versions": out,
-        "variables": _effective_variables(session, prompt_id, display_v) if display_v else [],
+        "variables": _effective_variables(app, session, prompt_id, display_v) if display_v else [],
         "includes": _includes_of(app, prompt_id, display_v) if display_v else [],
         "display_version": display_v,
     }
@@ -389,6 +423,9 @@ def commit_draft(
     metrics.commits_total.labels(_project_of(d.prompt_id)).inc()
     if outcome.validation["status"] != "valid":
         metrics.validation_failures_total.inc()
+    else:
+        # §7 track_tip: environments that follow tips auto-advance their live pointer.
+        app.auto_advance_tips(session, ident.name, d.prompt_id, d.version_number, outcome.sha)
     app.invalidate()
     return {
         "sha": outcome.sha[:7], "full_sha": outcome.sha,
@@ -427,7 +464,7 @@ def get_variables(
 ):
     _require(ident, "viewer", project=_project_of(prompt_id))
     return {"prompt_id": prompt_id, "version": version,
-            "variables": _effective_variables(session, prompt_id, version)}
+            "variables": _effective_variables(app, session, prompt_id, version)}
 
 
 @router.put("/prompts/{prompt_id:path}/variables")
@@ -442,7 +479,7 @@ def put_variable(
     reg.set_refinement(prompt_id, version, req.name, type=req.type,
                        required=req.required, default=req.default, description=req.description)
     app.invalidate()  # optional-var defaults are folded into snapshots
-    return {"ok": True, "variables": _effective_variables(session, prompt_id, version)}
+    return {"ok": True, "variables": _effective_variables(app, session, prompt_id, version)}
 
 
 @router.get("/prompts/{prompt_id:path}/test-contexts")
@@ -595,6 +632,41 @@ def patch_rule(
         raise HTTPException(404, str(exc))
     app.invalidate(env)
     return {"id": rule_id, "status": req.status}
+
+
+@router.get("/envs/{env}/revisions")
+def get_revisions(
+    env: str, limit: int = 100,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "viewer", environment=env)
+    tgt = app.targeting(session, ident.name)
+    return {"environment": env, "revisions": [
+        {"id": r.id, "rules_version": r.rules_version, "kind": r.kind,
+         "rule_id": r.rule_id, "actor": r.actor, "comment": r.comment,
+         "at": r.at.isoformat(), "snapshot": r.snapshot}
+        for r in tgt.list_revisions(env, limit)
+    ]}
+
+
+@router.post("/envs/{env}/rollback")
+def rollback_targeting(
+    env: str, req: RollbackRequest,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    # Rollback can touch global rules, so it needs env-wide operator.
+    _require(ident, "operator", environment=env)
+    tgt = app.targeting(session, ident.name)
+    try:
+        result = tgt.rollback(env, req.to_rules_version)
+    except TargetingError as exc:
+        raise HTTPException(400, str(exc))
+    app.invalidate(env)
+    return result
 
 
 @router.get("/envs/{env}/segments")

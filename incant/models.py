@@ -207,6 +207,7 @@ class RuleRevision(Base):
     environment_id: Mapped[str] = mapped_column(String, index=True)
     rule_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
     kind: Mapped[str] = mapped_column(String)                           # rule | segment | pointer | default | kill
+    rules_version: Mapped[int] = mapped_column(Integer, default=0, index=True)  # env rules_version after this change
     snapshot: Mapped[Any] = mapped_column(JSON)
     actor: Mapped[str] = mapped_column(String, default="")
     at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)

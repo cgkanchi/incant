@@ -48,6 +48,17 @@ class _RenderCtx:
     stack: list[str] = field(default_factory=list)
     skips: list[Skip] = field(default_factory=list)
     fallback: bool = False
+    # §9 pin replay: prompt_id -> (version, commit). When present, that prompt
+    # resolves to the pinned SHA directly, bypassing all targeting.
+    pin: Mapping[str, tuple[int, str]] = field(default_factory=dict)
+
+
+def _pinned(ctx: _RenderCtx, prompt_id: str) -> Resolution | None:
+    p = ctx.pin.get(prompt_id)
+    if p is None:
+        return None
+    version, commit = p
+    return Resolution(prompt_id, version, commit, "sha", "pin", None, None)
 
 
 _current: contextvars.ContextVar[_RenderCtx | None] = contextvars.ContextVar(
@@ -93,7 +104,7 @@ class _IncantEnvironment(SandboxedEnvironment):
         ctx = _current.get()
         if ctx is None:  # pragma: no cover - defensive
             raise TemplateNotFound(name)
-        res = resolve(ctx.snapshot, name, ctx.flags, skips=ctx.skips)
+        res = _pinned(ctx, name) or resolve(ctx.snapshot, name, ctx.flags, skips=ctx.skips)
         if res.content_fallback:
             ctx.fallback = True
         blob, res = _fetch(ctx, name, res)  # §10 within-version fallback
@@ -238,15 +249,17 @@ def render(
     content: ContentProvider,
     *,
     defaults: Mapping[str, Any] | None = None,
+    pin: Mapping[str, tuple[int, str]] | None = None,
 ) -> RenderResult:
     """Resolve, compile, and render ``prompt_id``. Raises core errors on failure.
 
     ``defaults`` are DB-held values for optional variables, applied pre-render so
-    ``StrictUndefined`` stays on.
+    ``StrictUndefined`` stays on. ``pin`` (prompt_id -> (version, commit)) replays
+    an exact prior response, bypassing targeting for the pinned prompts (§9).
     """
 
-    ctx = _RenderCtx(snapshot=snapshot, flags=flags, content=content)
-    root = resolve(snapshot, prompt_id, flags, skips=ctx.skips)
+    ctx = _RenderCtx(snapshot=snapshot, flags=flags, content=content, pin=pin or {})
+    root = _pinned(ctx, prompt_id) or resolve(snapshot, prompt_id, flags, skips=ctx.skips)
     if root.content_fallback:
         ctx.fallback = True
 

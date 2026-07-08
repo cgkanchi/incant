@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -102,6 +103,25 @@ class AppContext:
                 raise ServingError(503, "node not ready: no cached targeting")
             return replace(cached.snapshot, stale=True)
 
+    def auto_advance_tips(self, session: Session, actor: str, prompt_id: str,
+                          version: int, sha: str) -> list[str]:
+        """§7 track_tip: in environments that track validated tips, advance an
+        *existing* live pointer for (prompt, version) to the new tip. Returns the
+        list of environments advanced."""
+        advanced: list[str] = []
+        envs = session.execute(
+            select(models.Environment).where(models.Environment.track_tip.is_(True))
+        ).scalars().all()
+        for env in envs:
+            tgt = self.targeting(session, actor)
+            if tgt.current_live(env.id, prompt_id, version) is None:
+                continue  # nothing live to follow
+            tgt.make_live(env.id, prompt_id, version, sha,
+                          comment="track_tip auto-advance", force=True)
+            self.invalidate(env.id)
+            advanced.append(env.id)
+        return advanced
+
     def invalidate(self, env_id: str | None = None) -> None:
         if env_id is None:
             self._snapshots.clear()
@@ -166,23 +186,28 @@ class AppContext:
 
     def serve(
         self, session: Session, env_id: str, prompt_id: str,
-        flags: dict, variables: dict,
+        flags: dict, variables: dict, pin: dict | None = None,
     ) -> dict:
         snap = self.get_snapshot(session, env_id)
 
-        # Resolve the root first to gather DB-held defaults for its optional vars.
-        try:
-            root = resolve(snap, prompt_id, flags)
-        except UnresolvedPrompt:
-            raise ServingError(404, f"unknown prompt {prompt_id!r} in {env_id!r}")
-        except Unservable:
-            raise ServingError(409, f"resolved content for {prompt_id!r} is unservable")
+        # Determine the root version — for defaults lookup — honouring a pin (§9).
+        pinned = (pin or {}).get(prompt_id)
+        if pinned is not None:
+            root_version = pinned[0]
+        else:
+            try:
+                root_version = resolve(snap, prompt_id, flags).version
+            except UnresolvedPrompt:
+                raise ServingError(404, f"unknown prompt {prompt_id!r} in {env_id!r}")
+            except Unservable:
+                raise ServingError(409, f"resolved content for {prompt_id!r} is unservable")
 
         # Optional-variable defaults come from the snapshot (no per-request DB read).
-        defaults = snap.refinement_defaults.get((prompt_id, root.version), {})
+        defaults = snap.refinement_defaults.get((prompt_id, root_version), {})
 
         try:
-            result = render(snap, prompt_id, flags, variables, self.content, defaults=defaults)
+            result = render(snap, prompt_id, flags, variables, self.content,
+                            defaults=defaults, pin=pin)
         except MissingVariable as exc:
             raise ServingError(422, str(exc), variable=exc.name)
         except RenderError as exc:

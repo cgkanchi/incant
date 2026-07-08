@@ -161,6 +161,35 @@ def test_sandbox_blocks_attribute_access():
         render(snap, SYS, {}, {}, content)
 
 
+def test_pin_bypasses_targeting():
+    # §9 replay: a pin resolves the prompt to the exact (version, commit), ignoring
+    # rules/defaults/tip.
+    content = DictContent({(SYS, "v1c"): "one {{ n }}", (SYS, "v2c"): "two {{ n }}"})
+    snap = snapshot(
+        versions={SYS: {1: vinfo(1, live="v1c"), 2: vinfo(2, live="v2c")}},
+        defaults={SYS: 2},
+    )
+    assert render(snap, SYS, {}, {"n": "x"}, content).text == "two x"       # default v2
+    r = render(snap, SYS, {}, {"n": "x"}, content, pin={SYS: (1, "v1c")})   # pinned v1
+    assert r.text == "one x"
+    assert r.contributions[SYS].version == 1 and r.contributions[SYS].commit == "v1c"
+
+
+def test_pin_bypasses_include_targeting():
+    content = DictContent({
+        (SYS, "c1"): '[{% include "shared/style/language-rules" %}]',
+        (FRAG, "f1"): "v1-rules", (FRAG, "f2"): "v2-rules",
+    })
+    snap = snapshot(
+        versions={SYS: {1: vinfo(1, live="c1")},
+                  FRAG: {1: vinfo(1, live="f1"), 2: vinfo(2, live="f2")}},
+        defaults={SYS: 1, FRAG: 1},
+    )
+    # Default fragment is v1; pin the fragment to v2.
+    r = render(snap, SYS, {}, {}, content, pin={FRAG: (2, "f2")})
+    assert r.text == "[v2-rules]"
+
+
 def test_within_version_fallback_on_unfetchable_live_content():
     # §1.5/§10: the live SHA is validated (servable=True) but its content is
     # unfetchable (cache lost + store unreachable -> KeyError). Serve the previous

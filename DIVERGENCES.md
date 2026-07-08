@@ -78,10 +78,27 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
   fetched, serve the newest previous-live SHA whose content IS available and flag
   `content_fallback`. Pinned-SHA and tip resolutions never degrade (still 409). Tests
   in `test_render.py`. **All P0 guarantee-breaking bugs (§1.1–§1.7) are now closed.**
-  *Still open in §2 (larger, mostly design phase-4/5 additive):* pin replay (§1.8),
-  targeting revisions/rollback (§2.4), track_tip consumption (§2.3), effective-schema
-  closure in the mgmt API (§2.10 — closure walk already exists in the renderer), plus
-  backup pusher, OIDC, Alembic, and the remaining metrics.
+- **Batch 5b — reproducibility, history, tips, schema (done)** (§1.8, §2.4, §2.3, §2.10):
+  - **pin replay (§1.8)**: `RenderRequest` accepts a `pin` (feed a prior response's
+    `versions` back); the render path resolves pinned prompts to their exact
+    (version, commit), bypassing all targeting — for root and includes. Replay under
+    different flags reproduces the exact output. `X-Incant-Content-Fallback` header is
+    now set when a §10 fallback served.
+  - **revisions + rollback (§2.4)**: `RuleRevision` now carries the `rules_version` it
+    produced; `GET /mgmt/envs/{env}/revisions` exposes the change log, and
+    `POST /mgmt/envs/{env}/rollback` restores the rule set to a prior `rules_version`
+    (reconstruct each rule from its latest snapshot ≤ target; archive rules created
+    after). Rules only — segments/defaults/pointers not yet covered.
+  - **track_tip (§2.3)**: a valid commit auto-advances the live pointer of any version
+    already live in a track_tip environment (`AppContext.auto_advance_tips`, wired into
+    the commit route).
+  - **effective schema (§2.10)**: `_effective_variables` now unions the inferred sets
+    over the whole static include closure, so a fragment's required variable surfaces
+    in the parent's schema instead of only 422-ing at render.
+
+  *Still open in §2 (larger, design phase-4/5 additive):* backup pusher (§2.1), OIDC/
+  sessions (§2.7), key lifecycle endpoints (§2.8), Alembic (§2.11), remaining metrics
+  (§2.12), review comments (§2.15).
 
 ---
 

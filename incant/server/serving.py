@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -33,6 +32,21 @@ def _env(app: AppContext, req_env: str | None) -> str:
     return req_env or app.settings.default_environment
 
 
+def _parse_pin(pin: dict | None) -> dict | None:
+    """Turn a request pin ({"versions": {pid: {version, commit}}}) into the render
+    engine's shape (pid -> (version, commit))."""
+    if not pin:
+        return None
+    versions = pin.get("versions", pin)  # accept the bare versions map too
+    out: dict[str, tuple[int, str]] = {}
+    for pid, entry in (versions or {}).items():
+        try:
+            out[pid] = (int(entry["version"]), str(entry["commit"]))
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(422, f"invalid pin entry for {pid!r}")
+    return out or None
+
+
 @router.post("/prompt/{prompt_id:path}/evaluate")
 def evaluate_prompt(
     prompt_id: str, req: EvaluateRequest,
@@ -57,22 +71,24 @@ def evaluate_prompt(
 
 @router.post("/prompt/{prompt_id:path}")
 def render_prompt(
-    prompt_id: str, req: RenderRequest,
+    prompt_id: str, req: RenderRequest, response: Response,
     app: AppContext = Depends(app_context),
     session: Session = Depends(get_readonly_session),
     ident: Identity = Depends(serving_identity),
 ):
     env = _env(app, req.environment)
     _require_render(ident, prompt_id, env)
+    pin = _parse_pin(req.pin)
     start = time.perf_counter()
     try:
-        resp = app.serve(session, env, prompt_id, req.flags, req.variables)
+        resp = app.serve(session, env, prompt_id, req.flags, req.variables, pin=pin)
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail={"detail": exc.detail, **exc.extra})
     metrics.render_seconds.observe(time.perf_counter() - start)
     metrics.renders_total.labels(prompt_id, env, str(resp["stale_rules"]).lower()).inc()
     if resp["content_fallback"]:
         metrics.content_fallbacks_total.labels(prompt_id, env).inc()
+        response.headers["X-Incant-Content-Fallback"] = "true"
     return resp
 
 
