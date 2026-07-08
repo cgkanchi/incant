@@ -50,7 +50,7 @@ def _author(ctx: AppContext, s, prompt_id, version, content, author, message, *,
     assert out.validation["status"] == "valid", out.validation
     tgt = ctx.targeting(s, author)
     if make_live:
-        tgt.make_live(env, prompt_id, version, out.sha, comment=message, force=True)
+        tgt.make_live(env, prompt_id, version, out.sha, comment=message)
     return out
 
 
@@ -110,7 +110,7 @@ def seed() -> str:
         v3.label = "voice-v2"
         # v3 lives in staging as default via track_tip; make it live there.
         ctx.targeting(s, "Maya").make_live("staging", "support/system", 3, out3.sha,
-                                           comment="v3 to staging", force=True)
+                                           comment="v3 to staging")
 
     with session_scope() as s:
         _author(ctx, s, "support/greeting", 1,
@@ -137,7 +137,7 @@ def seed() -> str:
             models.CommitValidation.version_number == 3,
             models.CommitValidation.status == "valid",
         ).order_by(models.CommitValidation.validated_at.desc())).scalars().first()
-        tgt.make_live("prod", "support/system", 3, v3.sha, comment="v3 pointer for beta rule", force=True)
+        tgt.make_live("prod", "support/system", 3, v3.sha, comment="v3 pointer for beta rule")
         tgt.upsert_rule("prod", {
             "id": "beta-gets-v3", "scope": "prompt", "prompt_id": "support/system",
             "priority": 10, "comment": "Voice v2 beta — EXP-142",

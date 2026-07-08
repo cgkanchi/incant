@@ -35,6 +35,7 @@ from .schemas import (
     KillRequest,
     PointerRequest,
     ProjectRequest,
+    ProjectSettingsRequest,
     RefinementRequest,
     ReviewRequest,
     RollbackRequest,
@@ -307,6 +308,7 @@ def _draft_payload(app, reg, d) -> dict:
     content = reg.draft_content(d.id)
     ev = extract(content)                       # empty content -> empty var set
     val = reg.validate(d.prompt_id, content)    # empty template is valid
+    project = reg.s.get(models.Project, _project_of(d.prompt_id))
     return {
         "id": d.id, "prompt_id": d.prompt_id, "version_number": d.version_number,
         "base_sha": (d.base_sha[:7] if d.base_sha else None),
@@ -314,6 +316,10 @@ def _draft_payload(app, reg, d) -> dict:
         "content": content,
         "variables": ev.as_dict(),
         "lint": {"status": val.status, "error": val.error},
+        "project": _project_of(d.prompt_id),
+        "review_policy": project.review_policy if project else 0,
+        "allow_self_review": project.allow_self_review if project else True,
+        "reviewers": [r.reviewer for r in reg.approvals(d.id)],
     }
 
 
@@ -391,8 +397,9 @@ def review_draft(
         d = reg.get_draft(draft_id)
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
-    # The reviewer is the authenticated principal — never a body-supplied string —
-    # so self-approval (author == reviewer) can't be spoofed.
+    # The reviewer is the authenticated principal — never a body-supplied string.
+    # Self-review is allowed by default (per-project opt-out); either way the
+    # recorded reviewer is the real identity, not a spoofable name.
     _require(ident, "editor", project=_project_of(d.prompt_id))
     reg.add_review(draft_id, reviewer=ident.name, state=req.state)
     return {"draft_id": draft_id, "status": reg.get_draft(draft_id).status,
@@ -555,7 +562,7 @@ def list_envs(
 ):
     return {"environments": [
         {"id": e.id, "protected": e.protected, "track_tip": e.track_tip,
-         "allow_self_approval": e.allow_self_approval, "rules_version": e.rules_version}
+         "rules_version": e.rules_version}
         for e in session.execute(select(models.Environment)).scalars()
     ]}
 
@@ -741,74 +748,18 @@ def make_live(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    # An operator may propose (or directly release in an unprotected env). `force`
-    # is a break-glass direct release even in a protected env — gated to releaser.
-    _require(ident, "operator", project=_project_of(req.prompt_id), environment=env)
-    if req.force:
-        _require(ident, "releaser", environment=env)
+    # Pointer moves are unilateral and releaser-gated — no propose→approve ceremony.
+    _require(ident, "releaser", project=_project_of(req.prompt_id), environment=env)
     tgt = app.targeting(session, ident.name)
     try:
         outcome = tgt.make_live(
-            env, req.prompt_id, req.version_number, req.to_sha,
-            comment=req.comment, force=req.force,
+            env, req.prompt_id, req.version_number, req.to_sha, comment=req.comment,
         )
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
     app.invalidate(env)
     return {"status": outcome.status, "move_id": outcome.move_id,
             "rules_version": outcome.rules_version}
-
-
-@router.get("/envs/{env}/approvals")
-def list_approvals(
-    env: str,
-    app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
-):
-    _require(ident, "viewer", environment=env)
-    e = session.get(models.Environment, env)
-    tgt = app.targeting(session, ident.name)
-    return {"environment": env,
-            "allow_self_approval": bool(e and e.allow_self_approval),
-            "approvals": [
-        {"id": a.id, "change": a.change, "proposed_by": a.proposed_by,
-         "status": a.status, "created_at": a.created_at.isoformat()}
-        for a in tgt.list_pending_approvals(env)
-    ]}
-
-
-@router.post("/envs/{env}/approvals/{approval_id}/approve")
-def approve_change(
-    env: str, approval_id: int,
-    app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
-):
-    _require(ident, "releaser", environment=env)
-    tgt = app.targeting(session, ident.name)
-    try:
-        appr = tgt.approve(approval_id)
-    except TargetingError as exc:
-        raise HTTPException(400, str(exc))
-    app.invalidate(env)
-    return {"id": appr.id, "status": appr.status, "approved_by": appr.approved_by}
-
-
-@router.post("/envs/{env}/approvals/{approval_id}/reject")
-def reject_change(
-    env: str, approval_id: int,
-    app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
-):
-    _require(ident, "releaser", environment=env)
-    tgt = app.targeting(session, ident.name)
-    try:
-        appr = tgt.reject(approval_id)
-    except TargetingError as exc:
-        raise HTTPException(400, str(exc))
-    return {"id": appr.id, "status": appr.status}
 
 
 @router.post("/envs/{env}/defaults")
@@ -871,8 +822,28 @@ def create_project(
 ):
     _require(ident, "admin")
     reg = app.registry(session, ident.name)
-    reg.ensure_project(req.id, review_policy=req.review_policy)
+    reg.ensure_project(req.id, review_policy=req.review_policy,
+                       allow_self_review=req.allow_self_review)
     return {"ok": True, "id": req.id}
+
+
+@router.patch("/projects/{project_id}")
+def update_project(
+    project_id: str, req: ProjectSettingsRequest,
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "admin")
+    p = session.get(models.Project, project_id)
+    if p is None:
+        raise HTTPException(404, f"unknown project {project_id}")
+    if req.review_policy is not None:
+        p.review_policy = req.review_policy
+    if req.allow_self_review is not None:
+        p.allow_self_review = req.allow_self_review
+    session.flush()
+    return {"id": p.id, "review_policy": p.review_policy,
+            "allow_self_review": p.allow_self_review}
 
 
 @router.post("/envs")
@@ -885,7 +856,6 @@ def create_env(
     if session.get(models.Environment, req.id) is None:
         session.add(models.Environment(
             id=req.id, name=req.id, protected=req.protected, track_tip=req.track_tip,
-            allow_self_approval=req.allow_self_approval,
         ))
     return {"ok": True, "id": req.id}
 
@@ -905,12 +875,9 @@ def update_env(
         e.protected = req.protected
     if req.track_tip is not None:
         e.track_tip = req.track_tip
-    if req.allow_self_approval is not None:
-        e.allow_self_approval = req.allow_self_approval
     session.flush()
     app.invalidate(env)
-    return {"id": e.id, "protected": e.protected, "track_tip": e.track_tip,
-            "allow_self_approval": e.allow_self_approval}
+    return {"id": e.id, "protected": e.protected, "track_tip": e.track_tip}
 
 
 @router.post("/keys")

@@ -82,7 +82,7 @@ def test_concurrent_pointer_moves_are_all_recorded(app):
     def move(i: int):
         with session_scope() as s:
             app.targeting(s, f"op{i}").make_live(
-                "prod", "support/system", 1, shas[i % 2], comment=f"move {i}", force=True)
+                "prod", "support/system", 1, shas[i % 2], comment=f"move {i}")
 
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         errors = [f.exception() for f in [ex.submit(move, i) for i in range(16)]]

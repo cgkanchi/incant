@@ -109,7 +109,6 @@ class PointerRequest(BaseModel):
     version_number: int
     to_sha: str
     comment: str = ""
-    force: bool = False  # break-glass direct release (releaser-gated at the route)
 
 
 class DefaultRequest(BaseModel):
@@ -126,20 +125,25 @@ class KillRequest(BaseModel):
 class ProjectRequest(BaseModel):
     id: str
     review_policy: int = 0
+    allow_self_review: bool = True
+
+
+class ProjectSettingsRequest(BaseModel):
+    # Partial update of a project's review settings; unset fields untouched.
+    review_policy: Optional[int] = None
+    allow_self_review: Optional[bool] = None
 
 
 class EnvironmentRequest(BaseModel):
     id: str
     protected: bool = False
     track_tip: bool = False
-    allow_self_approval: bool = True
 
 
 class EnvSettingsRequest(BaseModel):
-    # Partial update of an environment's governance settings; unset fields untouched.
+    # Partial update of an environment's settings; unset fields untouched.
     protected: Optional[bool] = None
     track_tip: Optional[bool] = None
-    allow_self_approval: Optional[bool] = None
 
 
 class KeyRequest(BaseModel):

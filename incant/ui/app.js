@@ -113,7 +113,6 @@ function parseRoute() {
   const parts = pathPart.split("/").filter(Boolean);
   if (parts.length === 0 || parts[0] === "prompts") return { name: "prompts", pid: null, q };
   if (parts[0] === "segments") return { name: "segments", pid: null, q };
-  if (parts[0] === "approvals") return { name: "approvals", pid: null, q };
   if (parts[0] === "play") return { name: "play", pid: null, q };
   if (parts[0] === "audit") return { name: "audit", pid: null, q };
   if (parts[0] === "p") {
@@ -156,8 +155,6 @@ function sidebar() {
     ${subnav(pid)}
     <div class="nav ${State.route.name === "segments" ? "active" : ""}" data-act="go" data-hash="#/segments">
       <span class="gl">⬡</span><span>Segments</span></div>
-    <div class="nav ${State.route.name === "approvals" ? "active" : ""}" data-act="go" data-hash="#/approvals">
-      <span class="gl">⧉</span><span>Approvals</span></div>
     <div class="nav ${State.route.name === "play" ? "active" : ""}" data-act="go" data-hash="#/play">
       <span class="gl">▶</span><span>Playground</span></div>
     <div class="nav ${State.route.name === "audit" ? "active" : ""}" data-act="go" data-hash="#/audit">
@@ -441,20 +438,31 @@ async function screenReview() {
   }).join("") || '<div class="empty">No open drafts.</div>';
 
   let detail = '<div class="empty">Select a draft.</div>';
+  let policyNote = "";
   if (sel) {
     const draft = await GET(`/mgmt/drafts/${sel}`);
     const lint = draft.lint || {};
+    const selfOk = draft.allow_self_review;
+    const policyText = draft.review_policy > 0
+      ? `${draft.review_policy} approval(s) to commit · ${selfOk
+          ? "self-review counts — the author can approve their own draft"
+          : "distinct reviewer required — the author's own approval doesn't count"}`
+      : "no approvals required to commit";
+    policyNote = `<span class="pill ${selfOk ? "live" : "warn"}">${selfOk ? "self-review on" : "four-eyes"}</span>
+      <span class="link ${selfOk ? "faint" : ""}" data-act="toggleSelfReview" data-project="${esc(draft.project)}" data-to="${selfOk ? "false" : "true"}">${selfOk ? "require distinct reviewer" : "allow self-review"}</span>`;
     detail = `<div class="card"><div style="padding:14px 18px;border-bottom:1px solid var(--line2);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span style="font-size:13px;font-weight:700">${esc(draft.title || "Draft")}</span>
         <span class="mono muted" style="font-size:10.5px">${esc(draft.id)} · base ${esc(draft.base_sha || "")}</span>
         <div class="grow"></div>
         <button class="btn" data-act="approve" data-draft="${draft.id}">Approve ✓</button>
         <button class="btn live" data-act="commitReview" data-draft="${draft.id}">Commit</button></div>
-      <div style="padding:12px 18px;font-size:10.5px;color:var(--faint)">${lint.status === "valid" ? "✓ validates — includes resolve, no cycles" : "⚠ " + esc(lint.error || "")}</div>
+      <div style="padding:12px 18px;font-size:10.5px;color:var(--faint)">${lint.status === "valid" ? "✓ validates — includes resolve, no cycles" : "⚠ " + esc(lint.error || "")}
+        · ${esc(policyText)}${draft.reviewers.length ? " · approved by " + draft.reviewers.map(esc).join(", ") : ""}</div>
       <div class="render-out" style="margin:8px 18px 18px">${esc(draft.content || "")}</div></div>`;
   }
   el("main").innerHTML = `<div class="screen">
-    <div class="h1row"><span class="h1 sm serif">Review</span><span class="sub">${esc(pid)} · reviewers judge what will be served</span></div>
+    <div class="h1row"><span class="h1 sm serif">Review</span><span class="sub">${esc(pid)} · reviewers judge what will be served</span>
+      <div class="grow"></div>${policyNote}</div>
     <div class="panelrow"><div style="flex:1 1 240px;display:flex;flex-direction:column;gap:10px">${cards}</div>
       <div style="flex:10 1 440px;min-width:0">${detail}</div></div></div>`;
 }
@@ -549,7 +557,7 @@ async function screenPointers() {
 
   const advance = (vrow.tip_ahead > 0 && vrow.tip_full_sha)
     ? `<button class="tweak-btn" style="width:auto;display:inline-flex" data-act="makeLive" data-sha="${vrow.tip_full_sha}" data-v="${version}">✦ Advance to tip → ${esc(vrow.tip_sha)}</button>
-       <span class="faint" style="font-size:11px">protected env: proposes for approval unless forced (approver ≠ proposer)</span>`
+       <span class="faint" style="font-size:11px">releaser-gated, applied immediately — pointer moves are unilateral</span>`
     : `<span style="font-size:12px;color:var(--live);font-weight:600">✓ Tip is live — nothing to advance.</span>`;
 
   el("main").innerHTML = `<div class="screen">
@@ -589,39 +597,6 @@ async function screenAudit() {
     <div class="card" style="overflow-x:auto"><table class="grid">
       <thead class="ghead"><tr><th>When</th><th>Actor</th><th>Action</th><th>Object</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="4" class="empty">No audit entries.</td></tr>'}</tbody></table></div></div>`;
-}
-
-async function screenApprovals() {
-  const d = await GET(`/mgmt/envs/${enc(State.env)}/approvals`);
-  const rows = d.approvals.map((a) => {
-    const c = a.change || {};
-    const what = c.kind === "make_live"
-      ? `make live <b>${esc(c.prompt_id)}</b> v${c.version} → <span class="mono">${esc((c.to_sha || "").slice(0, 7))}</span>`
-      : esc(a.change ? JSON.stringify(a.change) : "");
-    return `<tr class="grow-row">
-      <td class="mono muted">#${a.id}</td>
-      <td>${what}</td>
-      <td><b>${esc(a.proposed_by)}</b></td>
-      <td class="mono muted">${new Date(a.created_at).toLocaleString()}</td>
-      <td style="text-align:right;white-space:nowrap">
-        <button class="btn primary" data-act="approveChange" data-id="${a.id}">Approve ✓</button>
-        <button class="btn" data-act="rejectChange" data-id="${a.id}">Reject</button></td></tr>`;
-  }).join("");
-  const selfOk = d.allow_self_approval;
-  const selfBadge = selfOk
-    ? `<span class="pill live">self-approval on</span><span class="link faint" data-act="toggleSelfApproval" data-to="false">require distinct approver</span>`
-    : `<span class="pill warn">four-eyes</span><span class="link" data-act="toggleSelfApproval" data-to="true">allow self-approval</span>`;
-  el("main").innerHTML = `<div class="screen">
-    <div class="h1row"><span class="h1 sm serif">Approvals — <i>${esc(State.env)}</i></span>
-      <span class="sub">pointer-class changes proposed in a protected environment</span>
-      <div class="grow"></div>${selfBadge}</div>
-    <div class="card" style="overflow-x:auto"><table class="grid">
-      <thead class="ghead"><tr><th>#</th><th>Change</th><th>Proposed by</th><th>When</th><th></th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="5" class="empty">No pending approvals.</td></tr>'}</tbody></table></div>
-    <div style="font-size:11px;color:var(--faint);margin-top:12px">${selfOk
-      ? "A releaser approves — self-approval is allowed here, so the proposer may approve their own change."
-      : "A releaser <i>other than the proposer</i> approves — separation of duties is enforced on this environment."}
-      Approving advances the live pointer immediately. Break-glass <span class="mono">force</span> releases bypass this and are gated to releaser.</div></div>`;
 }
 
 function renderPlayResult(r, pinned) {
@@ -680,7 +655,7 @@ async function screenPlay() {
 const SCREENS = {
   prompts: screenPrompts, overview: screenOverview, editor: screenEditor, diff: screenDiff,
   review: screenReview, rules: screenRules, pointers: screenPointers, segments: screenSegments,
-  approvals: screenApprovals, play: screenPlay, audit: screenAudit,
+  play: screenPlay, audit: screenAudit,
 };
 
 // ── actions ──────────────────────────────────────────────────────────
@@ -839,23 +814,20 @@ const Actions = {
   },
   async makeLive(ds) {
     try {
-      // No force: a protected env returns "proposed" and the change waits in the
-      // approval queue for a different releaser to approve.
-      const r = await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
+      // Pointer moves are unilateral — a releaser advances the pointer directly.
+      await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
         prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha, comment: "make live via UI",
       });
-      toast(r.status === "live" ? "Pointer advanced — tip is live"
-                                : "Proposed — awaiting approval (see Approvals)");
+      toast("Pointer advanced — tip is live");
       render();
     } catch (e) { toast(errText(e), true); }
   },
   async revert(ds) {
     try {
-      const r = await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
+      await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
         prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha, comment: "revert via UI",
       });
-      toast(r.status === "live" ? "Reverted — pointer moved"
-                                : "Revert proposed — awaiting approval");
+      toast("Reverted — pointer moved");
       render();
     } catch (e) { toast(errText(e), true); }
   },
@@ -883,25 +855,12 @@ const Actions = {
     Actions.play();
   },
   unpin() { window._playPin = null; toast("Pin cleared"); render(); },
-  async toggleSelfApproval(ds) {
+  async toggleSelfReview(ds) {
     const to = ds.to === "true";
     try {
-      await PATCH(`/mgmt/envs/${enc(State.env)}`, { allow_self_approval: to });
-      toast(to ? "Self-approval allowed on " + State.env : "Distinct approver now required on " + State.env);
-      render();
-    } catch (e) { toast(errText(e), true); }
-  },
-  async approveChange(ds) {
-    try {
-      await POST(`/mgmt/envs/${enc(State.env)}/approvals/${ds.id}/approve`, {});
-      toast("Approved — change is live");
-      render();
-    } catch (e) { toast(errText(e), true); }
-  },
-  async rejectChange(ds) {
-    try {
-      await POST(`/mgmt/envs/${enc(State.env)}/approvals/${ds.id}/reject`, {});
-      toast("Rejected");
+      await PATCH(`/mgmt/projects/${enc(ds.project)}`, { allow_self_review: to });
+      toast(to ? "Self-review allowed for " + ds.project
+               : "Distinct reviewer now required for " + ds.project);
       render();
     } catch (e) { toast(errText(e), true); }
   },

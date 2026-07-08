@@ -56,63 +56,28 @@ def _tip_sha(client, prompt_id="support/system", version=2):
     return next(x for x in v["versions"] if x["version"] == version)["tip_full_sha"]
 
 
-def test_protected_pointer_proposes_then_distinct_releaser_approves(client):
+def test_releaser_moves_pointer_directly(client):
     sha = _tip_sha(client)
-    op = make_key(client, "operator", project="support")
-    # Operator proposes on protected prod -> pending approval, no move yet.
+    rel = make_key(client, "releaser", env="prod")
+    # Pointer moves are unilateral — a releaser advances the live pointer directly,
+    # no propose→approve ceremony.
     r = client.post("/mgmt/envs/prod/pointers",
                     json={"prompt_id": "support/system", "version_number": 2, "to_sha": sha},
-                    headers=auth(op))
-    assert r.status_code == 200 and r.json()["status"] == "proposed", r.text
-    # A project-scoped operator can't view env-wide approvals; admin lists them.
-    assert client.get("/mgmt/envs/prod/approvals", headers=auth(op)).status_code == 403
-    aps = client.get("/mgmt/envs/prod/approvals", headers=auth()).json()["approvals"]
-    apid = aps[-1]["id"]
-    # Admin (distinct principal, implies releaser) approves -> becomes live at sha.
-    r = client.post(f"/mgmt/envs/prod/approvals/{apid}/approve", headers=auth())
-    assert r.status_code == 200 and r.json()["status"] == "approved", r.text
+                    headers=auth(rel))
+    assert r.status_code == 200 and r.json()["status"] == "live", r.text
     tl = client.get("/mgmt/envs/prod/pointers?prompt_id=support/system&version=2",
                     headers=auth()).json()
     assert tl["moves"][0]["full_sha"] == sha
 
 
-def test_self_approval_allowed_by_default_and_can_be_disabled(client):
-    sha = _tip_sha(client)
-    rel = make_key(client, "releaser", env="prod")
-
-    def propose_and_self_approve():
-        client.post("/mgmt/envs/prod/pointers",
-                    json={"prompt_id": "support/system", "version_number": 2, "to_sha": sha},
-                    headers=auth(rel))
-        apid = client.get("/mgmt/envs/prod/approvals",
-                          headers=auth(rel)).json()["approvals"][-1]["id"]
-        return client.post(f"/mgmt/envs/prod/approvals/{apid}/approve", headers=auth(rel))
-
-    # Opt-out default: the proposer may approve their own change.
-    r = propose_and_self_approve()
-    assert r.status_code == 200 and r.json()["status"] == "approved", r.text
-    aud = client.get("/mgmt/envs/prod/approvals", headers=auth()).json()
-    assert aud["allow_self_approval"] is True
-
-    # Disable it (admin) -> a distinct approver is now required again.
-    assert client.patch("/mgmt/envs/prod", json={"allow_self_approval": False},
-                        headers=auth()).status_code == 200
-    r = propose_and_self_approve()
-    assert r.status_code == 400  # approver must differ from proposer
-    # A distinct principal can still approve the now-pending change.
-    apid = client.get("/mgmt/envs/prod/approvals", headers=auth()).json()["approvals"][-1]["id"]
-    assert client.post(f"/mgmt/envs/prod/approvals/{apid}/approve",
-                       headers=auth()).status_code == 200
-
-
-def test_operator_cannot_force_release(client):
+def test_operator_cannot_move_pointer(client):
     sha = _tip_sha(client)
     op = make_key(client, "operator", project="support")
+    # An operator edits rules but can't release — pointer moves require releaser.
     r = client.post("/mgmt/envs/prod/pointers",
-                    json={"prompt_id": "support/system", "version_number": 2,
-                          "to_sha": sha, "force": True},
+                    json={"prompt_id": "support/system", "version_number": 2, "to_sha": sha},
                     headers=auth(op))
-    assert r.status_code == 403  # force is a releaser-gated break-glass
+    assert r.status_code == 403
 
 
 def test_project_operator_cannot_create_global_rule(client):
@@ -229,23 +194,18 @@ def test_tweak_flow_over_http(client):
     r = client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth())
     assert r.status_code == 412
 
-    # 2b. self-approval doesn't count: the admin authored the draft, so its own
-    # review can't satisfy the policy (identity comes from the principal).
+    # 3. self-review is allowed by default: the author's own approval satisfies the
+    # policy (the reviewer identity comes from the principal, never the body).
     client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth())
-    r = client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth())
-    assert r.status_code == 412
-
-    # 3. a *different* principal approves, then commit succeeds
-    reviewer = make_key(client, "editor", project="support")
-    client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth(reviewer))
     r = client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth())
     assert r.status_code == 200, r.text
     new_sha = r.json()["full_sha"]
 
-    # 4. make live (prod is protected; admin implies releaser) with force
+    # 4. make live directly — pointer moves are unilateral and releaser-gated
+    # (admin implies releaser); no force, no approval ceremony.
     r = client.post("/mgmt/envs/prod/pointers",
                     json={"prompt_id": "support/system", "version_number": 2,
-                          "to_sha": new_sha, "comment": "tweak live", "force": True},
+                          "to_sha": new_sha, "comment": "tweak live"},
                     headers=auth())
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "live"
@@ -255,6 +215,25 @@ def test_tweak_flow_over_http(client):
                     json={"variables": {"customer_name": "Acme", "history": []}},
                     headers=auth(client.renderer_key))
     assert "BRAND NEW LINE" in r.json()["prompt"]
+
+
+def test_self_review_optout_requires_distinct_reviewer(client):
+    # Disable self-review on the support project -> the author's own approval no
+    # longer counts; a distinct reviewer is required to satisfy the policy.
+    assert client.patch("/mgmt/projects/support", json={"allow_self_review": False},
+                        headers=auth()).status_code == 200
+    r = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "author": "sam",
+                          "content": "You are a support agent for {{ customer_name }}.\nOPTOUT."},
+                    headers=auth())
+    draft_id = r.json()["id"]
+    # Author (admin) self-reviews -> still blocked.
+    client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth())
+    assert client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth()).status_code == 412
+    # A distinct principal approves -> commit unlocked.
+    reviewer = make_key(client, "editor", project="support")
+    client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth(reviewer))
+    assert client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth()).status_code == 200
 
 
 def test_create_new_prompt_flow(client):
@@ -285,7 +264,7 @@ def test_create_new_prompt_flow(client):
                 json={"prompt_id": "growth/welcome", "version_number": 1}, headers=auth())
     client.post("/mgmt/envs/prod/pointers",
                 json={"prompt_id": "growth/welcome", "version_number": 1,
-                      "to_sha": sha, "force": True}, headers=auth())
+                      "to_sha": sha}, headers=auth())
     r = client.post("/prompt/growth/welcome", json={"variables": {"name": "Kai"}}, headers=auth())
     assert r.status_code == 200 and r.json()["prompt"] == "Welcome, Kai!"
 

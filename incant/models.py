@@ -32,6 +32,9 @@ class Project(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)          # == name / top dir
     name: Mapped[str] = mapped_column(String)
     review_policy: Mapped[int] = mapped_column(Integer, default=0)     # approvals to commit
+    # Draft review separation of duties is opt-out: by default the author's own
+    # approval counts toward the policy; disable to require a distinct reviewer.
+    allow_self_review: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -140,9 +143,6 @@ class Environment(Base):
     name: Mapped[str] = mapped_column(String)
     protected: Mapped[bool] = mapped_column(Boolean, default=False)
     track_tip: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Separation of duties for protected-env approvals is opt-out: by default the
-    # proposer may approve their own change; disable to require a distinct approver.
-    allow_self_approval: Mapped[bool] = mapped_column(Boolean, default=True)
     rules_version: Mapped[int] = mapped_column(Integer, default=1)
 
 
@@ -255,17 +255,6 @@ class RoleBinding(Base):
     role: Mapped[str] = mapped_column(String)                           # renderer|viewer|editor|operator|releaser|admin
     project_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     environment_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-
-
-class Approval(Base):
-    __tablename__ = "approvals"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    environment_id: Mapped[str] = mapped_column(String, index=True)
-    change: Mapped[Any] = mapped_column(JSON)                           # proposed pointer/default change
-    proposed_by: Mapped[str] = mapped_column(String)
-    approved_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    status: Mapped[str] = mapped_column(String, default="pending")      # pending | approved | rejected
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class AuditLog(Base):

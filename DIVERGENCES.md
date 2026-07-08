@@ -14,14 +14,21 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
 
 ## Fix log
 
-- **Policy change — self-approval is opt-out** (relaxes §1.6/§1.7 default): the
-  propose→approve separation of duties (approver ≠ proposer) is now a per-environment
-  **opt-out** rather than a hard rule. `Environment.allow_self_approval` defaults to
-  `True`, so by default the proposer may approve their own protected-env change; set it
-  `False` (admin `PATCH /mgmt/envs/{env}`, or the Approvals-screen toggle) to require a
-  distinct approver. The role gate (releaser to approve, `force` still releaser-only)
-  and the audit trail are unchanged; self-approvals record `self_approved=true`. This
-  was a deliberate product call for single-operator/small-team installs.
+- **Governance reshape — unilateral targeting + opt-out self-review** (supersedes the
+  §1.6/§1.7 propose→approve model): a deliberate product decision to simplify governance
+  for single-operator/small-team installs.
+  - **Targeting is unilateral.** Pointer moves (make-live) no longer go through
+    propose→approve — a **releaser** advances the live pointer directly, applied
+    immediately. The whole approval subsystem is gone: the `Approval` model, the
+    `/mgmt/envs/{env}/approvals[/approve|reject]` endpoints, the propose branch in
+    `make_live`, the pointer `force` break-glass, and the Approvals UI screen were all
+    removed. Operators keep rule edits; only releasers release. `make_live` always
+    returns `status="live"`.
+  - **Draft self-review is opt-out.** `Project.allow_self_review` defaults to `True`, so
+    the author's own approval counts toward the review policy — one operator can author,
+    review, and commit. Set it `False` (admin `PATCH /mgmt/projects/{id}`, or the
+    Review-screen toggle) to require a distinct reviewer. The recorded reviewer is always
+    the authenticated principal, never a body-supplied name.
 
 - **Batch 1 — P0 one-liners (done)**: git commit dates now real wall-clock, pinned
   only under the `INCANT_FIXED_GIT_DATE` test hook (§1.3); `commit_version` writes

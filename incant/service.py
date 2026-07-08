@@ -117,7 +117,7 @@ class AppContext:
             if tgt.current_live(env.id, prompt_id, version) is None:
                 continue  # nothing live to follow
             tgt.make_live(env.id, prompt_id, version, sha,
-                          comment="track_tip auto-advance", force=True)
+                          comment="track_tip auto-advance")
             self.invalidate(env.id)
             advanced.append(env.id)
         return advanced

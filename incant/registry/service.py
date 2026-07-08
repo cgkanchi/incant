@@ -48,10 +48,12 @@ class RegistryService:
 
     # ── projects & prompts ───────────────────────────────────────────
 
-    def ensure_project(self, project_id: str, review_policy: int = 0) -> models.Project:
+    def ensure_project(self, project_id: str, review_policy: int = 0,
+                       allow_self_review: bool = True) -> models.Project:
         p = self.s.get(models.Project, project_id)
         if p is None:
-            p = models.Project(id=project_id, name=project_id, review_policy=review_policy)
+            p = models.Project(id=project_id, name=project_id, review_policy=review_policy,
+                               allow_self_review=allow_self_review)
             self.s.add(p)
             self.s.flush()
         return p
@@ -187,8 +189,13 @@ class RegistryService:
         prompt = self.s.get(models.Prompt, draft.prompt_id)
         project = self.s.get(models.Project, prompt.project_id) if prompt else None
         need = project.review_policy if project else 0
-        approvals = {r.reviewer for r in self.approvals(draft.id) if r.reviewer != draft.author}
-        return len(approvals) >= need
+        if need <= 0:
+            return True
+        # Self-review is opt-out: when allowed, the author's own approval counts.
+        allow_self = project.allow_self_review if project else True
+        reviewers = {r.reviewer for r in self.approvals(draft.id)
+                     if allow_self or r.reviewer != draft.author}
+        return len(reviewers) >= need
 
     # ── validation & commit ──────────────────────────────────────────
 

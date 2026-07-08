@@ -24,7 +24,7 @@ class TargetingError(Exception):
 
 @dataclass
 class MakeLiveOutcome:
-    status: str          # "live" | "proposed"
+    status: str          # always "live" — pointer moves are unilateral
     move_id: int | None
     rules_version: int
 
@@ -164,31 +164,14 @@ class TargetingService:
 
     def make_live(
         self, env_id: str, prompt_id: str, version_number: int, to_sha: str,
-        *, comment: str = "", force: bool = False,
+        *, comment: str = "",
     ) -> MakeLiveOutcome:
+        """Advance the live pointer directly. Pointer moves are unilateral — the
+        route gates them to releaser; there is no propose→approve ceremony."""
         env = self._env(env_id)
         if not self.is_validated(to_sha):
             raise TargetingError(f"SHA {to_sha} is not a validated commit; cannot make live")
-
         from_sha = self.current_live(env_id, prompt_id, version_number)
-
-        # Protected environments: pointer-class changes go through propose→approve
-        # (the approver, ≠ proposer, is the authenticated principal at approve time).
-        # `force` is a break-glass direct release, gated to releaser at the route.
-        if env.protected and not force:
-            appr = models.Approval(
-                environment_id=env_id, proposed_by=self.actor,
-                change={"kind": "make_live", "prompt_id": prompt_id,
-                        "version": version_number, "to_sha": to_sha,
-                        "from_sha": from_sha, "comment": comment},
-                status="pending",
-            )
-            self.s.add(appr)
-            self.s.flush()
-            record_audit(self.s, self.actor, "pointer.propose", "approval", str(appr.id),
-                         after=appr.change)
-            return MakeLiveOutcome("proposed", None, env.rules_version)
-
         move_id, rv = self._apply_make_live(env, prompt_id, version_number, to_sha,
                                             from_sha, comment)
         return MakeLiveOutcome("live", move_id, rv)
@@ -273,55 +256,6 @@ class TargetingService:
                      after={"to_rules_version": to_rules_version, "rules_changed": changed})
         return {"to_rules_version": to_rules_version, "rules_changed": changed,
                 "rules_version": rv}
-
-    # ── approvals (protected-env propose→approve) ────────────────────
-
-    def list_pending_approvals(self, env_id: str) -> list[models.Approval]:
-        return list(self.s.execute(
-            select(models.Approval).where(
-                models.Approval.environment_id == env_id,
-                models.Approval.status == "pending",
-            ).order_by(models.Approval.id)
-        ).scalars())
-
-    def approve(self, approval_id: int) -> models.Approval:
-        appr = self.s.get(models.Approval, approval_id)
-        if appr is None:
-            raise TargetingError(f"unknown approval {approval_id}")
-        if appr.status != "pending":
-            raise TargetingError(f"approval {approval_id} is already {appr.status}")
-        env = self._env(appr.environment_id)
-        self_approved = appr.proposed_by == self.actor
-        if self_approved and not env.allow_self_approval:
-            raise TargetingError("approver must differ from proposer")
-        ch = appr.change
-        kind = ch.get("kind")
-        if kind == "make_live":
-            if not self.is_validated(ch["to_sha"]):
-                raise TargetingError(f"SHA {ch['to_sha']} is no longer a validated commit")
-            from_sha = self.current_live(env.id, ch["prompt_id"], ch["version"])
-            self._apply_make_live(env, ch["prompt_id"], ch["version"], ch["to_sha"],
-                                  from_sha, ch.get("comment", ""))
-        else:
-            raise TargetingError(f"unknown change kind {kind!r}")
-        appr.status = "approved"
-        appr.approved_by = self.actor
-        self.s.flush()
-        record_audit(self.s, self.actor, "approval.approve", "approval", str(approval_id),
-                     after={**ch, "self_approved": self_approved})
-        return appr
-
-    def reject(self, approval_id: int) -> models.Approval:
-        appr = self.s.get(models.Approval, approval_id)
-        if appr is None:
-            raise TargetingError(f"unknown approval {approval_id}")
-        if appr.status != "pending":
-            raise TargetingError(f"approval {approval_id} is already {appr.status}")
-        appr.status = "rejected"
-        appr.approved_by = self.actor
-        self.s.flush()
-        record_audit(self.s, self.actor, "approval.reject", "approval", str(approval_id))
-        return appr
 
     # ── defaults ─────────────────────────────────────────────────────
 
