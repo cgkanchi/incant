@@ -1,0 +1,210 @@
+"""Sandboxed rendering with targeting-resolved includes.
+
+The render path is pure: given an :class:`EnvSnapshot`, flags, variables, and a
+:class:`ContentProvider`, it resolves the prompt (and every ``{% include %}``)
+through the evaluator with the *same* flag context, compiles under a Jinja
+``SandboxedEnvironment`` with ``StrictUndefined``, and renders.
+
+Compiled templates are cached by blob hash (immutable content ⇒ immutable
+bytecode), so the hot path never recompiles. Include resolution happens at render
+time via a ``get_template`` override; a per-render include stack backstops cycles
+and enforces the depth limit (static validation is the primary cycle guard).
+"""
+
+from __future__ import annotations
+
+import contextvars
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+from jinja2 import StrictUndefined, Template
+from jinja2.exceptions import TemplateNotFound, UndefinedError
+from jinja2.exceptions import TemplateError as JinjaTemplateError
+from jinja2.sandbox import SandboxedEnvironment
+
+from .errors import IncludeCycle, IncludeDepthExceeded, MissingVariable, RenderError
+from .evaluate import Skip, resolve
+from .model import ContentProvider, EnvSnapshot, Resolution
+
+DEPTH_LIMIT = 32
+
+
+@dataclass
+class RenderResult:
+    text: str
+    root: Resolution
+    contributions: dict[str, Resolution]  # prompt_id -> Resolution (incl. root)
+    content_fallback: bool
+    skips: list[Skip] = field(default_factory=list)
+
+
+@dataclass
+class _RenderCtx:
+    snapshot: EnvSnapshot
+    flags: Mapping[str, Any]
+    content: ContentProvider
+    contributions: dict[str, Resolution] = field(default_factory=dict)
+    stack: list[str] = field(default_factory=list)
+    skips: list[Skip] = field(default_factory=list)
+    fallback: bool = False
+
+
+_current: contextvars.ContextVar[_RenderCtx | None] = contextvars.ContextVar(
+    "incant_render_ctx", default=None
+)
+
+
+class _IncantEnvironment(SandboxedEnvironment):
+    """A sandboxed environment whose includes resolve through the targeting engine."""
+
+    def _resolve_include(self, name: str) -> Template:
+        ctx = _current.get()
+        if ctx is None:  # pragma: no cover - defensive
+            raise TemplateNotFound(name)
+        res = resolve(ctx.snapshot, name, ctx.flags, skips=ctx.skips)
+        ctx.contributions[name] = res
+        if res.content_fallback:
+            ctx.fallback = True
+        blob = ctx.content.get(name, res.commit)
+        base = _compile(self, blob.blob_sha, blob.source, name)
+        return _stack_wrapped(base, name)
+
+    def get_template(self, name, parent=None, globals=None):  # type: ignore[override]
+        if isinstance(name, Template):
+            return name
+        return self._resolve_include(str(name))
+
+    def get_or_select_template(self, template_name_or_list, parent=None, globals=None):  # type: ignore[override]
+        if isinstance(template_name_or_list, (list, tuple)):
+            template_name_or_list = template_name_or_list[0]
+        return self.get_template(template_name_or_list, parent, globals)
+
+
+# The single shared environment. Autoescape off (plain text for LLMs); no
+# filesystem loader — content only ever arrives through the ContentProvider.
+_ENV = _IncantEnvironment(
+    undefined=StrictUndefined,
+    autoescape=False,
+    cache_size=0,  # we maintain our own blob-keyed compiled cache
+    auto_reload=False,
+    keep_trailing_newline=True,
+)
+
+# Blob-keyed compiled-template cache: immutable content ⇒ never invalidated.
+_COMPILED: dict[str, Template] = {}
+_COMPILE_ORDER: list[str] = []
+_CACHE_MAX = 4096
+compile_misses = 0
+
+
+def _compile(env: SandboxedEnvironment, blob_sha: str, source: str, name: str) -> Template:
+    global compile_misses
+    cached = _COMPILED.get(blob_sha)
+    if cached is not None:
+        return cached
+    compile_misses += 1
+    try:
+        code = env.compile(source, name=name, filename=name)
+        tmpl = Template.from_code(env, code, env.make_globals(None), None)
+    except JinjaTemplateError as exc:  # syntax error reaching compile
+        raise RenderError(str(exc), prompt_id=name, lineno=getattr(exc, "lineno", None))
+    _COMPILED[blob_sha] = tmpl
+    _COMPILE_ORDER.append(blob_sha)
+    if len(_COMPILE_ORDER) > _CACHE_MAX:
+        evict = _COMPILE_ORDER.pop(0)
+        _COMPILED.pop(evict, None)
+    return tmpl
+
+
+def _stack_wrapped(base: Template, name: str) -> Template:
+    """Return a cheap per-include view of ``base`` that maintains the render stack.
+
+    The stack reflects the *active* include chain (pushed when the child actually
+    renders, popped when it finishes) so diamonds are fine and only true cycles /
+    excessive depth raise.
+    """
+
+    wrapper = object.__new__(type(base))
+    wrapper.__dict__ = base.__dict__.copy()
+    orig = base.root_render_func
+
+    def rrf(context):
+        ctx = _current.get()
+        assert ctx is not None
+        if name in ctx.stack:
+            raise IncludeCycle(ctx.stack + [name])
+        if len(ctx.stack) >= DEPTH_LIMIT:
+            raise IncludeDepthExceeded(DEPTH_LIMIT, ctx.stack + [name])
+        ctx.stack.append(name)
+        try:
+            yield from orig(context)
+        finally:
+            ctx.stack.pop()
+
+    wrapper.root_render_func = rrf
+    return wrapper
+
+
+def precompile(blob_sha: str, source: str) -> None:
+    """Warm the compiled-template cache for a blob (eager-warm at boot/commit)."""
+
+    _compile(_ENV, blob_sha, source, blob_sha)
+
+
+def render(
+    snapshot: EnvSnapshot,
+    prompt_id: str,
+    flags: Mapping[str, Any],
+    variables: Mapping[str, Any],
+    content: ContentProvider,
+    *,
+    defaults: Mapping[str, Any] | None = None,
+) -> RenderResult:
+    """Resolve, compile, and render ``prompt_id``. Raises core errors on failure.
+
+    ``defaults`` are DB-held values for optional variables, applied pre-render so
+    ``StrictUndefined`` stays on.
+    """
+
+    ctx = _RenderCtx(snapshot=snapshot, flags=flags, content=content)
+    root = resolve(snapshot, prompt_id, flags, skips=ctx.skips)
+    ctx.contributions[prompt_id] = root
+    if root.content_fallback:
+        ctx.fallback = True
+
+    blob = content.get(prompt_id, root.commit)
+    base = _compile(_ENV, blob.blob_sha, blob.source, prompt_id)
+    tmpl = _stack_wrapped(base, prompt_id)
+
+    render_vars: dict[str, Any] = {}
+    if defaults:
+        render_vars.update(defaults)
+    render_vars.update(variables)
+
+    token = _current.set(ctx)
+    try:
+        text = tmpl.render(render_vars)
+    except UndefinedError as exc:
+        raise MissingVariable(_undefined_name(exc), prompt_id) from exc
+    except (IncludeCycle, IncludeDepthExceeded):
+        raise
+    except JinjaTemplateError as exc:
+        raise RenderError(str(exc), prompt_id=prompt_id, lineno=getattr(exc, "lineno", None))
+    finally:
+        _current.reset(token)
+
+    return RenderResult(
+        text=text,
+        root=root,
+        contributions=ctx.contributions,
+        content_fallback=ctx.fallback,
+        skips=ctx.skips,
+    )
+
+
+def _undefined_name(exc: UndefinedError) -> str:
+    # jinja2 message form: "'foo' is undefined"
+    msg = str(exc)
+    if msg.startswith("'") and "'" in msg[1:]:
+        return msg[1:].split("'", 1)[0]
+    return msg
