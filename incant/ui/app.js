@@ -114,6 +114,7 @@ function parseRoute() {
   if (parts.length === 0 || parts[0] === "prompts") return { name: "prompts", pid: null, q };
   if (parts[0] === "segments") return { name: "segments", pid: null, q };
   if (parts[0] === "approvals") return { name: "approvals", pid: null, q };
+  if (parts[0] === "play") return { name: "play", pid: null, q };
   if (parts[0] === "audit") return { name: "audit", pid: null, q };
   if (parts[0] === "p") {
     const pid = decodeURIComponent(parts[1] || "");
@@ -157,6 +158,8 @@ function sidebar() {
       <span class="gl">⬡</span><span>Segments</span></div>
     <div class="nav ${State.route.name === "approvals" ? "active" : ""}" data-act="go" data-hash="#/approvals">
       <span class="gl">⧉</span><span>Approvals</span></div>
+    <div class="nav ${State.route.name === "play" ? "active" : ""}" data-act="go" data-hash="#/play">
+      <span class="gl">▶</span><span>Playground</span></div>
     <div class="nav ${State.route.name === "audit" ? "active" : ""}" data-act="go" data-hash="#/audit">
       <span class="gl">◷</span><span>Audit</span></div>
     <div class="spacer"></div>
@@ -458,7 +461,10 @@ async function screenReview() {
 
 async function screenRules() {
   const env = State.env;
-  const d = await GET(`/mgmt/envs/${enc(env)}/rules`);
+  const [d, rv] = await Promise.all([
+    GET(`/mgmt/envs/${enc(env)}/rules`),
+    GET(`/mgmt/envs/${enc(env)}/revisions?limit=25`),
+  ]);
   const pid = State.route.pid;
   const anyKill = Object.entries(d.kills).filter(([, v]) => v).map(([k]) => k);
   const killBanner = anyKill.length
@@ -487,6 +493,19 @@ async function screenRules() {
   const defaultPid = pid || (d.rules.find((r) => r.prompt_id)?.prompt_id);
   const defV = defaultPid ? d.defaults[defaultPid] : null;
 
+  const revRows = rv.revisions.map((r, i) => `
+    <tr class="grow-row">
+      <td class="mono muted">rv${r.rules_version}</td>
+      <td><span class="tag ${r.kind === "rollback" ? "acc" : "mut"}">${esc(r.kind)}</span>
+        ${r.rule_id ? `<span class="mono" style="font-size:11px">${esc(r.rule_id)}</span>` : ""}</td>
+      <td><b>${esc(r.actor || "—")}</b></td>
+      <td class="muted" style="font-size:11px">${esc(r.comment || "")}</td>
+      <td class="mono muted" style="font-size:11px">${new Date(r.at).toLocaleString()}</td>
+      <td style="text-align:right;white-space:nowrap">${i === 0
+        ? '<span class="faint" style="font-size:10.5px">current</span>'
+        : `<button class="btn" data-act="rollback" data-rv="${r.rules_version}">▸ Roll back here</button>`}</td>
+    </tr>`).join("") || '<tr><td colspan="6" class="empty">No targeting changes yet.</td></tr>';
+
   el("main").innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Targeting — <i>${esc(env)}</i></span>
       ${d.protected ? '<span class="pill warn">PROTECTED</span>' : ""}
@@ -499,7 +518,13 @@ async function screenRules() {
         <div class="grow"></div>
         ${defaultPid ? `<button class="btn danger" data-act="kill" data-pid="${esc(defaultPid)}" data-engage="true">⏻ Kill switch</button>` : ""}</div>
     </div>
-    <div style="font-size:11px;color:var(--faint);margin-top:12px">First match wins, top to bottom. Rule edits apply in &lt;2s, no approval ceremony — rules can only reference validated SHAs. Pointer moves and default changes are the governed acts.</div></div>`;
+    <div style="font-size:11px;color:var(--faint);margin-top:12px">First match wins, top to bottom. Rule edits apply in &lt;2s, no approval ceremony — rules can only reference validated SHAs. Pointer moves and default changes are the governed acts.</div>
+    <div class="h1row" style="margin-top:26px"><span class="h1 sm serif">Change history</span>
+      <span class="sub">every targeting mutation, stamped with the rules_version it produced</span></div>
+    <div class="card" style="overflow-x:auto"><table class="grid">
+      <thead class="ghead"><tr><th>Version</th><th>Change</th><th>Actor</th><th>Comment</th><th>When</th><th></th></tr></thead>
+      <tbody>${revRows}</tbody></table></div>
+    <div style="font-size:11px;color:var(--faint);margin-top:12px">Rolling back restores the rule set to that version — rules created afterward are archived. Itself a change (bumps rules_version), so history is append-only.</div></div>`;
 }
 
 async function screenPointers() {
@@ -591,10 +616,63 @@ async function screenApprovals() {
     <div style="font-size:11px;color:var(--faint);margin-top:12px">A releaser other than the proposer approves; approving advances the live pointer immediately. Break-glass <span class="mono">force</span> releases bypass this and are gated to releaser.</div></div>`;
 }
 
+function renderPlayResult(r, pinned) {
+  const matched = typeof r.matched_rule === "string"
+    ? r.matched_rule : `${r.matched_rule.scope}:${r.matched_rule.id}`;
+  const vers = Object.entries(r.versions).map(([k, v]) =>
+    `<div class="mono" style="font-size:11.5px">${esc(k)} → v${v.version} · ${esc(v.commit)}${
+      v.fallback ? ' <span class="pill warn">fallback</span>' : ""}</div>`).join("");
+  const flags = [
+    r.stale_rules ? '<span class="pill warn">stale_rules</span>' : "",
+    r.content_fallback ? '<span class="pill warn">content_fallback</span>' : "",
+  ].join(" ");
+  return `<div class="card pad">
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <span class="tag ${pinned ? "acc" : "mut"}">${pinned ? "PINNED REPLAY" : "matched: " + esc(matched)}</span>
+      <span class="faint" style="font-size:11px">rules_version ${r.rules_version}</span>${flags}</div>
+    <div class="render-out" style="white-space:pre-wrap;margin:0">${esc(r.prompt)}</div>
+    <div style="border-top:1px solid var(--line2);margin-top:12px;padding-top:10px">
+      <div style="font-size:11px;font-weight:600;letter-spacing:.03em;color:var(--faint);text-transform:uppercase;margin-bottom:6px">Resolved versions (pin)</div>
+      ${vers}
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" data-act="pinLast">⚓ Reproduce exactly (pin)</button>
+        <span class="faint" style="font-size:11px">re-renders ignoring targeting — same output regardless of flags</span></div>
+    </div></div>`;
+}
+
+async function screenPlay() {
+  const pid = window._playPid || State.route.q.pid || "support/system";
+  const flags = window._playFlags != null ? window._playFlags : '{"user_id": "u_12"}';
+  const vars = window._playVars != null ? window._playVars
+    : '{"customer_name": "Acme", "history": []}';
+  const pinned = !!window._playPin;
+  const last = window._playLast;
+  el("main").innerHTML = `<div class="screen">
+    <div class="h1row"><span class="h1 sm serif">Playground — <i>${esc(State.env)}</i></span>
+      <span class="sub">render through the live serving path; capture a pin to reproduce it exactly</span></div>
+    <div class="panelrow">
+      <div style="flex:1 1 300px;display:flex;flex-direction:column;gap:12px">
+        <div class="field"><label>Prompt id</label>
+          <input id="playPid" value="${esc(pid)}" spellcheck="false"></div>
+        <div class="field"><label>Flags (JSON)</label>
+          <textarea id="playFlags" spellcheck="false" style="min-height:66px">${esc(flags)}</textarea></div>
+        <div class="field"><label>Variables (JSON)</label>
+          <textarea id="playVars" spellcheck="false" style="min-height:66px">${esc(vars)}</textarea></div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button class="btn primary" data-act="play">Render</button>
+          ${pinned ? '<span class="pill live">pinned</span><span class="link faint" data-act="unpin">clear pin</span>' : ""}
+        </div>
+      </div>
+      <div style="flex:10 1 440px;min-width:0">${
+        last ? renderPlayResult(last, pinned)
+             : '<div class="empty">Render a prompt to see the resolved output and its reproducible pin.</div>'}</div>
+    </div></div>`;
+}
+
 const SCREENS = {
   prompts: screenPrompts, overview: screenOverview, editor: screenEditor, diff: screenDiff,
   review: screenReview, rules: screenRules, pointers: screenPointers, segments: screenSegments,
-  approvals: screenApprovals, audit: screenAudit,
+  approvals: screenApprovals, play: screenPlay, audit: screenAudit,
 };
 
 // ── actions ──────────────────────────────────────────────────────────
@@ -727,6 +805,25 @@ const Actions = {
     try { await PATCH(`/mgmt/envs/${enc(State.env)}/rules/${ds.id}`, { status: ds.status }); toast(`Rule ${ds.id} → ${ds.status}`); render(); }
     catch (e) { toast(errText(e), true); }
   },
+  rollback(ds) {
+    openModal(`
+      <h3>Roll back targeting</h3>
+      <p class="hint">Restore <b>${esc(State.env)}</b>'s rule set to <span class="mono">rules_version ${esc(ds.rv)}</span>.
+        Rules created after that version are archived (they stop serving). This is itself
+        a change and bumps the rules_version — history stays append-only.</p>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn primary" data-act="rollbackConfirm" data-rv="${esc(ds.rv)}">Roll back to rv${esc(ds.rv)}</button>
+      </div>`);
+  },
+  async rollbackConfirm(ds) {
+    try {
+      const r = await POST(`/mgmt/envs/${enc(State.env)}/rollback`, { to_rules_version: parseInt(ds.rv) });
+      closeModal();
+      toast(`Rolled back to rv${ds.rv} — ${r.rules_changed} rule(s) changed`);
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
   async kill(ds) {
     const engage = ds.engage === "true";
     try { await POST(`/mgmt/envs/${enc(State.env)}/kill?prompt_id=${enc(ds.pid)}`, { engaged: engage }); toast(engage ? "Kill switch engaged" : "Rules restored"); render(); }
@@ -754,6 +851,30 @@ const Actions = {
       render();
     } catch (e) { toast(errText(e), true); }
   },
+  async play() {
+    window._playPid = el("playPid").value.trim();
+    window._playFlags = el("playFlags").value;
+    window._playVars = el("playVars").value;
+    let flags, vars;
+    try { flags = window._playFlags.trim() ? JSON.parse(window._playFlags) : {}; }
+    catch { return toast("Flags: invalid JSON", true); }
+    try { vars = window._playVars.trim() ? JSON.parse(window._playVars) : {}; }
+    catch { return toast("Variables: invalid JSON", true); }
+    const body = { flags, variables: vars, environment: State.env };
+    if (window._playPin) body.pin = window._playPin;
+    try {
+      window._playLast = await POST(`/prompt/${enc(window._playPid)}`, body);
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  pinLast() {
+    const r = window._playLast;
+    if (!r) return;
+    window._playPin = { versions: r.versions, rules_version: r.rules_version };
+    toast("Pinned — renders now reproduce this exact result");
+    Actions.play();
+  },
+  unpin() { window._playPin = null; toast("Pin cleared"); render(); },
   async approveChange(ds) {
     try {
       await POST(`/mgmt/envs/${enc(State.env)}/approvals/${ds.id}/approve`, {});
