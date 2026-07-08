@@ -25,6 +25,7 @@ from .core import (
     Unservable,
     UnresolvedPrompt,
     render,
+    render_source,
     resolve,
 )
 from .db import init_db, session_scope
@@ -148,6 +149,23 @@ class AppContext:
             except (UnresolvedPrompt, Unservable):
                 continue
         return out
+
+    def render_draft_source(
+        self, session: Session, env_id: str, prompt_id: str, source: str,
+        flags: dict, variables: dict,
+    ) -> str:
+        """Render an explicit draft/source top-level, resolving includes live."""
+        snap = self.get_snapshot(session, env_id)
+        result = render_source(snap, prompt_id, source, flags, variables, self.content)
+        return result.text
+
+    def render_at(
+        self, session: Session, env_id: str, prompt_id: str, version: int, sha: str,
+        flags: dict, variables: dict,
+    ) -> str:
+        """Render a specific committed SHA as the top-level (for rendered diffs)."""
+        blob = self.content.get(prompt_id, version, sha)
+        return self.render_draft_source(session, env_id, prompt_id, blob.source, flags, variables)
 
     def serve(
         self, session: Session, env_id: str, prompt_id: str,

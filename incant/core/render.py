@@ -22,6 +22,30 @@ from jinja2.exceptions import TemplateNotFound, UndefinedError
 from jinja2.exceptions import TemplateError as JinjaTemplateError
 from jinja2.sandbox import SandboxedEnvironment
 
+
+class GuardUndefined(StrictUndefined):
+    """Strict on *output*, lenient in *guard* positions.
+
+    Missing variables raise on direct output/access (``{{ x }}`` → 422), exactly
+    like ``StrictUndefined``. But a missing variable is falsy in a boolean test
+    (``{% if x %}``) and yields an empty iteration (``{% for m in x %}``) — the
+    guard forms our variable inference treats as marking a variable *optional*.
+    This keeps StrictUndefined's safety while letting guarded-optional variables
+    render without a supplied value (defaults are still applied pre-render when
+    the DB holds one).
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:  # {% if x %}
+        return False
+
+    def __iter__(self):  # {% for m in x %}
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
 from .errors import IncludeCycle, IncludeDepthExceeded, MissingVariable, RenderError
 from .evaluate import Skip, resolve
 from .model import ContentProvider, EnvSnapshot, Resolution
@@ -83,7 +107,7 @@ class _IncantEnvironment(SandboxedEnvironment):
 # The single shared environment. Autoescape off (plain text for LLMs); no
 # filesystem loader — content only ever arrives through the ContentProvider.
 _ENV = _IncantEnvironment(
-    undefined=StrictUndefined,
+    undefined=GuardUndefined,
     autoescape=False,
     cache_size=0,  # we maintain our own blob-keyed compiled cache
     auto_reload=False,
