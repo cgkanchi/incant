@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -56,6 +55,17 @@ class AppContext:
     def __post_init__(self) -> None:
         self.git = GitStore(self.settings.repo_dir())
         self.content = ContentStore(self.git)
+        # Lazy import avoids an import cycle (server.auth -> ... -> service).
+        from .server.auth import AuthCache
+        self.auth = AuthCache()
+
+    # ── auth (in-memory; survives DB outages) ─────────────────────────
+
+    def authenticate(self, session: Session, authorization: str | None):
+        return self.auth.identify(session, authorization)
+
+    def invalidate_auth(self) -> None:
+        self.auth.invalidate()
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -115,20 +125,6 @@ class AppContext:
                     except KeyError:
                         pass
 
-    # ── defaults for optional variables ──────────────────────────────
-
-    def _refinement_defaults(self, session: Session, prompt_id: str, version: int) -> dict:
-        out: dict[str, Any] = {}
-        for r in session.execute(
-            select(models.VariableRefinement).where(
-                models.VariableRefinement.prompt_id == prompt_id,
-                models.VariableRefinement.version_number == version,
-            )
-        ).scalars():
-            if r.default is not None:
-                out[r.name] = r.default
-        return out
-
     # ── serving ──────────────────────────────────────────────────────
 
     def evaluate(self, session: Session, env_id: str, prompt_id: str, flags: dict) -> Resolution:
@@ -181,7 +177,8 @@ class AppContext:
         except Unservable:
             raise ServingError(409, f"resolved content for {prompt_id!r} is unservable")
 
-        defaults = self._refinement_defaults(session, prompt_id, root.version)
+        # Optional-variable defaults come from the snapshot (no per-request DB read).
+        defaults = snap.refinement_defaults.get((prompt_id, root.version), {})
 
         try:
             result = render(snap, prompt_id, flags, variables, self.content, defaults=defaults)

@@ -12,7 +12,7 @@ from .. import models
 from ..service import AppContext, ServingError
 from . import metrics
 from .auth import AuthError, Identity
-from .deps import app_context, get_session, identity
+from .deps import app_context, get_readonly_session, serving_identity
 from .schemas import EvaluateRequest, RenderRequest
 
 router = APIRouter(tags=["serving"])
@@ -37,8 +37,8 @@ def _env(app: AppContext, req_env: str | None) -> str:
 def evaluate_prompt(
     prompt_id: str, req: EvaluateRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
+    session: Session = Depends(get_readonly_session),
+    ident: Identity = Depends(serving_identity),
 ):
     env = _env(app, req.environment)
     _require_render(ident, prompt_id, env)
@@ -59,8 +59,8 @@ def evaluate_prompt(
 def render_prompt(
     prompt_id: str, req: RenderRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
+    session: Session = Depends(get_readonly_session),
+    ident: Identity = Depends(serving_identity),
 ):
     env = _env(app, req.environment)
     _require_render(ident, prompt_id, env)
@@ -80,8 +80,8 @@ def render_prompt(
 def evaluate_all(
     req: EvaluateRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
+    session: Session = Depends(get_readonly_session),
+    ident: Identity = Depends(serving_identity),
 ):
     env = _env(app, req.environment)
     try:
@@ -104,8 +104,8 @@ def evaluate_all(
 def list_prompts(
     environment: str | None = None,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
+    session: Session = Depends(get_readonly_session),
+    ident: Identity = Depends(serving_identity),
 ):
     env = _env(app, environment)
     try:

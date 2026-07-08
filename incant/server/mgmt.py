@@ -439,6 +439,7 @@ def put_variable(
     reg = app.registry(session, ident.name)
     reg.set_refinement(prompt_id, version, req.name, type=req.type,
                        required=req.required, default=req.default, description=req.description)
+    app.invalidate()  # optional-var defaults are folded into snapshots
     return {"ok": True, "variables": _effective_variables(session, prompt_id, version)}
 
 
@@ -754,6 +755,7 @@ def create_env(
 @router.post("/keys")
 def create_key(
     req: KeyRequest,
+    app: AppContext = Depends(app_context),
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
@@ -767,5 +769,6 @@ def create_key(
                               name=req.principal_name))
     session.add(models.RoleBinding(principal_id=pid, role=req.role,
                                    project_id=req.project_id, environment_id=req.environment_id))
+    app.invalidate_auth()  # reload the in-memory key table so the new key authenticates
     return {"key": raw, "principal_id": pid, "role": req.role,
             "note": "store this key now; it is not recoverable"}

@@ -87,6 +87,14 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
     ).scalars().all():
         defaults[d.prompt_id] = d.version_number
 
+    # Refinement defaults for optional variables — folded in so the render hot
+    # path resolves them from memory rather than a per-request DB SELECT.
+    refinement_defaults: dict[tuple[str, int], dict] = defaultdict(dict)
+    for r in session.execute(
+        select(models.VariableRefinement).where(models.VariableRefinement.default.isnot(None))
+    ).scalars().all():
+        refinement_defaults[(r.prompt_id, r.version_number)][r.name] = r.default
+
     # Rules
     rules: list[CoreRule] = []
     for r in session.execute(
@@ -124,6 +132,7 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
         rules=rules,
         segments=segments,
         defaults=defaults,
+        refinement_defaults={k: dict(v) for k, v in refinement_defaults.items()},
         versions={k: dict(v) for k, v in versions.items()},
         track_tip=env.track_tip,
         stale=stale,

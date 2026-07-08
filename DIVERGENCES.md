@@ -24,6 +24,18 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
   `GET /prompts` now returns 404, not 500 (§3). Tests added in `test_gitstore.py`,
   `test_server.py`, `test_integration.py`.
 
+- **Batch 2 — hot-path outage tolerance (done)** (§1.1, §8, §10, §15): the render
+  path now does zero per-request DB round-trips. API keys are served from an
+  in-memory `AuthCache` (TTL refresh + throttled on-miss reload) that keeps
+  authenticating through a Postgres outage; the per-request `last_used_at` write is
+  gone and serving uses a read-only, never-committing session (§15). Optional-variable
+  refinement defaults are folded into the `EnvSnapshot`, so `serve()` reads them from
+  memory. The `rules_version` poll was already outage-tolerant; together these make an
+  actual `docker compose stop db` keep serving `HTTP 200 stale_rules:true` (verified in
+  the container, including rule resolution), clearing on recovery. Key issuance and
+  refinement edits invalidate the auth/snapshot caches. Tests: auth-survives-outage,
+  serve-during-outage, created-key-immediately-valid, serving-path-does-not-write.
+
 ---
 
 ## 1. Guarantee-breaking bugs (P0)

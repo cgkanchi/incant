@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 
 import datetime as dt
 
+from sqlalchemy import select
+
 from incant import db, models
 from incant.config import Settings, set_settings
 from incant.db import session_scope
@@ -224,6 +226,49 @@ def test_rendered_diff_missing_vars_is_graceful_not_500(client):
     r = client.get(f"/mgmt/prompts/support/novars/diff?{q}", headers=auth())
     assert r.status_code == 200
     assert "error" in r.json()  # graceful render-failed note, not a 500
+
+
+def test_auth_cache_survives_db_outage(client):
+    # §8/§10: keys are checked in-memory; auth continues through a DB outage.
+    from sqlalchemy.exc import SQLAlchemyError
+    from incant.server.auth import AuthCache
+
+    cache = AuthCache()
+    with session_scope() as s:
+        ident = cache.identify(s, f"Bearer {ADMIN}")
+    assert ident.has("admin")
+
+    cache._last_refresh = 0.0  # force a refresh attempt on next identify
+
+    class BoomSession:
+        def execute(self, *a, **k):
+            raise SQLAlchemyError("db down")
+
+        def rollback(self):
+            pass
+
+    ident2 = cache.identify(BoomSession(), f"Bearer {ADMIN}")  # falls back to cache
+    assert ident2.principal_id == ident.principal_id and ident2.has("admin")
+
+
+def test_created_key_authenticates_immediately(client):
+    # Issuing a key invalidates the in-memory table, so it works on the next call.
+    r = client.post("/mgmt/keys", json={"principal_name": "svc", "role": "viewer"}, headers=auth())
+    assert r.status_code == 200, r.text
+    newkey = r.json()["key"]
+    r = client.get("/mgmt/overview?environment=prod", headers=auth(newkey))
+    assert r.status_code == 200, r.text
+
+
+def test_serving_path_does_not_write(client):
+    # §8/§15: read replicas must not write on the render path. last_used_at stays null.
+    client.post("/prompt/support/system",
+                json={"variables": {"customer_name": "Acme", "history": []}},
+                headers=auth(client.renderer_key))
+    with session_scope() as s:
+        used = [k.last_used_at for k in
+                s.execute(select(models.ApiKey)).scalars().all()]
+    assert all(u is None for u in used)
 
 
 def test_expired_key_is_rejected(client):

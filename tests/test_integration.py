@@ -90,6 +90,30 @@ def test_stale_flag_clears_after_db_recovery(app):
     assert recovered.stale is False  # flag clears once the DB is back (no sticky mutation)
 
 
+def test_serve_continues_during_db_outage(app):
+    # §10: a Postgres outage must not take down serving. After a warm render the
+    # snapshot is cached; the render path does no per-request DB read, so a broken
+    # session still serves — flagged stale_rules.
+    _author_version(app, "support/system", 1, "Hi {{ name }}")
+    app.invalidate("prod")
+    with session_scope() as s:
+        warm = app.serve(s, "prod", "support/system", {}, {"name": "Acme"})
+    assert warm["stale_rules"] is False and warm["prompt"] == "Hi Acme"
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    class BoomSession:
+        def get(self, *a, **k):
+            raise SQLAlchemyError("db down")
+
+        def execute(self, *a, **k):
+            raise SQLAlchemyError("db down")
+
+    out = app.serve(BoomSession(), "prod", "support/system", {}, {"name": "Zed"})
+    assert out["prompt"] == "Hi Zed"       # still rendered from the frozen snapshot
+    assert out["stale_rules"] is True
+
+
 def test_full_loop_render(app):
     _author_version(app, "shared/style/language-rules", 1, "Write in plain English.")
     _author_version(

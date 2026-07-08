@@ -154,6 +154,9 @@ class EnvSnapshot:
     rules: list[Rule] = field(default_factory=list)
     segments: dict[str, Segment] = field(default_factory=dict)
     defaults: dict[str, int] = field(default_factory=dict)  # prompt_id -> version number
+    # (prompt_id, version_number) -> {var_name -> default value} for optional vars.
+    # Folded into the snapshot so the render hot path needs no per-request DB read.
+    refinement_defaults: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
     # prompt_id -> {version_number -> VersionInfo}
     versions: dict[str, dict[int, VersionInfo]] = field(default_factory=dict)
     track_tip: bool = False
