@@ -154,6 +154,32 @@ def test_tweak_flow_over_http(client):
     assert "BRAND NEW LINE" in r.json()["prompt"]
 
 
+def test_rendered_diff_uses_test_context(client):
+    v = client.get("/mgmt/prompts/support/system/versions?environment=prod", headers=auth()).json()
+    v2 = next(x for x in v["versions"] if x["version"] == 2)
+    q = (f"a_version=2&a_sha={v2['live_full_sha']}&b_version=2&b_sha={v2['tip_full_sha']}"
+         f"&mode=rendered&environment=prod")
+    r = client.get(f"/mgmt/prompts/support/system/diff?{q}", headers=auth())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["context"] == "enterprise-us"       # picked a test context that supplies vars
+    assert "formal, professional tone" in body["diff"]      # removed line
+    assert "Write in plain English" in body["diff"]         # fragment expanded, added line
+
+
+def test_rendered_diff_missing_vars_is_graceful_not_500(client):
+    # A prompt with a required var and NO test context must not 500 the diff endpoint.
+    client.post("/mgmt/prompts", json={"prompt_id": "support/novars"}, headers=auth())
+    d = client.post("/mgmt/prompts/support/novars/drafts",
+                    json={"version_number": 1, "content": "Hi {{ who }}"}, headers=auth()).json()
+    client.post(f"/mgmt/drafts/{d['id']}/review", json={"reviewer": "rae"}, headers=auth())
+    sha = client.post(f"/mgmt/drafts/{d['id']}/commit", json={"author": "sam"}, headers=auth()).json()["full_sha"]
+    q = f"a_version=1&a_sha={sha}&b_version=1&b_sha={sha}&mode=rendered&environment=prod"
+    r = client.get(f"/mgmt/prompts/support/novars/diff?{q}", headers=auth())
+    assert r.status_code == 200
+    assert "error" in r.json()  # graceful render-failed note, not a 500
+
+
 def test_kill_switch_over_http(client):
     r = client.post("/mgmt/envs/prod/kill?prompt_id=support/system",
                     json={"engaged": True}, headers=auth())

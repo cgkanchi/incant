@@ -196,13 +196,16 @@ def get_versions(
             "notes": v.notes,
             "is_default": v.number == default_v,
             "live_sha": (live.to_sha[:7] if live else None),
+            "live_full_sha": (live.to_sha if live else None),
             "live_at": (live.moved_at.isoformat() if live else None),
             "tip_sha": (tip.sha[:7] if tip else None),
+            "tip_full_sha": (tip.sha if tip else None),
             "tip_author": (tip.author if tip else None),
             "tip_when": (tip.date if tip else None),
             "tip_ahead": _tip_ahead(session, environment, prompt_id, v.number, live.to_sha) if live else 0,
             "history": [
-                {"sha": c.sha[:7], "author": c.author, "when": c.date, "subject": c.subject}
+                {"sha": c.sha[:7], "full_sha": c.sha, "author": c.author,
+                 "when": c.date, "subject": c.subject}
                 for c in hist
             ],
         })
@@ -465,22 +468,29 @@ def put_test_context(
 @router.get("/prompts/{prompt_id:path}/diff")
 def diff_versions(
     prompt_id: str, a_version: int, a_sha: str, b_version: int, b_sha: str,
-    mode: str = "source", environment: str = "prod",
-    flags: str | None = None,
+    mode: str = "source", environment: str = "prod", test_context: str | None = None,
     app: AppContext = Depends(app_context),
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "viewer", project=_project_of(prompt_id))
     if mode == "rendered":
-        f = {}
-        left = app.render_at(session, environment, prompt_id, a_version, a_sha, f, {})
-        right = app.render_at(session, environment, prompt_id, b_version, b_sha, f, {})
+        reg = app.registry(session)
+        tcs = reg.get_test_contexts(prompt_id)
+        tc = next((t for t in tcs if t.name == test_context), tcs[0] if tcs else None)
+        flags = tc.flags if tc else {}
+        variables = tc.variables if tc else {}
+        try:
+            left = app.render_at(session, environment, prompt_id, a_version, a_sha, flags, variables)
+            right = app.render_at(session, environment, prompt_id, b_version, b_sha, flags, variables)
+        except Exception as exc:
+            return {"mode": "rendered", "diff": "", "context": (tc.name if tc else None),
+                    "error": f"render failed — {exc}. Add a test context that supplies required variables."}
         diff = list(difflib.unified_diff(
             left.splitlines(), right.splitlines(), lineterm="", n=3,
             fromfile=f"v{a_version}@{a_sha[:7]}", tofile=f"v{b_version}@{b_sha[:7]}",
         ))
-        return {"mode": "rendered", "diff": "\n".join(diff)}
+        return {"mode": "rendered", "diff": "\n".join(diff), "context": (tc.name if tc else None)}
     left = app.git.read(f"{prompt_id}/v{a_version}.j2", ref=a_sha) or ""
     right = app.git.read(f"{prompt_id}/v{b_version}.j2", ref=b_sha) or ""
     diff = list(difflib.unified_diff(

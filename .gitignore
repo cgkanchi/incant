@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local runtime state (canonical repo, caches, dev DB)
+/var/
+*.db
+.env
+
+# Playwright / screenshots
+.playwright-mcp/
+*.png
+

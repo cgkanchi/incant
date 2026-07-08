@@ -68,9 +68,10 @@ def create_app() -> FastAPI:
         @app.get("/", response_class=HTMLResponse)
         def index():
             index_file = _UI_DIR / "index.html"
+            headers = {"Cache-Control": "no-store"}
             if index_file.exists():
-                return HTMLResponse(index_file.read_text())
-            return HTMLResponse("<h1>Incant</h1><p>UI not built.</p>")
+                return HTMLResponse(index_file.read_text(), headers=headers)
+            return HTMLResponse("<h1>Incant</h1><p>UI not built.</p>", headers=headers)
 
         app.mount("/ui", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
 
