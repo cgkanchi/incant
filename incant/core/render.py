@@ -14,7 +14,7 @@ and enforces the depth limit (static validation is the primary cycle guard).
 from __future__ import annotations
 
 import contextvars
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from jinja2 import StrictUndefined, Template, Undefined
@@ -55,6 +55,37 @@ _current: contextvars.ContextVar[_RenderCtx | None] = contextvars.ContextVar(
 )
 
 
+def _fetch(ctx: _RenderCtx, prompt_id: str, res: Resolution):
+    """Fetch a resolution's content, applying the §10 within-version fallback.
+
+    The evaluator's ``servable`` predicate only knows about *validation*; the real
+    §10 trigger is content that is validated but unfetchable (cache lost + store
+    unreachable), which surfaces here as ``KeyError``. For a *live* resolution we
+    then serve the newest previous-live SHA whose content IS available, flagging
+    ``content_fallback``. Pinned SHA / tip resolutions never degrade.
+
+    Returns ``(blob, resolution)`` — the resolution updated to the served SHA.
+    """
+    try:
+        return ctx.content.get(prompt_id, res.version, res.commit), res
+    except KeyError:
+        if res.at != "live":
+            raise
+        for row in ctx.snapshot.versions.get(prompt_id, {}).values():
+            if row.version != res.version:
+                continue
+            for sha in row.previous_live:
+                if sha == res.commit or not ctx.snapshot.servable(prompt_id, sha):
+                    continue
+                try:
+                    blob = ctx.content.get(prompt_id, res.version, sha)
+                except KeyError:
+                    continue
+                ctx.fallback = True
+                return blob, replace(res, commit=sha, content_fallback=True)
+        raise
+
+
 class _IncantEnvironment(SandboxedEnvironment):
     """A sandboxed environment whose includes resolve through the targeting engine."""
 
@@ -63,10 +94,10 @@ class _IncantEnvironment(SandboxedEnvironment):
         if ctx is None:  # pragma: no cover - defensive
             raise TemplateNotFound(name)
         res = resolve(ctx.snapshot, name, ctx.flags, skips=ctx.skips)
-        ctx.contributions[name] = res
         if res.content_fallback:
             ctx.fallback = True
-        blob = ctx.content.get(name, res.version, res.commit)
+        blob, res = _fetch(ctx, name, res)  # §10 within-version fallback
+        ctx.contributions[name] = res
         base = _compile(self, blob.blob_sha, blob.source, name)
         return _stack_wrapped(base, name)
 
@@ -216,11 +247,11 @@ def render(
 
     ctx = _RenderCtx(snapshot=snapshot, flags=flags, content=content)
     root = resolve(snapshot, prompt_id, flags, skips=ctx.skips)
-    ctx.contributions[prompt_id] = root
     if root.content_fallback:
         ctx.fallback = True
 
-    blob = content.get(prompt_id, root.version, root.commit)
+    blob, root = _fetch(ctx, prompt_id, root)  # §10 within-version fallback
+    ctx.contributions[prompt_id] = root
     return _render_compiled(ctx, prompt_id, blob.blob_sha, blob.source, variables, defaults, root)
 
 

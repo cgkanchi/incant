@@ -69,6 +69,20 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
   *Remaining:* env-**default** changes still apply directly on protected envs (releaser-
   gated) rather than via propose→approve (§3) — deferred to avoid seed churn.
 
+- **Batch 5 (in progress) — §1.5 within-version fallback wired (done)**: the §10
+  fallback can now actually fire. The evaluator's `servable` predicate only knew about
+  validation, so a SHA that is validated but *unfetchable* (cache lost + store
+  unreachable — the real §10 trigger, surfacing as `KeyError` from `ContentStore.get`)
+  went straight to 409. Content fetching now applies the fallback at the fetch point:
+  for a *live* resolution (root or include), if the resolved SHA's content can't be
+  fetched, serve the newest previous-live SHA whose content IS available and flag
+  `content_fallback`. Pinned-SHA and tip resolutions never degrade (still 409). Tests
+  in `test_render.py`. **All P0 guarantee-breaking bugs (§1.1–§1.7) are now closed.**
+  *Still open in §2 (larger, mostly design phase-4/5 additive):* pin replay (§1.8),
+  targeting revisions/rollback (§2.4), track_tip consumption (§2.3), effective-schema
+  closure in the mgmt API (§2.10 — closure walk already exists in the renderer), plus
+  backup pusher, OIDC, Alembic, and the remaining metrics.
+
 ---
 
 ## 1. Guarantee-breaking bugs (P0)

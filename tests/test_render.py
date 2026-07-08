@@ -161,6 +161,35 @@ def test_sandbox_blocks_attribute_access():
         render(snap, SYS, {}, {}, content)
 
 
+def test_within_version_fallback_on_unfetchable_live_content():
+    # §1.5/§10: the live SHA is validated (servable=True) but its content is
+    # unfetchable (cache lost + store unreachable -> KeyError). Serve the previous
+    # live SHA's content with content_fallback=True, rather than 409-ing.
+    content = DictContent({(SYS, "old"): "old-content"})   # note: no (SYS, "live")
+    snap = snapshot(
+        versions={SYS: {1: vinfo(1, live="live", previous=("old",))}},
+        defaults={SYS: 1},                                 # servable default: all True
+    )
+    r = render(snap, SYS, {}, {}, content)
+    assert r.text == "old-content" and r.content_fallback is True
+    assert r.contributions[SYS].commit == "old"
+    assert r.contributions[SYS].content_fallback is True
+
+
+def test_pinned_sha_does_not_fall_back_on_missing_content():
+    # A pinned-SHA resolution must NOT degrade to a previous SHA — it 409s (KeyError).
+    import pytest as _pytest
+    content = DictContent({(SYS, "old"): "old"})
+    snap = snapshot(
+        versions={SYS: {1: vinfo(1, live="live", previous=("old",))}},
+        defaults={SYS: 1},
+        rules=[parse_rule({"id": "pin", "scope": "prompt", "prompt_id": SYS, "priority": 1,
+                           "when": None, "serve": {"version": 1, "at": "sha", "sha": "live"}})],
+    )
+    with _pytest.raises(KeyError):
+        render(snap, SYS, {}, {}, content)
+
+
 def test_content_fallback_flag_propagates():
     content = DictContent({(SYS, "old"): "old-content"})
     dead = {"live"}
