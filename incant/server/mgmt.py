@@ -183,8 +183,12 @@ def get_versions(
     snap = build_snapshot(session, environment)
     vers = snap.versions.get(prompt_id, {})
     default_v = snap.defaults.get(prompt_id)
+    version_rows = reg.get_versions(prompt_id)
+    # Show effective variables/includes for the default version, or the newest
+    # committed version when no default is set yet (e.g. a brand-new prompt).
+    display_v = default_v or (version_rows[0].number if version_rows else None)
     out = []
-    for v in reg.get_versions(prompt_id):
+    for v in version_rows:
         vinfo = vers.get(v.number)
         hist = app.git.history(f"{prompt_id}/v{v.number}.j2")
         tip = hist[0] if hist else None
@@ -213,8 +217,9 @@ def get_versions(
         "prompt_id": prompt_id,
         "environment": environment,
         "versions": out,
-        "variables": _effective_variables(session, prompt_id, default_v) if default_v else [],
-        "includes": _includes_of(app, prompt_id, default_v) if default_v else [],
+        "variables": _effective_variables(session, prompt_id, display_v) if display_v else [],
+        "includes": _includes_of(app, prompt_id, display_v) if display_v else [],
+        "display_version": display_v,
     }
 
 
@@ -265,15 +270,15 @@ def create_draft(
 
 def _draft_payload(app, reg, d) -> dict:
     content = reg.draft_content(d.id)
-    ev = extract(content) if content else None
-    val = reg.validate(d.prompt_id, content) if content else None
+    ev = extract(content)                       # empty content -> empty var set
+    val = reg.validate(d.prompt_id, content)    # empty template is valid
     return {
         "id": d.id, "prompt_id": d.prompt_id, "version_number": d.version_number,
         "base_sha": (d.base_sha[:7] if d.base_sha else None),
         "title": d.title, "author": d.author, "status": d.status,
         "content": content,
-        "variables": ev.as_dict() if ev else None,
-        "lint": {"status": val.status, "error": val.error} if val else None,
+        "variables": ev.as_dict(),
+        "lint": {"status": val.status, "error": val.error},
     }
 
 

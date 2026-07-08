@@ -60,6 +60,22 @@ function errText(e) {
 }
 function go(hash) { location.hash = hash; }
 
+// ── modal ────────────────────────────────────────────────────────────
+function openModal(html) {
+  closeModal();
+  const o = document.createElement("div");
+  o.id = "modal";
+  o.className = "modal-overlay";
+  o.innerHTML = `<div class="modal" data-act="noop">${html}</div>`;
+  document.body.appendChild(o);
+  const first = o.querySelector("input, textarea");
+  if (first) first.focus();
+}
+function closeModal() {
+  const m = el("modal");
+  if (m) m.remove();
+}
+
 // ── describe rules ───────────────────────────────────────────────────
 const OPSYM = { eq: "=", neq: "≠", in: "∈", not_in: "∉", contains: "⊇", starts_with: "starts", ends_with: "ends",
   matches: "~", gt: ">", gte: "≥", lt: "<", lte: "≤", semver_gt: "semver>", semver_lt: "semver<", exists: "exists" };
@@ -194,7 +210,8 @@ async function screenPrompts() {
     <div class="h1row"><span class="h1">Prompts</span>
       <span class="sub">${data.projects.length} projects · env ${esc(State.env)} · rules_version ${data.rules_version}</span>
       <div class="grow"></div>
-      <span class="search">Search prompts…</span></div>`;
+      <input class="search" id="promptSearch" placeholder="Search prompts…" data-act="search" spellcheck="false">
+      <button class="btn primary" data-act="newPrompt">New prompt</button></div>`;
   for (const proj of data.projects) {
     html += `<div class="groupname">${esc(proj.project.toUpperCase())}</div>
       <div class="card" style="margin-bottom:20px"><table class="grid">
@@ -205,7 +222,7 @@ async function screenPrompts() {
       const status = p.tip_ahead > 0
         ? `<span class="pill warn">tip ahead +${p.tip_ahead}</span>` : `<span class="faint">tip = live</span>`;
       const upd = p.updated ? `${ago(p.updated.when)} · ${esc(p.updated.who)}` : "";
-      html += `<tr class="grow-row click" data-act="go" data-hash="#/p/${enc(p.prompt_id)}/overview">
+      html += `<tr class="grow-row click prow" data-pid="${esc(p.prompt_id)}" data-act="go" data-hash="#/p/${enc(p.prompt_id)}/overview">
         <td><span class="pid">${esc(p.prompt_id)}</span></td>
         <td>${p.versions}</td><td>${live}</td><td>${status}</td>
         <td class="muted">${upd}</td></tr>`;
@@ -573,6 +590,56 @@ const Actions = {
     render();
   },
   toggleTweak() { State.tweakOpen = !State.tweakOpen; render(); },
+  noop() {},
+  closeModal() { closeModal(); },
+  search(ds, ev) {
+    const q = (ev.target.value || "").toLowerCase().trim();
+    document.querySelectorAll("tr.prow").forEach((r) => {
+      r.style.display = !q || r.dataset.pid.toLowerCase().includes(q) ? "" : "none";
+    });
+  },
+  newPrompt() {
+    openModal(`
+      <h3>New prompt</h3>
+      <p class="hint">A prompt id is a path: <span class="mono">project/name</span> (e.g.
+        <span class="mono">support/refunds</span>). A new leading segment creates a new project.
+        Fragments are just prompts — this can be included by any other.</p>
+      <div class="field"><label>Prompt id</label>
+        <input id="npId" placeholder="support/refunds" spellcheck="false"></div>
+      <div class="field"><label>Description <span style="text-transform:none;font-weight:400">(optional)</span></label>
+        <textarea id="npDesc" placeholder="What this prompt is for…"></textarea></div>
+      <div class="err" id="npErr"></div>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn primary" data-act="createPrompt">Create &amp; edit v1</button>
+      </div>`);
+  },
+  async createPrompt() {
+    const id = (el("npId").value || "").trim().replace(/^\/+|\/+$/g, "");
+    const desc = (el("npDesc").value || "").trim();
+    const errEl = el("npErr");
+    if (!id || !id.includes("/")) {
+      errEl.textContent = "Enter a path like project/name (needs at least one “/”).";
+      return;
+    }
+    if (!/^[a-z0-9]([a-z0-9._\/-]*[a-z0-9])?$/i.test(id)) {
+      errEl.textContent = "Use letters, numbers, dashes, dots, and “/” only.";
+      return;
+    }
+    errEl.textContent = "";
+    try {
+      await POST("/mgmt/prompts", { prompt_id: id, description: desc });
+      const draft = await POST(`/mgmt/prompts/${enc(id)}/drafts`,
+        { version_number: 1, title: "v1", content: "" });
+      closeModal();
+      toast(`Created ${id} — start writing v1`);
+      go(`#/p/${enc(id)}/editor?draft=${draft.id}`);
+    } catch (e) {
+      if (e.status === 409) errEl.textContent = "A prompt with that id already exists.";
+      else if (e.status === 403) errEl.textContent = "You don't have editor access on that project.";
+      else errEl.textContent = errText(e);
+    }
+  },
   async newVersion() {
     const pid = State.route.pid;
     try {
@@ -687,6 +754,13 @@ document.addEventListener("click", (ev) => {
 document.addEventListener("change", (ev) => {
   const t = ev.target.closest("[data-act]");
   if (t && t.dataset.act === "env") Actions.env(t.dataset, ev);
+});
+document.addEventListener("input", (ev) => {
+  const t = ev.target.closest("[data-act]");
+  if (t && t.dataset.act === "search") Actions.search(t.dataset, ev);
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") closeModal();
 });
 window.addEventListener("hashchange", render);
 

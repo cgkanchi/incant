@@ -157,6 +157,45 @@ def test_tweak_flow_over_http(client):
     assert "BRAND NEW LINE" in r.json()["prompt"]
 
 
+def test_create_new_prompt_flow(client):
+    # New prompt in a new project (review_policy 0 -> commit needs no approval).
+    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/welcome",
+                                           "description": "welcome message"}, headers=auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["prompt_id"] == "growth/welcome"
+
+    # It shows up immediately in the overview with zero versions.
+    ov = client.get("/mgmt/overview?environment=prod", headers=auth()).json()
+    growth = next(p for p in ov["projects"] if p["project"] == "growth")
+    wp = next(p for p in growth["prompts"] if p["prompt_id"] == "growth/welcome")
+    assert wp["versions"] == 0 and wp["live_version"] is None
+
+    # Start a v1 draft (empty content lints valid), write, commit.
+    d = client.post("/mgmt/prompts/growth/welcome/drafts",
+                    json={"version_number": 1, "content": ""}, headers=auth()).json()
+    assert d["lint"]["status"] == "valid"
+    client.put(f"/mgmt/drafts/{d['id']}/content",
+               json={"content": "Welcome, {{ name }}!"}, headers=auth())
+    r = client.post(f"/mgmt/drafts/{d['id']}/commit", json={"author": "sam"}, headers=auth())
+    assert r.status_code == 200, r.text
+    sha = r.json()["full_sha"]
+
+    # Make it live + default, then it serves.
+    client.post("/mgmt/envs/prod/defaults",
+                json={"prompt_id": "growth/welcome", "version_number": 1}, headers=auth())
+    client.post("/mgmt/envs/prod/pointers",
+                json={"prompt_id": "growth/welcome", "version_number": 1,
+                      "to_sha": sha, "force": True}, headers=auth())
+    r = client.post("/prompt/growth/welcome", json={"variables": {"name": "Kai"}}, headers=auth())
+    assert r.status_code == 200 and r.json()["prompt"] == "Welcome, Kai!"
+
+
+def test_create_duplicate_prompt_is_409(client):
+    client.post("/mgmt/prompts", json={"prompt_id": "growth/dup"}, headers=auth())
+    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/dup"}, headers=auth())
+    assert r.status_code == 409
+
+
 def test_rendered_diff_uses_test_context(client):
     v = client.get("/mgmt/prompts/support/system/versions?environment=prod", headers=auth()).json()
     v2 = next(x for x in v["versions"] if x["version"] == 2)
