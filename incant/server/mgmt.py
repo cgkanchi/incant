@@ -30,6 +30,7 @@ from .schemas import (
     DraftContentRequest,
     DraftRenderRequest,
     EnvironmentRequest,
+    EnvSettingsRequest,
     KeyRequest,
     KillRequest,
     PointerRequest,
@@ -554,7 +555,7 @@ def list_envs(
 ):
     return {"environments": [
         {"id": e.id, "protected": e.protected, "track_tip": e.track_tip,
-         "rules_version": e.rules_version}
+         "allow_self_approval": e.allow_self_approval, "rules_version": e.rules_version}
         for e in session.execute(select(models.Environment)).scalars()
     ]}
 
@@ -766,8 +767,11 @@ def list_approvals(
     ident: Identity = Depends(identity),
 ):
     _require(ident, "viewer", environment=env)
+    e = session.get(models.Environment, env)
     tgt = app.targeting(session, ident.name)
-    return {"environment": env, "approvals": [
+    return {"environment": env,
+            "allow_self_approval": bool(e and e.allow_self_approval),
+            "approvals": [
         {"id": a.id, "change": a.change, "proposed_by": a.proposed_by,
          "status": a.status, "created_at": a.created_at.isoformat()}
         for a in tgt.list_pending_approvals(env)
@@ -880,9 +884,33 @@ def create_env(
     _require(ident, "admin")
     if session.get(models.Environment, req.id) is None:
         session.add(models.Environment(
-            id=req.id, name=req.id, protected=req.protected, track_tip=req.track_tip
+            id=req.id, name=req.id, protected=req.protected, track_tip=req.track_tip,
+            allow_self_approval=req.allow_self_approval,
         ))
     return {"ok": True, "id": req.id}
+
+
+@router.patch("/envs/{env}")
+def update_env(
+    env: str, req: EnvSettingsRequest,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "admin")
+    e = session.get(models.Environment, env)
+    if e is None:
+        raise HTTPException(404, f"unknown environment {env}")
+    if req.protected is not None:
+        e.protected = req.protected
+    if req.track_tip is not None:
+        e.track_tip = req.track_tip
+    if req.allow_self_approval is not None:
+        e.allow_self_approval = req.allow_self_approval
+    session.flush()
+    app.invalidate(env)
+    return {"id": e.id, "protected": e.protected, "track_tip": e.track_tip,
+            "allow_self_approval": e.allow_self_approval}
 
 
 @router.post("/keys")

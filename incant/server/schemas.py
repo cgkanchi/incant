@@ -132,6 +132,14 @@ class EnvironmentRequest(BaseModel):
     id: str
     protected: bool = False
     track_tip: bool = False
+    allow_self_approval: bool = True
+
+
+class EnvSettingsRequest(BaseModel):
+    # Partial update of an environment's governance settings; unset fields untouched.
+    protected: Optional[bool] = None
+    track_tip: Optional[bool] = None
+    allow_self_approval: Optional[bool] = None
 
 
 class KeyRequest(BaseModel):

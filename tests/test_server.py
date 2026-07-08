@@ -76,16 +76,33 @@ def test_protected_pointer_proposes_then_distinct_releaser_approves(client):
     assert tl["moves"][0]["full_sha"] == sha
 
 
-def test_releaser_cannot_approve_own_proposal(client):
+def test_self_approval_allowed_by_default_and_can_be_disabled(client):
     sha = _tip_sha(client)
     rel = make_key(client, "releaser", env="prod")
-    r = client.post("/mgmt/envs/prod/pointers",
+
+    def propose_and_self_approve():
+        client.post("/mgmt/envs/prod/pointers",
                     json={"prompt_id": "support/system", "version_number": 2, "to_sha": sha},
                     headers=auth(rel))
-    assert r.json()["status"] == "proposed"
-    apid = client.get("/mgmt/envs/prod/approvals", headers=auth(rel)).json()["approvals"][-1]["id"]
-    r = client.post(f"/mgmt/envs/prod/approvals/{apid}/approve", headers=auth(rel))
+        apid = client.get("/mgmt/envs/prod/approvals",
+                          headers=auth(rel)).json()["approvals"][-1]["id"]
+        return client.post(f"/mgmt/envs/prod/approvals/{apid}/approve", headers=auth(rel))
+
+    # Opt-out default: the proposer may approve their own change.
+    r = propose_and_self_approve()
+    assert r.status_code == 200 and r.json()["status"] == "approved", r.text
+    aud = client.get("/mgmt/envs/prod/approvals", headers=auth()).json()
+    assert aud["allow_self_approval"] is True
+
+    # Disable it (admin) -> a distinct approver is now required again.
+    assert client.patch("/mgmt/envs/prod", json={"allow_self_approval": False},
+                        headers=auth()).status_code == 200
+    r = propose_and_self_approve()
     assert r.status_code == 400  # approver must differ from proposer
+    # A distinct principal can still approve the now-pending change.
+    apid = client.get("/mgmt/envs/prod/approvals", headers=auth()).json()["approvals"][-1]["id"]
+    assert client.post(f"/mgmt/envs/prod/approvals/{apid}/approve",
+                       headers=auth()).status_code == 200
 
 
 def test_operator_cannot_force_release(client):

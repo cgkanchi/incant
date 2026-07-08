@@ -607,13 +607,21 @@ async function screenApprovals() {
         <button class="btn primary" data-act="approveChange" data-id="${a.id}">Approve ✓</button>
         <button class="btn" data-act="rejectChange" data-id="${a.id}">Reject</button></td></tr>`;
   }).join("");
+  const selfOk = d.allow_self_approval;
+  const selfBadge = selfOk
+    ? `<span class="pill live">self-approval on</span><span class="link faint" data-act="toggleSelfApproval" data-to="false">require distinct approver</span>`
+    : `<span class="pill warn">four-eyes</span><span class="link" data-act="toggleSelfApproval" data-to="true">allow self-approval</span>`;
   el("main").innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Approvals — <i>${esc(State.env)}</i></span>
-      <span class="sub">pointer-class changes proposed in a protected environment</span></div>
+      <span class="sub">pointer-class changes proposed in a protected environment</span>
+      <div class="grow"></div>${selfBadge}</div>
     <div class="card" style="overflow-x:auto"><table class="grid">
       <thead class="ghead"><tr><th>#</th><th>Change</th><th>Proposed by</th><th>When</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="5" class="empty">No pending approvals.</td></tr>'}</tbody></table></div>
-    <div style="font-size:11px;color:var(--faint);margin-top:12px">A releaser other than the proposer approves; approving advances the live pointer immediately. Break-glass <span class="mono">force</span> releases bypass this and are gated to releaser.</div></div>`;
+    <div style="font-size:11px;color:var(--faint);margin-top:12px">${selfOk
+      ? "A releaser approves — self-approval is allowed here, so the proposer may approve their own change."
+      : "A releaser <i>other than the proposer</i> approves — separation of duties is enforced on this environment."}
+      Approving advances the live pointer immediately. Break-glass <span class="mono">force</span> releases bypass this and are gated to releaser.</div></div>`;
 }
 
 function renderPlayResult(r, pinned) {
@@ -875,6 +883,14 @@ const Actions = {
     Actions.play();
   },
   unpin() { window._playPin = null; toast("Pin cleared"); render(); },
+  async toggleSelfApproval(ds) {
+    const to = ds.to === "true";
+    try {
+      await PATCH(`/mgmt/envs/${enc(State.env)}`, { allow_self_approval: to });
+      toast(to ? "Self-approval allowed on " + State.env : "Distinct approver now required on " + State.env);
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
   async approveChange(ds) {
     try {
       await POST(`/mgmt/envs/${enc(State.env)}/approvals/${ds.id}/approve`, {});

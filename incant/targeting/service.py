@@ -290,9 +290,10 @@ class TargetingService:
             raise TargetingError(f"unknown approval {approval_id}")
         if appr.status != "pending":
             raise TargetingError(f"approval {approval_id} is already {appr.status}")
-        if appr.proposed_by == self.actor:
-            raise TargetingError("approver must differ from proposer")
         env = self._env(appr.environment_id)
+        self_approved = appr.proposed_by == self.actor
+        if self_approved and not env.allow_self_approval:
+            raise TargetingError("approver must differ from proposer")
         ch = appr.change
         kind = ch.get("kind")
         if kind == "make_live":
@@ -307,7 +308,7 @@ class TargetingService:
         appr.approved_by = self.actor
         self.s.flush()
         record_audit(self.s, self.actor, "approval.approve", "approval", str(approval_id),
-                     after=ch)
+                     after={**ch, "self_approved": self_approved})
         return appr
 
     def reject(self, approval_id: int) -> models.Approval:

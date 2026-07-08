@@ -140,6 +140,9 @@ class Environment(Base):
     name: Mapped[str] = mapped_column(String)
     protected: Mapped[bool] = mapped_column(Boolean, default=False)
     track_tip: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Separation of duties for protected-env approvals is opt-out: by default the
+    # proposer may approve their own change; disable to require a distinct approver.
+    allow_self_approval: Mapped[bool] = mapped_column(Boolean, default=True)
     rules_version: Mapped[int] = mapped_column(Integer, default=1)
 
 

@@ -14,6 +14,15 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
 
 ## Fix log
 
+- **Policy change — self-approval is opt-out** (relaxes §1.6/§1.7 default): the
+  propose→approve separation of duties (approver ≠ proposer) is now a per-environment
+  **opt-out** rather than a hard rule. `Environment.allow_self_approval` defaults to
+  `True`, so by default the proposer may approve their own protected-env change; set it
+  `False` (admin `PATCH /mgmt/envs/{env}`, or the Approvals-screen toggle) to require a
+  distinct approver. The role gate (releaser to approve, `force` still releaser-only)
+  and the audit trail are unchanged; self-approvals record `self_approved=true`. This
+  was a deliberate product call for single-operator/small-team installs.
+
 - **Batch 1 — P0 one-liners (done)**: git commit dates now real wall-clock, pinned
   only under the `INCANT_FIXED_GIT_DATE` test hook (§1.3); `commit_version` writes
   `refs/heads/main` via compare-and-swap with retry + an in-process serialization
