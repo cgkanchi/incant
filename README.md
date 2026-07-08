@@ -82,10 +82,15 @@ the full suite, including the concurrency tests that prove no lost `rules_versio
 bumps under parallel writes:
 
 ```bash
-uv run pytest                                    # quick local pass
+uv run pytest                                    # quick local pass (SQLite)
 INCANT_TEST_DATABASE_URL=postgresql+psycopg://incant:incant@localhost:5432/incant \
-  uv run pytest                                  # full suite incl. concurrency (65 tests)
+  uv run pytest                                  # full suite incl. concurrency (67 tests)
 ```
+
+Tests drop and recreate all tables, so they are **isolated to a dedicated
+`<db>_test` database**: the URL above is redirected to `incant_test` (created on
+demand) and the app's `incant` database is never touched. A safety rail refuses to
+reset any Postgres database whose name doesn't end in `_test`.
 
 ## Config (`INCANT_*` env vars)
 

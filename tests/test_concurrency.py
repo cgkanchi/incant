@@ -17,17 +17,17 @@ from incant.config import Settings, set_settings
 from incant.db import session_scope
 from incant.service import AppContext, reset_app
 
-from .conftest import TEST_DATABASE_URL, reset_schema
+from .conftest import EFFECTIVE_TEST_URL, reset_schema
 
 pytestmark = pytest.mark.skipif(
-    not (TEST_DATABASE_URL and TEST_DATABASE_URL.startswith("postgres")),
+    not (EFFECTIVE_TEST_URL and EFFECTIVE_TEST_URL.startswith("postgres")),
     reason="concurrency tests require Postgres (set INCANT_TEST_DATABASE_URL)",
 )
 
 
 @pytest.fixture()
 def app(tmp_path):
-    set_settings(Settings(database_url=TEST_DATABASE_URL, repo_path=str(tmp_path / "repo")))
+    set_settings(Settings(database_url=EFFECTIVE_TEST_URL, repo_path=str(tmp_path / "repo")))
     db.reset_engine()
     reset_app()
     reset_schema()
