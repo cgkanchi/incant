@@ -17,38 +17,15 @@ import contextvars
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from jinja2 import StrictUndefined, Template
+from jinja2 import StrictUndefined, Template, Undefined
 from jinja2.exceptions import TemplateNotFound, UndefinedError
 from jinja2.exceptions import TemplateError as JinjaTemplateError
 from jinja2.sandbox import SandboxedEnvironment
 
-
-class GuardUndefined(StrictUndefined):
-    """Strict on *output*, lenient in *guard* positions.
-
-    Missing variables raise on direct output/access (``{{ x }}`` → 422), exactly
-    like ``StrictUndefined``. But a missing variable is falsy in a boolean test
-    (``{% if x %}``) and yields an empty iteration (``{% for m in x %}``) — the
-    guard forms our variable inference treats as marking a variable *optional*.
-    This keeps StrictUndefined's safety while letting guarded-optional variables
-    render without a supplied value (defaults are still applied pre-render when
-    the DB holds one).
-    """
-
-    __slots__ = ()
-
-    def __bool__(self) -> bool:  # {% if x %}
-        return False
-
-    def __iter__(self):  # {% for m in x %}
-        return iter(())
-
-    def __len__(self) -> int:
-        return 0
-
 from .errors import IncludeCycle, IncludeDepthExceeded, MissingVariable, RenderError
 from .evaluate import Skip, resolve
 from .model import ContentProvider, EnvSnapshot, Resolution
+from .variables import extract
 
 DEPTH_LIMIT = 32
 
@@ -107,7 +84,7 @@ class _IncantEnvironment(SandboxedEnvironment):
 # The single shared environment. Autoescape off (plain text for LLMs); no
 # filesystem loader — content only ever arrives through the ContentProvider.
 _ENV = _IncantEnvironment(
-    undefined=GuardUndefined,
+    undefined=StrictUndefined,  # strict everywhere; optional vars are injected lenient
     autoescape=False,
     cache_size=0,  # we maintain our own blob-keyed compiled cache
     auto_reload=False,
@@ -119,6 +96,53 @@ _COMPILED: dict[str, Template] = {}
 _COMPILE_ORDER: list[str] = []
 _CACHE_MAX = 4096
 compile_misses = 0
+
+# Blob-keyed variable-extraction cache (parsing is deterministic per blob).
+_EXTRACT: dict[str, Any] = {}
+_EXTRACT_ORDER: list[str] = []
+
+
+def _extract_cached(blob_sha: str, source: str):
+    ev = _EXTRACT.get(blob_sha)
+    if ev is not None:
+        return ev
+    ev = extract(source)
+    _EXTRACT[blob_sha] = ev
+    _EXTRACT_ORDER.append(blob_sha)
+    if len(_EXTRACT_ORDER) > _CACHE_MAX:
+        _EXTRACT.pop(_EXTRACT_ORDER.pop(0), None)
+    return ev
+
+
+def _closure_optionals(ctx: "_RenderCtx", prompt_id: str, source: str, blob_sha: str) -> set[str]:
+    """Names that are optional across the whole include closure (and required
+    nowhere) — the set to render leniently. Required-anywhere wins over optional.
+
+    Walking the closure mirrors the render's own targeting-resolved includes, so
+    a fragment's guarded-optional variable is treated leniently too.
+    """
+
+    required: set[str] = set()
+    optional: set[str] = set()
+    seen: set[str] = set()
+
+    def walk(pid: str, src: str, bsha: str) -> None:
+        if pid in seen:
+            return
+        seen.add(pid)
+        ev = _extract_cached(bsha, src)
+        required.update(ev.required)
+        optional.update(ev.optional)
+        for inc in ev.includes:
+            try:
+                res = resolve(ctx.snapshot, inc, ctx.flags)
+                blob = ctx.content.get(inc, res.version, res.commit)
+            except Exception:
+                continue  # unresolved/unservable include — the render will surface it
+            walk(inc, blob.source, blob.blob_sha)
+
+    walk(prompt_id, source, blob_sha)
+    return optional - required
 
 
 def _compile(env: SandboxedEnvironment, blob_sha: str, source: str, name: str) -> Template:
@@ -240,6 +264,13 @@ def _render_compiled(
     if defaults:
         render_vars.update(defaults)
     render_vars.update(variables)
+
+    # Inject a lenient (base) Undefined for every closure-optional variable that
+    # wasn't supplied, so guards (`{% if x %}`, `{% for m in x %}`) render while
+    # any *required* missing variable still raises under StrictUndefined (→ 422).
+    for name in _closure_optionals(ctx, prompt_id, source, blob_sha):
+        if name not in render_vars:
+            render_vars[name] = Undefined(name=name)
 
     token = _current.set(ctx)
     try:

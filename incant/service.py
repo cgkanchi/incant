@@ -74,7 +74,8 @@ class AppContext:
         init_db()
 
     def registry(self, session: Session, actor: str = "system") -> RegistryService:
-        return RegistryService(session, self.git, self.content)
+        return RegistryService(session, self.git, self.content,
+                               default_env=self.settings.default_environment)
 
     def targeting(self, session: Session, actor: str = "system") -> TargetingService:
         return TargetingService(session, actor)

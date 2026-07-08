@@ -35,7 +35,15 @@ def test_var_used_both_guarded_and_bare_is_required():
     assert v.required == {"x"}
 
 
-def test_condition_reference_is_optional():
-    # tier only appears in an if-test comparison -> optional (guarded usage).
+def test_condition_comparison_is_required():
+    # tier in an if-test *comparison* is required: a comparison against an
+    # undefined raises under StrictUndefined at render, so inference must agree.
     v = extract("{% if tier == 'pro' %}pro{% endif %}")
-    assert v.optional == {"tier"}
+    assert v.required == {"tier"}
+    assert v.optional == set()
+
+
+def test_bare_truthiness_and_defined_stay_optional():
+    assert extract("{% if flag %}on{% endif %}").optional == {"flag"}
+    assert extract("{% if a and b %}both{% endif %}").optional == {"a", "b"}
+    assert extract("{% if x is defined %}{% endif %}").optional == {"x"}

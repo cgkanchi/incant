@@ -36,11 +36,15 @@ def validate_source(
     *,
     is_known_prompt: Callable[[str], bool],
     include_source: Callable[[str], str | None],
+    test_render: Callable[[str], str | None] | None = None,
 ) -> ValidationResult:
     """Validate one version's source.
 
     ``include_source`` returns the current (default) source of an included prompt,
     used only for the static cycle check; ``None`` if it cannot be resolved.
+    ``test_render``, when supplied, strict-renders ``source`` against the prompt's
+    test contexts and returns an error string on the first failure (§5) — so a
+    template that compiles but fails at render is recorded *invalid*, not valid.
     """
 
     # 1. Compiles under the sandbox.
@@ -55,13 +59,21 @@ def validate_source(
     for target in ev.includes:
         if not is_known_prompt(target):
             return ValidationResult(
-                "invalid", f"include target {target!r} is not a registered prompt"
+                "invalid", f"include target {target!r} is not a registered prompt",
+                ev.as_dict(),
             )
 
     # 3. No cycles in the static include graph at current defaults.
     cycle = _find_cycle(prompt_id, source, include_source)
     if cycle:
-        return ValidationResult("invalid", "include cycle: " + " -> ".join(cycle))
+        return ValidationResult("invalid", "include cycle: " + " -> ".join(cycle),
+                                ev.as_dict())
+
+    # 4. Strict render against test contexts (only when contexts are supplied).
+    if test_render is not None:
+        err = test_render(source)
+        if err:
+            return ValidationResult("invalid", err, ev.as_dict())
 
     return ValidationResult("valid", None, ev.as_dict())
 

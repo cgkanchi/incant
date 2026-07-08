@@ -31,6 +31,55 @@ def test_missing_required_variable_raises_named():
     assert e.value.name == "name"
 
 
+def test_missing_required_in_filter_raises_not_silent():
+    # §1.2: `{{ history | length }}` with history missing must 422, not render "0".
+    content = DictContent({(SYS, "c1"): "n={{ history | length }}"})
+    snap = snapshot(versions={SYS: {1: vinfo(1, live="c1")}}, defaults={SYS: 1})
+    with pytest.raises(MissingVariable) as e:
+        render(snap, SYS, {}, {}, content)
+    assert e.value.name == "history"
+
+
+def test_missing_required_in_inline_if_raises_not_silent():
+    # §1.2: `{{ 'yes' if x else 'no' }}` with x missing must 422, not render "no".
+    content = DictContent({(SYS, "c1"): "{{ 'yes' if x else 'no' }}"})
+    snap = snapshot(versions={SYS: {1: vinfo(1, live="c1")}}, defaults={SYS: 1})
+    with pytest.raises(MissingVariable) as e:
+        render(snap, SYS, {}, {}, content)
+    assert e.value.name == "x"
+
+
+def test_missing_required_in_comparison_test_raises():
+    # §1.2 mirror: `{% if tier == 'pro' %}` — tier is required; missing must 422.
+    content = DictContent({(SYS, "c1"): "{% if tier == 'pro' %}P{% endif %}done"})
+    snap = snapshot(versions={SYS: {1: vinfo(1, live="c1")}}, defaults={SYS: 1})
+    with pytest.raises(MissingVariable) as e:
+        render(snap, SYS, {}, {}, content)
+    assert e.value.name == "tier"
+
+
+def test_guarded_optional_renders_when_missing():
+    # The other half: guarded-optional vars still render (empty) without a value.
+    content = DictContent({
+        (SYS, "c1"): "{% if plan %}{{ plan }}{% endif %}{% for m in items %}{{ m }}{% endfor %}ok"
+    })
+    snap = snapshot(versions={SYS: {1: vinfo(1, live="c1")}}, defaults={SYS: 1})
+    assert render(snap, SYS, {}, {}, content).text == "ok"
+
+
+def test_fragments_optional_var_is_lenient_across_closure():
+    # A guarded-optional variable inside an included fragment renders leniently too.
+    content = DictContent({
+        (SYS, "c1"): 'top {% include "shared/style/language-rules" %}',
+        (FRAG, "f1"): "{% if extra %}{{ extra }}{% endif %}frag",
+    })
+    snap = snapshot(
+        versions={SYS: {1: vinfo(1, live="c1")}, FRAG: {1: vinfo(1, live="f1")}},
+        defaults={SYS: 1, FRAG: 1},
+    )
+    assert render(snap, SYS, {}, {}, content).text == "top frag"
+
+
 def test_defaults_applied_pre_render():
     content = DictContent({(SYS, "c1"): "{% if tone %}{{ tone }}{% endif %}done"})
     snap = snapshot(versions={SYS: {1: vinfo(1, live="c1")}}, defaults={SYS: 1})

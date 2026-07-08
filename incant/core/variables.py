@@ -58,10 +58,14 @@ def _names_in(node: nodes.Node) -> set[str]:
 
 def _walk(node: nodes.Node, guarded: frozenset[str], hard: set[str]) -> None:
     if isinstance(node, nodes.If):
-        # Names anywhere in the test are guard usages, so we never descend into it
-        # for hard usages. The body/elif are additionally guarded by whatever the
-        # test proves defined ({% if name %}); the else branch is not.
+        # The test is *evaluated* at render time, so names in it are hard usages
+        # UNLESS they are bare truthiness / `is defined` guards (which we render
+        # leniently). Thus `{% if name %}` keeps name optional, but
+        # `{% if name == 'x' %}` makes name required — matching what StrictUndefined
+        # does at render (a comparison against an undefined raises). The body/elif
+        # are additionally guarded by whatever the test proves defined.
         gnames = _guard_names(node.test)
+        _walk(node.test, guarded | gnames, hard)
         body_guard = guarded | gnames
         for child in node.body:
             _walk(child, body_guard, hard)

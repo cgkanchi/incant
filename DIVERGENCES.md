@@ -36,6 +36,21 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
   refinement edits invalidate the auth/snapshot caches. Tests: auth-survives-outage,
   serve-during-outage, created-key-immediately-valid, serving-path-does-not-write.
 
+- **Batch 3 — content strictness (done)** (§1.2, §2.2): the render environment is
+  `StrictUndefined` everywhere again — a missing *required* variable raises (→ 422)
+  even inside a filter (`{{ history | length }}`) or an inline-if
+  (`{{ 'yes' if x else 'no' }}`), closing the silent-wrong-content path. Guarded-
+  optional variables still render: inference now computes the optional set across the
+  whole include closure and the renderer injects Jinja's lenient base `Undefined` for
+  exactly those names, so `{% if x %}`/`{% for m in x %}` (including inside fragments)
+  render while everything else stays strict. Inference and render now agree on
+  comparison tests — `{% if tier == 'pro' %}` makes `tier` **required** (a comparison
+  against undefined raises), fixing the mirror bug and its wrong test assertion.
+  Validation gained the missing test-context render (§2.2/§5): `validate_source` now
+  strict-renders against a prompt's test contexts, so a template that compiles but
+  fails at render is recorded *invalid*, never pointer-referenceable. Tests added in
+  `test_render.py`, `test_variables.py`, `test_integration.py`.
+
 ---
 
 ## 1. Guarantee-breaking bugs (P0)

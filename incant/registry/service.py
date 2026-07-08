@@ -39,10 +39,12 @@ class CommitOutcome:
 
 
 class RegistryService:
-    def __init__(self, session: Session, git: GitStore, content: ContentStore) -> None:
+    def __init__(self, session: Session, git: GitStore, content: ContentStore,
+                 default_env: str = "prod") -> None:
         self.s = session
         self.git = git
         self.content = content
+        self.default_env = default_env
 
     # ── projects & prompts ───────────────────────────────────────────
 
@@ -202,7 +204,35 @@ class RegistryService:
             source, prompt_id,
             is_known_prompt=self.prompt_exists,
             include_source=self._include_source,
+            test_render=self._make_test_render(prompt_id),
         )
+
+    def _make_test_render(self, prompt_id: str):
+        """A strict-render check over the prompt's test contexts (§5). Returns a
+        callable(source)->error|None, or None when there are no contexts to render
+        against or the default-env snapshot can't be built."""
+        contexts = self.get_test_contexts(prompt_id)
+        if not contexts:
+            return None
+        # Lazy imports avoid an import cycle (targeting/core -> registry).
+        from ..core import MissingVariable, RenderError, Unservable, render_source
+        from ..core.errors import UnresolvedPrompt
+        from ..targeting import build_snapshot
+        try:
+            snap = build_snapshot(self.s, self.default_env)
+        except Exception:
+            return None  # no snapshot (e.g. env missing) -> skip render check
+
+        def check(source: str) -> str | None:
+            for c in contexts:
+                try:
+                    render_source(snap, prompt_id, source, c.flags or {}, c.variables or {},
+                                  self.content)
+                except (MissingVariable, RenderError, Unservable, UnresolvedPrompt) as exc:
+                    return f"render failed for test context {c.name!r}: {exc}"
+            return None
+
+        return check
 
     def commit_draft(
         self, draft_id: str, *, author: str, email: str = "", message: str = "",

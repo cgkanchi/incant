@@ -114,6 +114,33 @@ def test_serve_continues_during_db_outage(app):
     assert out["stale_rules"] is True
 
 
+def test_validation_render_checks_test_contexts(app):
+    # §2.2/§5: a template that compiles but fails at render against a test context
+    # must be recorded invalid, not valid.
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        reg.create_prompt("support/note")
+        # A test context that does NOT supply the required `who` variable.
+        reg.set_test_context("support/note", "ctx1", {}, {"other": "x"})
+        d = reg.create_draft("support/note", version_number=1, author="sam",
+                             content="Hello {{ who }}")  # compiles fine
+        outcome = reg.commit_draft(d.id, author="sam", message="v1")
+    assert outcome.validation["status"] == "invalid"
+    assert "render failed" in outcome.validation["error"]
+    assert "ctx1" in outcome.validation["error"]
+
+
+def test_validation_passes_when_context_supplies_vars(app):
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        reg.create_prompt("support/note2")
+        reg.set_test_context("support/note2", "ok", {}, {"who": "Sam"})
+        d = reg.create_draft("support/note2", version_number=1, author="sam",
+                             content="Hello {{ who }}")
+        outcome = reg.commit_draft(d.id, author="sam", message="v1")
+    assert outcome.validation["status"] == "valid", outcome.validation
+
+
 def test_full_loop_render(app):
     _author_version(app, "shared/style/language-rules", 1, "Write in plain English.")
     _author_version(
