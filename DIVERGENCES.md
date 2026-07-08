@@ -51,6 +51,24 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
   fails at render is recorded *invalid*, never pointer-referenceable. Tests added in
   `test_render.py`, `test_variables.py`, `test_integration.py`.
 
+- **Batch 4 — governance from the authenticated principal (done)** (§1.6, §1.7):
+  identities are no longer client-supplied strings — commit author and review
+  reviewer are the authenticated principal, so self-approval can't be spoofed (a
+  principal's review of its own draft doesn't count toward policy). The protected-env
+  flow is now real: an **operator proposes**, a **releaser (≠ proposer) approves** via
+  new `GET/POST /mgmt/envs/{env}/approvals[/{id}/approve|reject]` endpoints; approving
+  advances the live pointer. The body-supplied `approver` is gone; `force` is a
+  break-glass direct release **gated to releaser** at the route. RBAC scope holes
+  closed: `Identity.has` no longer lets a project-scoped binding satisfy an
+  instance-wide (project=None) check, and global-rule create/patch require env-wide
+  operator — so a project operator can't govern other projects or create global rules.
+  UI: removed the hardcoded `force:true` on make-live/revert and the fake
+  `author/reviewer` strings; added an **Approvals** screen (queue + approve/reject).
+  Verified end-to-end in Docker (operator propose → force-denied → admin approve →
+  pointer live) and in the browser. Tests in `test_server.py` (+ two-principal review).
+  *Remaining:* env-**default** changes still apply directly on protected envs (releaser-
+  gated) rather than via propose→approve (§3) — deferred to avoid seed churn.
+
 ---
 
 ## 1. Guarantee-breaking bugs (P0)

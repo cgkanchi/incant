@@ -48,12 +48,14 @@ class DraftRenderRequest(BaseModel):
 
 
 class ReviewRequest(BaseModel):
-    reviewer: str
+    # `reviewer` is ignored — the reviewer is the authenticated principal.
+    reviewer: Optional[str] = None
     state: str = "approved"
 
 
 class CommitRequest(BaseModel):
-    author: str
+    # `author` is ignored — the author is the authenticated principal.
+    author: Optional[str] = None
     email: str = ""
     message: str = ""
     force: bool = False
@@ -100,8 +102,7 @@ class PointerRequest(BaseModel):
     version_number: int
     to_sha: str
     comment: str = ""
-    approver: Optional[str] = None
-    force: bool = False
+    force: bool = False  # break-glass direct release (releaser-gated at the route)
 
 
 class DefaultRequest(BaseModel):

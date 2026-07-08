@@ -261,7 +261,7 @@ def create_draft(
         d = reg.create_draft(
             prompt_id, version_number=req.version_number,
             seed_from_version=req.seed_from_version,
-            author=req.author or ident.name, title=req.title, content=req.content,
+            author=ident.name, title=req.title, content=req.content,
         )
     except RegistryError as exc:
         raise HTTPException(400, str(exc))
@@ -311,7 +311,7 @@ def put_draft_content(
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
     _require(ident, "editor", project=_project_of(d.prompt_id))
-    reg.put_draft_content(draft_id, req.content, author=req.author or ident.name)
+    reg.put_draft_content(draft_id, req.content, author=ident.name)
     return _draft_payload(app, reg, d)
 
 
@@ -356,8 +356,10 @@ def review_draft(
         d = reg.get_draft(draft_id)
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
-    _require(ident, "viewer", project=_project_of(d.prompt_id))
-    reg.add_review(draft_id, reviewer=req.reviewer or ident.name, state=req.state)
+    # The reviewer is the authenticated principal — never a body-supplied string —
+    # so self-approval (author == reviewer) can't be spoofed.
+    _require(ident, "editor", project=_project_of(d.prompt_id))
+    reg.add_review(draft_id, reviewer=ident.name, state=req.state)
     return {"draft_id": draft_id, "status": reg.get_draft(draft_id).status,
             "approvals": [r.reviewer for r in reg.approvals(draft_id)]}
 
@@ -377,7 +379,7 @@ def commit_draft(
     _require(ident, "editor", project=_project_of(d.prompt_id))
     try:
         outcome = reg.commit_draft(
-            draft_id, author=req.author or ident.name, email=req.email,
+            draft_id, author=ident.name, email=req.email,
             message=req.message, force=req.force,
         )
     except ReviewRequired as exc:
@@ -557,9 +559,12 @@ def upsert_rule(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "operator", environment=env)
+    # Prompt-scoped rules need operator on that project+env; a *global* rule
+    # governs every project, so it requires env-wide (or instance) operator.
     if req.prompt_id:
         _require(ident, "operator", project=_project_of(req.prompt_id), environment=env)
+    else:
+        _require(ident, "operator", environment=env)
     tgt = app.targeting(session, ident.name)
     try:
         r = tgt.upsert_rule(env, req.model_dump())
@@ -576,7 +581,13 @@ def patch_rule(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "operator", environment=env)
+    r = session.get(models.Rule, rule_id)
+    if r is None or r.environment_id != env:
+        raise HTTPException(404, f"unknown rule {rule_id!r} in {env!r}")
+    if r.prompt_id:
+        _require(ident, "operator", project=_project_of(r.prompt_id), environment=env)
+    else:
+        _require(ident, "operator", environment=env)
     tgt = app.targeting(session, ident.name)
     try:
         tgt.set_rule_status(env, rule_id, req.status)
@@ -657,21 +668,71 @@ def make_live(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
+    # An operator may propose (or directly release in an unprotected env). `force`
+    # is a break-glass direct release even in a protected env — gated to releaser.
     _require(ident, "operator", project=_project_of(req.prompt_id), environment=env)
-    e = session.get(models.Environment, env)
-    if e and e.protected:
+    if req.force:
         _require(ident, "releaser", environment=env)
     tgt = app.targeting(session, ident.name)
     try:
         outcome = tgt.make_live(
             env, req.prompt_id, req.version_number, req.to_sha,
-            comment=req.comment, approver=req.approver, force=req.force,
+            comment=req.comment, force=req.force,
         )
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
     app.invalidate(env)
     return {"status": outcome.status, "move_id": outcome.move_id,
             "rules_version": outcome.rules_version}
+
+
+@router.get("/envs/{env}/approvals")
+def list_approvals(
+    env: str,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "viewer", environment=env)
+    tgt = app.targeting(session, ident.name)
+    return {"environment": env, "approvals": [
+        {"id": a.id, "change": a.change, "proposed_by": a.proposed_by,
+         "status": a.status, "created_at": a.created_at.isoformat()}
+        for a in tgt.list_pending_approvals(env)
+    ]}
+
+
+@router.post("/envs/{env}/approvals/{approval_id}/approve")
+def approve_change(
+    env: str, approval_id: int,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "releaser", environment=env)
+    tgt = app.targeting(session, ident.name)
+    try:
+        appr = tgt.approve(approval_id)
+    except TargetingError as exc:
+        raise HTTPException(400, str(exc))
+    app.invalidate(env)
+    return {"id": appr.id, "status": appr.status, "approved_by": appr.approved_by}
+
+
+@router.post("/envs/{env}/approvals/{approval_id}/reject")
+def reject_change(
+    env: str, approval_id: int,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "releaser", environment=env)
+    tgt = app.targeting(session, ident.name)
+    try:
+        appr = tgt.reject(approval_id)
+    except TargetingError as exc:
+        raise HTTPException(400, str(exc))
+    return {"id": appr.id, "status": appr.status}
 
 
 @router.post("/envs/{env}/defaults")

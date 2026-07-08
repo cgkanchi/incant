@@ -42,6 +42,76 @@ def auth(key=ADMIN):
     return {"Authorization": f"Bearer {key}"}
 
 
+def make_key(client, role, project=None, env=None, name=None):
+    """Issue a distinct principal's key (needed to review someone else's draft)."""
+    r = client.post("/mgmt/keys", json={"principal_name": name or f"{role}-{project or 'inst'}",
+                                        "role": role, "project_id": project,
+                                        "environment_id": env}, headers=auth())
+    assert r.status_code == 200, r.text
+    return r.json()["key"]
+
+
+def _tip_sha(client, prompt_id="support/system", version=2):
+    v = client.get(f"/mgmt/prompts/{prompt_id}/versions?environment=prod", headers=auth()).json()
+    return next(x for x in v["versions"] if x["version"] == version)["tip_full_sha"]
+
+
+def test_protected_pointer_proposes_then_distinct_releaser_approves(client):
+    sha = _tip_sha(client)
+    op = make_key(client, "operator", project="support")
+    # Operator proposes on protected prod -> pending approval, no move yet.
+    r = client.post("/mgmt/envs/prod/pointers",
+                    json={"prompt_id": "support/system", "version_number": 2, "to_sha": sha},
+                    headers=auth(op))
+    assert r.status_code == 200 and r.json()["status"] == "proposed", r.text
+    # A project-scoped operator can't view env-wide approvals; admin lists them.
+    assert client.get("/mgmt/envs/prod/approvals", headers=auth(op)).status_code == 403
+    aps = client.get("/mgmt/envs/prod/approvals", headers=auth()).json()["approvals"]
+    apid = aps[-1]["id"]
+    # Admin (distinct principal, implies releaser) approves -> becomes live at sha.
+    r = client.post(f"/mgmt/envs/prod/approvals/{apid}/approve", headers=auth())
+    assert r.status_code == 200 and r.json()["status"] == "approved", r.text
+    tl = client.get("/mgmt/envs/prod/pointers?prompt_id=support/system&version=2",
+                    headers=auth()).json()
+    assert tl["moves"][0]["full_sha"] == sha
+
+
+def test_releaser_cannot_approve_own_proposal(client):
+    sha = _tip_sha(client)
+    rel = make_key(client, "releaser", env="prod")
+    r = client.post("/mgmt/envs/prod/pointers",
+                    json={"prompt_id": "support/system", "version_number": 2, "to_sha": sha},
+                    headers=auth(rel))
+    assert r.json()["status"] == "proposed"
+    apid = client.get("/mgmt/envs/prod/approvals", headers=auth(rel)).json()["approvals"][-1]["id"]
+    r = client.post(f"/mgmt/envs/prod/approvals/{apid}/approve", headers=auth(rel))
+    assert r.status_code == 400  # approver must differ from proposer
+
+
+def test_operator_cannot_force_release(client):
+    sha = _tip_sha(client)
+    op = make_key(client, "operator", project="support")
+    r = client.post("/mgmt/envs/prod/pointers",
+                    json={"prompt_id": "support/system", "version_number": 2,
+                          "to_sha": sha, "force": True},
+                    headers=auth(op))
+    assert r.status_code == 403  # force is a releaser-gated break-glass
+
+
+def test_project_operator_cannot_create_global_rule(client):
+    op = make_key(client, "operator", project="support")
+    # A prompt-scoped rule in their own project is allowed.
+    r = client.post("/mgmt/envs/prod/rules",
+                    json={"id": "r-sup", "scope": "prompt", "prompt_id": "support/system",
+                          "priority": 5, "serve": {"version": 2}}, headers=auth(op))
+    assert r.status_code == 200, r.text
+    # A global rule governs every project -> forbidden for a project operator.
+    r = client.post("/mgmt/envs/prod/rules",
+                    json={"id": "r-glob", "scope": "global", "priority": 5,
+                          "serve": {"version": 2}}, headers=auth(op))
+    assert r.status_code == 403
+
+
 def test_health_and_ready(client):
     assert client.get("/healthz").text == "ok"
     assert client.get("/readyz").status_code == 200
@@ -139,12 +209,19 @@ def test_tweak_flow_over_http(client):
     assert r.json()["lint"]["status"] == "valid"
 
     # 2. commit is blocked until review policy (1 approval) is met
-    r = client.post(f"/mgmt/drafts/{draft_id}/commit", json={"author": "sam"}, headers=auth())
+    r = client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth())
     assert r.status_code == 412
 
-    # 3. a different reviewer approves, then commit succeeds
-    client.post(f"/mgmt/drafts/{draft_id}/review", json={"reviewer": "rae"}, headers=auth())
-    r = client.post(f"/mgmt/drafts/{draft_id}/commit", json={"author": "sam"}, headers=auth())
+    # 2b. self-approval doesn't count: the admin authored the draft, so its own
+    # review can't satisfy the policy (identity comes from the principal).
+    client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth())
+    r = client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth())
+    assert r.status_code == 412
+
+    # 3. a *different* principal approves, then commit succeeds
+    reviewer = make_key(client, "editor", project="support")
+    client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth(reviewer))
+    r = client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth())
     assert r.status_code == 200, r.text
     new_sha = r.json()["full_sha"]
 
@@ -220,8 +297,9 @@ def test_rendered_diff_missing_vars_is_graceful_not_500(client):
     client.post("/mgmt/prompts", json={"prompt_id": "support/novars"}, headers=auth())
     d = client.post("/mgmt/prompts/support/novars/drafts",
                     json={"version_number": 1, "content": "Hi {{ who }}"}, headers=auth()).json()
-    client.post(f"/mgmt/drafts/{d['id']}/review", json={"reviewer": "rae"}, headers=auth())
-    sha = client.post(f"/mgmt/drafts/{d['id']}/commit", json={"author": "sam"}, headers=auth()).json()["full_sha"]
+    reviewer = make_key(client, "editor", project="support")
+    client.post(f"/mgmt/drafts/{d['id']}/review", json={}, headers=auth(reviewer))
+    sha = client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).json()["full_sha"]
     q = f"a_version=1&a_sha={sha}&b_version=1&b_sha={sha}&mode=rendered&environment=prod"
     r = client.get(f"/mgmt/prompts/support/novars/diff?{q}", headers=auth())
     assert r.status_code == 200

@@ -63,9 +63,12 @@ class Identity:
         for b in self.bindings:
             if role not in _IMPLIES.get(b.role, set()):
                 continue
-            if b.project_id is not None and project is not None and b.project_id != project:
+            # A project-scoped binding satisfies only checks for *that* project;
+            # in particular it must NOT satisfy an instance-wide (project=None)
+            # check — otherwise a project operator gains instance-wide power.
+            if b.project_id is not None and b.project_id != project:
                 continue
-            if b.environment_id is not None and environment is not None and b.environment_id != environment:
+            if b.environment_id is not None and b.environment_id != environment:
                 continue
             # An instance-scoped binding (both None) covers everything.
             return True

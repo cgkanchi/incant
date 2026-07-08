@@ -113,6 +113,7 @@ function parseRoute() {
   const parts = pathPart.split("/").filter(Boolean);
   if (parts.length === 0 || parts[0] === "prompts") return { name: "prompts", pid: null, q };
   if (parts[0] === "segments") return { name: "segments", pid: null, q };
+  if (parts[0] === "approvals") return { name: "approvals", pid: null, q };
   if (parts[0] === "audit") return { name: "audit", pid: null, q };
   if (parts[0] === "p") {
     const pid = decodeURIComponent(parts[1] || "");
@@ -154,6 +155,8 @@ function sidebar() {
     ${subnav(pid)}
     <div class="nav ${State.route.name === "segments" ? "active" : ""}" data-act="go" data-hash="#/segments">
       <span class="gl">⬡</span><span>Segments</span></div>
+    <div class="nav ${State.route.name === "approvals" ? "active" : ""}" data-act="go" data-hash="#/approvals">
+      <span class="gl">⧉</span><span>Approvals</span></div>
     <div class="nav ${State.route.name === "audit" ? "active" : ""}" data-act="go" data-hash="#/audit">
       <span class="gl">◷</span><span>Audit</span></div>
     <div class="spacer"></div>
@@ -563,10 +566,35 @@ async function screenAudit() {
       <tbody>${rows || '<tr><td colspan="4" class="empty">No audit entries.</td></tr>'}</tbody></table></div></div>`;
 }
 
+async function screenApprovals() {
+  const d = await GET(`/mgmt/envs/${enc(State.env)}/approvals`);
+  const rows = d.approvals.map((a) => {
+    const c = a.change || {};
+    const what = c.kind === "make_live"
+      ? `make live <b>${esc(c.prompt_id)}</b> v${c.version} → <span class="mono">${esc((c.to_sha || "").slice(0, 7))}</span>`
+      : esc(a.change ? JSON.stringify(a.change) : "");
+    return `<tr class="grow-row">
+      <td class="mono muted">#${a.id}</td>
+      <td>${what}</td>
+      <td><b>${esc(a.proposed_by)}</b></td>
+      <td class="mono muted">${new Date(a.created_at).toLocaleString()}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="btn primary" data-act="approveChange" data-id="${a.id}">Approve ✓</button>
+        <button class="btn" data-act="rejectChange" data-id="${a.id}">Reject</button></td></tr>`;
+  }).join("");
+  el("main").innerHTML = `<div class="screen">
+    <div class="h1row"><span class="h1 sm serif">Approvals — <i>${esc(State.env)}</i></span>
+      <span class="sub">pointer-class changes proposed in a protected environment</span></div>
+    <div class="card" style="overflow-x:auto"><table class="grid">
+      <thead class="ghead"><tr><th>#</th><th>Change</th><th>Proposed by</th><th>When</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" class="empty">No pending approvals.</td></tr>'}</tbody></table></div>
+    <div style="font-size:11px;color:var(--faint);margin-top:12px">A releaser other than the proposer approves; approving advances the live pointer immediately. Break-glass <span class="mono">force</span> releases bypass this and are gated to releaser.</div></div>`;
+}
+
 const SCREENS = {
   prompts: screenPrompts, overview: screenOverview, editor: screenEditor, diff: screenDiff,
   review: screenReview, rules: screenRules, pointers: screenPointers, segments: screenSegments,
-  audit: screenAudit,
+  approvals: screenApprovals, audit: screenAudit,
 };
 
 // ── actions ──────────────────────────────────────────────────────────
@@ -668,7 +696,8 @@ const Actions = {
   async commit() {
     try {
       const force = el("forceCommit")?.checked;
-      const r = await POST(`/mgmt/drafts/${window._draft.id}/commit`, { author: "you", force });
+      // Identity (author) comes from the authenticated key, not the client.
+      const r = await POST(`/mgmt/drafts/${window._draft.id}/commit`, { force });
       toast(`Committed ${r.sha} · v${r.version_number} · ${r.validation.status}`);
       go(`#/p/${enc(State.route.pid)}/overview`);
     } catch (e) {
@@ -678,14 +707,15 @@ const Actions = {
   },
   async approve(ds) {
     try {
-      await POST(`/mgmt/drafts/${ds.draft}/review`, { reviewer: "reviewer", state: "approved" });
+      // The reviewer is the authenticated principal; you can't approve your own draft.
+      await POST(`/mgmt/drafts/${ds.draft}/review`, { state: "approved" });
       toast("Approved — commit unlocked");
       render();
     } catch (e) { toast(errText(e), true); }
   },
   async commitReview(ds) {
     try {
-      const r = await POST(`/mgmt/drafts/${ds.draft}/commit`, { author: "you" });
+      const r = await POST(`/mgmt/drafts/${ds.draft}/commit`, {});
       toast(`Committed ${r.sha} · v${r.version_number}`);
       go(`#/p/${enc(State.route.pid)}/overview`);
     } catch (e) {
@@ -704,19 +734,37 @@ const Actions = {
   },
   async makeLive(ds) {
     try {
+      // No force: a protected env returns "proposed" and the change waits in the
+      // approval queue for a different releaser to approve.
       const r = await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
-        prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha, comment: "make live via UI", force: true,
+        prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha, comment: "make live via UI",
       });
-      toast(r.status === "live" ? "Pointer advanced — tip is live" : "Proposed for approval");
+      toast(r.status === "live" ? "Pointer advanced — tip is live"
+                                : "Proposed — awaiting approval (see Approvals)");
       render();
     } catch (e) { toast(errText(e), true); }
   },
   async revert(ds) {
     try {
-      await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
-        prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha, comment: "revert via UI", force: true,
+      const r = await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
+        prompt_id: State.route.pid, version_number: parseInt(ds.v), to_sha: ds.sha, comment: "revert via UI",
       });
-      toast("Reverted — pointer moved");
+      toast(r.status === "live" ? "Reverted — pointer moved"
+                                : "Revert proposed — awaiting approval");
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  async approveChange(ds) {
+    try {
+      await POST(`/mgmt/envs/${enc(State.env)}/approvals/${ds.id}/approve`, {});
+      toast("Approved — change is live");
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  async rejectChange(ds) {
+    try {
+      await POST(`/mgmt/envs/${enc(State.env)}/approvals/${ds.id}/reject`, {});
+      toast("Rejected");
       render();
     } catch (e) { toast(errText(e), true); }
   },
