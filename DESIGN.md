@@ -54,7 +54,9 @@ serving; pointer moves do.
 - **Never serve the wrong content.** Serving resolves exclusively through explicit SHAs
   (live pointers, or a rule's deliberate tip/SHA target). Tips never serve implicitly;
   pointer moves are the only way served content changes, and they are audited and
-  optionally approval-gated. Errors, never silent substitution.
+  optionally approval-gated. One bounded exception, loudly flagged: if a version's
+  current live SHA is unservable, its *previous live* SHA may serve (§10) — same
+  version, same intent; never a different version, never silent.
 - **In-product review.** PR review is the wrong tool: it reviews a text diff of a
   branch, prompt review must judge *what will be served* — both sides rendered with
   real flags and variables, fragments expanded, test contexts executed, by reviewers
@@ -82,7 +84,7 @@ serving; pointer moves do.
 | **Prompt** | A folder of version files. Its id is a path: `support/system`. Fragments are not a separate type — any prompt can include any other (§4). |
 | **Version** | A file: `support/system/v2.j2`. A stable, targetable identity whose content iterates via commits — not a frozen point. Optional label, notes, status in the DB. |
 | **Tip** | The newest validated commit touching a version file. Content that *exists* but serves only where explicitly targeted. |
-| **Live pointer** | Per `(environment, prompt, version)`: the commit SHA that version serves in that environment. "Make live" = advance the pointer. |
+| **Live pointer** | Per `(environment, prompt, version)`: the commit SHA that version serves in that environment. "Make live" = advance the pointer. Append-only history retained (rollback, audit, blame). |
 | **Label** | A name attached to versions across prompts (`voice-v2`) — the handle for multi-prompt experiments. |
 | **Draft** | Work-in-progress edit of a version file (or a proposed new file), held on an Incant-managed ref; becomes a commit through review. |
 | **Flags** | Evaluation context sent with a render request (`{"tier": "pro", "user_id": "u_42"}`). Rules match these. |
@@ -239,9 +241,10 @@ filename; the commit log records that the fix landed last Tuesday. No v14-that-i
 really-v12 confusion.
 
 **Rollback** (req 2): three levers, all instant pointer moves — move a version's live
-pointer back to an earlier SHA; retarget default/rules at an older version; or the kill
-switch (§7). Nothing is rebuilt, nothing re-reviewed; every state ever served is a
-validated SHA away.
+pointer back to any entry in its **pointer history** (§7); retarget default/rules at an
+older version; or the kill switch (§7). Nothing is rebuilt, nothing re-reviewed; every
+state ever served is a validated SHA away, and the history records who served what,
+when.
 
 ### Review
 
@@ -359,6 +362,17 @@ nodes in seconds.
 - Eval-time backstop: a rule resolving to something unservable is skipped, counted
   (`incant_rule_skips_total`), surfaced in the UI.
 
+### Pointer history
+
+Live pointers are **append-only**: every move writes
+`(from_sha, to_sha, actor, at, comment)`, and the current pointer is simply the newest
+entry. That one decision buys three things — **rollback** (make any prior entry live
+again, one click), **audit** (who made what live, when, why), and **blame** (join the
+history against render logs to answer "which make-live changed behavior at 3 pm?" —
+the UI renders this as a per-version timeline per environment). Recent history also
+rides along in the serving snapshot: it is what makes the §10 within-version fallback
+work even during a DB outage.
+
 ### Lifecycle, audit, propagation
 
 Every targeting mutation (rules, segments, pointers, defaults) snapshots to
@@ -382,7 +396,8 @@ including "make live" — serves everywhere in **< 2 s**.
 - **Content cache**: blobs are extracted from git into a content-addressed cache when a
   SHA becomes referenceable (validation time), compiled templates cached by blob hash —
   immutable, LRU-evicted, never invalidated.
-- **Eager warm**: everything reachable from any environment's targeting (live pointers,
+- **Eager warm**: everything reachable from any environment's targeting (live pointers
+  *and each version's previous live* — the §10 fallback must be warm to be useful —
   defaults, rule targets incl. tips, their include closures) precompiles at boot and on
   commit/targeting change. `incant_template_cache_misses_total` should sit at zero.
 
@@ -420,13 +435,17 @@ POST /prompt/{prompt_id}
   },
   "environment": "prod",
   "rules_version": 4172,
-  "stale_rules": false               // true iff targeting is frozen at last-known-good (§10)
+  "stale_rules": false,              // true iff targeting is frozen at last-known-good (§10)
+  "content_fallback": false          // true iff any entry served a previous live SHA (§10)
 }
 ```
 
 The `versions` map + `rules_version` is the reproducibility tuple — log it beside LLM
 calls; feed it back as `pin` to replay exactly. It is SHA-exact, so later tweaks to v2
-never blur an old trace. Humans read `v2`; machines pin `8c1f2ab`.
+never blur an old trace. Humans read `v2`; machines pin `8c1f2ab`. On the rare §10
+fallback, the map reports the SHA *actually served* with `"fallback": true` on that
+entry (plus the top-level flag and an `X-Incant-Content-Fallback` header) — the
+reproducibility contract holds even in degraded states.
 
 Errors: `401/403` bad or under-scoped credential · `404` unknown prompt/environment ·
 `409` resolved content unservable (compound cache+DB failure — §10) · `422`
@@ -459,13 +478,16 @@ for the control plane and sits on the refresh/write paths only, never per-reques
 | Postgres unreachable | Serving continues on rule snapshots + caches (`stale_rules: true`). All writes (drafts, commits, targeting, pointer moves) return `503`. Frozen deterministically. |
 | Commit fails validation | Recorded against the SHA; that SHA can never be referenced by a pointer or rule. The draft shows the error; serving never sees invalid content. |
 | Rule resolves to something unservable | Skipped, evaluation continues; counted + surfaced. |
-| Resolved SHA's content not in any cache and DB down | `409` — **never substitute other content**. Compound failure; eager warm makes it rare. |
+| Version's current live SHA unservable (cache lost + store unreachable — compound failure) | **Within-version fallback**: serve the most recent *previous live* SHA of the same version that is still servable. Loud: `content_fallback` in the response, header, error-level logs, `incant_content_fallbacks_total` alerts. Never a different version. |
+| Nothing in the version's pointer history is servable | `409` for that request — never substitute another version. |
 | Repo volume lost | Restore by cloning a remote (full history, no reconstruction). Between backup pushes, the queue metric bounds the exposure window. |
 | Node restart | Caches/spills reload; re-warm before `readyz` goes green. |
 | Missing required variable / render error | `422` — caller-input problem, never a fallback trigger. |
 
 Availability posture: **rules freeze** (last-known-good targeting keeps evaluating
-through DB outages) and **content never lies** (SHAs serve exactly or error exactly).
+through DB outages) and **content never lies** (what served is exactly reported; the
+only permitted degradation is stepping back within a version's own pointer history —
+loudly — before erroring).
 
 ---
 
@@ -524,7 +546,8 @@ canonical loop: edit → commit → target to cohort → expand → make live.
 
 **Target & operate.** Per environment: rule list (global + per-prompt,
 drag-to-reprioritize), segment editor, ramp sliders writing live, kill switches, live
-pointers per prompt/version with advance/revert controls and rendered old→new diffs,
+pointers per prompt/version with advance/revert controls, the per-version pointer
+timeline (who made what live, when, why — the blame view), rendered old→new diffs,
 approval queue (protected envs), targeting history with one-click rollback. Controls
 reflect RBAC.
 
@@ -621,7 +644,8 @@ test_contexts(id, prompt_id, name, flags, variables)
 drafts(id, prompt_id, version_number?, base_sha, git_ref, author, status)
 reviews(id, draft_id, reviewer, state)  review_comments(...)
 environments(id, name, protected, track_tip)
-live_pointers(environment_id, prompt_id, version_number, sha, moved_by, moved_at)
+pointer_moves(environment_id, prompt_id, version_number, from_sha?, to_sha,
+              moved_by, moved_at, comment)      -- append-only; current live = newest row
 env_defaults(environment_id, prompt_id, version_number)
 segments(id, environment_id, name, clauses, version)
 rules(id, environment_id, scope, prompt_id?, priority, clauses, serve, status, comment)
@@ -642,7 +666,9 @@ audit_log(actor, action, object_type, object_id, before, after, at)
   `incant_template_cache_misses_total` (~0 expected).
 - Targeting: `incant_renders_total{prompt,version,environment,stale_rules}` ·
   `incant_rules_snapshot_age_seconds{environment}` · `incant_rule_skips_total` ·
-  `incant_flag_eval_fallthrough_total` (dead rules) · pointer moves in the audit log.
+  `incant_flag_eval_fallthrough_total` (dead rules) ·
+  `incant_content_fallbacks_total{prompt,version,environment}` (page on nonzero) ·
+  pointer history is queryable state (§7), not just audit entries.
 - Authoring: `incant_commits_total{project}` · `incant_validation_failures_total`.
 - Backup: `incant_backup_lag_seconds{remote}` · `incant_backup_queue_depth` — bounds
   the content-durability exposure window.
