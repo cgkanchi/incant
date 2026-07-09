@@ -27,7 +27,13 @@ class ReviewRequired(RegistryError):
 
 
 class ConcurrencyError(RegistryError):
-    pass
+    def __init__(self, message: str, *, base_sha: str | None = None,
+                 current_sha: str | None = None) -> None:
+        super().__init__(message)
+        # The publisher must see the intervening diff (base -> current tip) to
+        # re-confirm; carry the endpoints so the handler can compute it.
+        self.base_sha = base_sha
+        self.current_sha = current_sha
 
 
 @dataclass
@@ -167,6 +173,15 @@ class RegistryService:
         self.s.flush()
         return extract(content)
 
+    def discard_draft(self, draft_id: str) -> models.Draft:
+        d = self.get_draft(draft_id)
+        if d.status in ("committed", "discarded"):
+            raise RegistryError(f"draft {draft_id!r} is already {d.status}")
+        d.status = "discarded"
+        self.git.delete_draft(draft_id)
+        self.s.flush()
+        return d
+
     # ── review ───────────────────────────────────────────────────────
 
     def approvals(self, draft_id: str) -> list[models.Review]:
@@ -262,7 +277,8 @@ class RegistryService:
             if current_blob is not None and current_blob != base_blob:
                 raise ConcurrencyError(
                     f"{path} changed since this draft's base; review the intervening "
-                    "diff and re-confirm to publish"
+                    "diff and re-confirm to publish",
+                    base_sha=d.base_sha, current_sha=self.git.head(),
                 )
 
         result = self.validate(d.prompt_id, source)

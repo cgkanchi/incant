@@ -179,6 +179,13 @@ def _effective_variables(app, session, prompt_id, version) -> list[dict]:
     return out
 
 
+# ── identity ─────────────────────────────────────────────────────────
+
+@router.get("/whoami")
+def whoami(ident: Identity = Depends(identity)):
+    return {"principal_id": ident.principal_id, "name": ident.name}
+
+
 # ── overview / prompts list ──────────────────────────────────────────
 
 @router.get("/overview")
@@ -331,6 +338,7 @@ def _draft_payload(app, reg, d) -> dict:
     return {
         "id": d.id, "prompt_id": d.prompt_id, "version_number": d.version_number,
         "base_sha": (d.base_sha[:7] if d.base_sha else None),
+        "base_full_sha": d.base_sha,
         "title": d.title, "author": d.author, "status": d.status,
         "content": content,
         "variables": ev.as_dict(),
@@ -404,6 +412,54 @@ def render_draft(
     return {"rendered": text, "flags": flags, "variables": variables}
 
 
+@router.get("/drafts/{draft_id}/diff")
+def diff_draft(
+    draft_id: str,
+    against_version: int | None = None, against_sha: str | None = None,
+    mode: str = "source", environment: str = "prod", test_context: str | None = None,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    reg = app.registry(session, ident.name)
+    try:
+        d = reg.get_draft(draft_id)
+    except RegistryError as exc:
+        raise HTTPException(404, str(exc))
+    _require(ident, "viewer", project=_project_of(d.prompt_id))
+    # Default target is the draft's own version at its base — "what did I change".
+    v = against_version if against_version is not None else d.version_number
+    sha = against_sha if against_sha is not None else d.base_sha
+    left = (app.git.read(f"{d.prompt_id}/v{v}.j2", ref=sha) if sha else "") or ""
+    right = reg.draft_content(draft_id)
+    fromfile = f"v{v}@{sha[:7]}" if sha else f"v{v} (new)"
+    tofile = f"draft:{draft_id[:7]}"
+    if mode == "rendered":
+        tcs = reg.get_test_contexts(d.prompt_id)
+        tc = next((t for t in tcs if t.name == test_context), tcs[0] if tcs else None)
+        flags = tc.flags if tc else {}
+        variables = tc.variables if tc else {}
+        try:
+            left_txt = app.render_at(session, environment, d.prompt_id, v, sha,
+                                     flags, variables) if sha else ""
+            right_txt = app.render_draft_source(session, environment, d.prompt_id,
+                                                right, flags, variables)
+        except Exception as exc:
+            return {"mode": "rendered", "diff": "", "context": (tc.name if tc else None),
+                    "error": f"render failed — {exc}. Add a test context that supplies required variables."}
+        diff = list(difflib.unified_diff(
+            left_txt.splitlines(), right_txt.splitlines(), lineterm="", n=3,
+            fromfile=fromfile, tofile=tofile,
+        ))
+        return {"mode": "rendered", "diff": "\n".join(diff), "context": (tc.name if tc else None),
+                "left": left_txt, "right": right_txt}
+    diff = list(difflib.unified_diff(
+        left.splitlines(), right.splitlines(), lineterm="", n=3,
+        fromfile=fromfile, tofile=tofile,
+    ))
+    return {"mode": "source", "diff": "\n".join(diff), "left": left, "right": right}
+
+
 @router.post("/drafts/{draft_id}/review")
 def review_draft(
     draft_id: str, req: ReviewRequest,
@@ -446,7 +502,18 @@ def commit_draft(
     except ReviewRequired as exc:
         raise HTTPException(412, str(exc))
     except ConcurrencyError as exc:
-        raise HTTPException(409, str(exc))
+        if exc.base_sha is None:  # plain conflict without shas — surface the message
+            raise HTTPException(409, str(exc))
+        path = f"{d.prompt_id}/v{d.version_number}.j2"
+        left = app.git.read(path, ref=exc.base_sha) or ""
+        right = app.git.read(path) or ""
+        diff = "\n".join(difflib.unified_diff(
+            left.splitlines(), right.splitlines(), lineterm="", n=3,
+            fromfile=f"v{d.version_number}@{exc.base_sha[:7]}",
+            tofile=f"v{d.version_number}@{exc.current_sha[:7]}",
+        ))
+        raise HTTPException(409, {"detail": str(exc), "base_sha": exc.base_sha[:7],
+                                  "current_sha": exc.current_sha[:7], "diff": diff})
     metrics.commits_total.labels(_project_of(d.prompt_id)).inc()
     if outcome.validation["status"] != "valid":
         metrics.validation_failures_total.inc()
@@ -458,6 +525,26 @@ def commit_draft(
         "sha": outcome.sha[:7], "full_sha": outcome.sha,
         "version_number": outcome.version_number, "validation": outcome.validation,
     }
+
+
+@router.post("/drafts/{draft_id}/discard")
+def discard_draft(
+    draft_id: str,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    reg = app.registry(session, ident.name)
+    try:
+        d = reg.get_draft(draft_id)
+    except RegistryError as exc:
+        raise HTTPException(404, str(exc))
+    _require(ident, "editor", project=_project_of(d.prompt_id))
+    try:
+        reg.discard_draft(draft_id)
+    except RegistryError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "draft_id": draft_id, "status": "discarded"}
 
 
 @router.get("/prompts/{prompt_id:path}/drafts")
@@ -477,6 +564,8 @@ def list_drafts(
     return {"prompt_id": prompt_id, "drafts": [
         {"id": d.id, "title": d.title, "author": d.author, "status": d.status,
          "version_number": d.version_number,
+         "base_sha": (d.base_sha[:7] if d.base_sha else None),
+         "updated_at": (d.updated_at.isoformat() if d.updated_at else None),
          "approvals": [r.reviewer for r in reg.approvals(d.id)]}
         for d in drafts
     ]}

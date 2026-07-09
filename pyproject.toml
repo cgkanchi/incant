@@ -3,6 +3,8 @@ name = "incant"
 version = "0.1.0"
 description = "A prompt management platform — git for content, Jinja2 for rendering, flag-based targeting."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",

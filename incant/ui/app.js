@@ -6,6 +6,7 @@ const State = {
   env: localStorage.getItem("incant_env") || "prod",
   theme: localStorage.getItem("incant_theme") || "light",
   envs: [],
+  me: null,               // cached GET /mgmt/whoami — cleared when the key changes
   tweakOpen: false,
   route: { name: "prompts", pid: null, q: {} },
 };
@@ -61,12 +62,12 @@ function errText(e) {
 function go(hash) { location.hash = hash; }
 
 // ── modal ────────────────────────────────────────────────────────────
-function openModal(html) {
+function openModal(html, cls) {
   closeModal();
   const o = document.createElement("div");
   o.id = "modal";
   o.className = "modal-overlay";
-  o.innerHTML = `<div class="modal" data-act="noop">${html}</div>`;
+  o.innerHTML = `<div class="modal ${cls || ""}" data-act="noop">${html}</div>`;
   document.body.appendChild(o);
   const first = o.querySelector("input, textarea");
   if (first) first.focus();
@@ -138,7 +139,11 @@ function parseRoute() {
   if (parts[0] === "access") return { name: "access", pid: null, q };
   if (parts[0] === "p") {
     const pid = decodeURIComponent(parts[1] || "");
-    const screen = parts[2] || "overview";
+    let screen = parts[2] || "overview";
+    // Legacy route redirects — old links keep working after the draft-page reshape.
+    if (screen === "editor") screen = "draft";
+    else if (screen === "review") { screen = "draft"; if (!q.tab) q.tab = "review"; }
+    else if (screen === "diff") screen = "compare";
     return { name: screen, pid, q };
   }
   return { name: "prompts", pid: null, q };
@@ -148,8 +153,8 @@ function parseRoute() {
 function subnav(pid) {
   if (!pid) return "";
   const items = [
-    ["overview", "Overview", "◈"], ["editor", "Draft editor", "✎"], ["diff", "Diff", "⇄"],
-    ["review", "Review", "☰"], ["rules", "Targeting", "◐"], ["pointers", "Pointers", "▸"],
+    ["overview", "Overview", "◈"], ["draft", "Draft", "✎"], ["compare", "Compare", "⇄"],
+    ["rules", "Targeting", "◐"], ["pointers", "Pointers", "▸"],
   ];
   const cur = State.route.name;
   const head = `<div class="subnav ${cur === "overview" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/overview">
@@ -206,11 +211,12 @@ function shell(mainHtml) {
 
 function tweakPanel() {
   const pid = State.route.pid;
+  // Targets may carry a query string; the hash is built by plain concatenation below.
   const steps = [
-    ["Edit", "Draft on the version — commit lands, serving unchanged", "editor"],
-    ["Commit", "Validated + review passed", "review"],
+    ["Edit", "Draft on the version — commit lands, serving unchanged", "draft"],
+    ["Commit", "Validated + review passed", "draft?tab=review"],
     ["Target a segment", "Rule: cohort → version @ tip", "rules"],
-    ["Verify", "Render test contexts + diff against live", "diff"],
+    ["Verify", "Render test contexts + diff against live", "draft?tab=diff"],
     ["Make live", "Advance the pointer, delete the rule", "pointers"],
   ];
   const rows = steps.map(([t, s, target], i) =>
@@ -310,91 +316,382 @@ async function screenOverview() {
     </div></div>`;
 }
 
-async function ensureDraft(pid, version, seed) {
-  const list = await GET(`/mgmt/prompts/${enc(pid)}/drafts`);
-  let draft = list.drafts.find((x) => x.version_number === version) || list.drafts[0];
-  if (draft) return draft.id;
-  const created = await POST(`/mgmt/prompts/${enc(pid)}/drafts`, {
-    version_number: version, seed_from_version: seed || version, title: "Draft v" + version,
-  });
-  return created.id;
+// ── draft page: autosave ─────────────────────────────────────────────
+// Autosave state lives at module scope so a pending save survives the re-render
+// that a tab switch or navigation triggers — a keystroke is never dropped.
+const Auto = { draftId: null, timer: null, seq: 0, applied: 0, inflight: null };
+let _draftNotice = null;   // one-shot notice shown atop the review tab (e.g. after a 412)
+
+function scheduleAutosave() {
+  clearTimeout(Auto.timer);
+  Auto.timer = setTimeout(fireAutosave, 800);   // ~800ms debounce after the last keystroke
+}
+function fireAutosave() {
+  clearTimeout(Auto.timer); Auto.timer = null;
+  const ta = el("draftTa");
+  if (!ta || !Auto.draftId) return;
+  const draftId = Auto.draftId, content = ta.value, seq = ++Auto.seq;
+  setAutosaveChip("saving");
+  Auto.inflight = (async () => {
+    try {
+      const r = await PUT(`/mgmt/drafts/${draftId}/content`, { content });
+      if (seq < Auto.applied) return;   // out-of-order guard: a newer save already landed
+      Auto.applied = seq;
+      if (window._dp && window._dp.draft && window._dp.draft.id === r.id) {
+        applyDraftUpdate(r);
+        setAutosaveChip("saved");
+        doRenderDraft();                // refresh the test render off the saved content
+      }
+    } catch (e) {
+      setAutosaveChip("failed");
+    }
+  })();
+  return Auto.inflight;
+}
+// Fire any pending debounce immediately and await the in-flight PUT — called before
+// the DOM is replaced (render) and before a commit, so no edit is lost or stale.
+async function flushAutosave() {
+  if (Auto.timer) fireAutosave();
+  if (Auto.inflight) { try { await Auto.inflight; } catch (_) {} }
+}
+function setAutosaveChip(state) {
+  const c = el("autoChip"); if (!c) return;
+  if (state === "saving") { c.textContent = "saving…"; c.className = "autochip"; }
+  else if (state === "saved") { c.textContent = "saved just now"; c.className = "autochip ok"; }
+  else if (state === "failed") { c.textContent = "save failed"; c.className = "autochip err"; }
+  else { c.textContent = "saved"; c.className = "autochip faint"; }
 }
 
-async function screenEditor() {
-  const pid = State.route.pid;
-  const vq = State.route.q.v ? parseInt(State.route.q.v) : null;
-  el("main").innerHTML = `<div class="empty">Opening draft…</div>`;
-  // find or create a draft
-  let draftId = State.route.q.draft;
-  if (!draftId) {
-    const dv = await GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`);
-    const targetV = vq || (dv.versions.find((x) => x.is_default)?.version) || dv.versions[0]?.version || 1;
-    draftId = await ensureDraft(pid, targetV, targetV);
+// ── diff helpers (shared by Compare + the draft diff tab) ─────────────
+function renderUnifiedDiff(diffText) {
+  const lines = (diffText || "").split("\n");
+  if (lines.length === 1 && lines[0] === "") return "";   // empty diff = no changes
+  return lines.map((ln) => {
+    let cls = "";
+    if (ln.startsWith("+") && !ln.startsWith("+++")) cls = "add";
+    else if (ln.startsWith("-") && !ln.startsWith("---")) cls = "del";
+    if (ln.startsWith("@@") || ln.startsWith("+++") || ln.startsWith("---"))
+      return `<div class="diffline"><span class="gut"></span><span class="txt faint">${esc(ln)}</span></div>`;
+    return `<div class="diffline ${cls}"><span class="gut">${cls === "add" ? "+" : cls === "del" ? "−" : ""}</span><span class="txt">${esc(ln.replace(/^[+-]/, ""))}</span></div>`;
+  }).join("");
+}
+// LCS line alignment: unchanged lines sit across from each other, inserted/removed
+// lines get their own colored row — feeds the side-by-side rendered diff.
+function alignLines(a, b) {
+  const n = a.length, m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const rows = []; let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { rows.push({ l: a[i], r: b[j], t: "same" }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { rows.push({ l: a[i], r: null, t: "del" }); i++; }
+    else { rows.push({ l: null, r: b[j], t: "add" }); j++; }
   }
-  const [draft, tcs] = await Promise.all([
-    GET(`/mgmt/drafts/${draftId}`),
-    GET(`/mgmt/prompts/${enc(pid)}/test-contexts`),
-  ]);
-  window._draft = draft;
-  window._tcs = tcs.test_contexts;
-  window._tcActive = tcs.test_contexts[0]?.name || null;
+  while (i < n) rows.push({ l: a[i++], r: null, t: "del" });
+  while (j < m) rows.push({ l: null, r: b[j++], t: "add" });
+  return rows;
+}
+function renderSideBySide(left, right) {
+  return alignLines((left || "").split("\n"), (right || "").split("\n")).map((row) =>
+    `<div class="sxs-row"><div class="sxs-cell${row.t === "del" ? " del" : ""}">${row.l == null ? "" : esc(row.l)}</div>` +
+    `<div class="sxs-cell${row.t === "add" ? " add" : ""}">${row.r == null ? "" : esc(row.r)}</div></div>`).join("");
+}
 
+// ── draft page: header pieces ────────────────────────────────────────
+function lintChipHtml(draft) {
   const lint = draft.lint || {};
-  const lintPill = lint.status === "valid"
+  return lint.status === "valid"
     ? `<span class="pill live">✓ lint clean</span>`
     : `<span class="pill danger">${esc(lint.error || "invalid")}</span>`;
-  const vars = draft.variables
-    ? `variables: ${draft.variables.required.map((n) => "<b>" + esc(n) + "</b>").join(" · ")}${draft.variables.optional.length ? " · " + draft.variables.optional.map((n) => esc(n) + "?").join(" · ") : ""}`
-    : "";
-  const chips = window._tcs.map((t) =>
-    `<span class="chip ${t.name === window._tcActive ? "active" : ""}" data-act="tc" data-name="${esc(t.name)}">${esc(t.name)}</span>`).join("");
-
-  el("main").innerHTML = `<div class="screen">
-    <div class="h1row"><span class="h1 sm serif">Draft — <i>v${draft.version_number}</i></span>
-      <span class="mono muted" style="font-size:10.5px">base ${esc(draft.base_sha || "")}</span>${lintPill}
-      <div class="grow"></div>
-      <button class="btn" data-act="go" data-hash="#/p/${enc(pid)}/diff">View diff</button>
-      <button class="btn" data-act="saveDraft">Save draft</button>
-      <button class="btn primary" data-act="go" data-hash="#/p/${enc(pid)}/review">Request review</button></div>
-    <div class="editor-wrap">
-      <div class="card editor">
-        <div class="ed-head"><span class="mono">v${draft.version_number}.j2</span><span>·</span><span>Jinja2</span>
-          <span style="margin-left:auto" class="mono">${esc(draft.id)}</span></div>
-        <textarea class="ta" id="draftTa" spellcheck="false">${esc(draft.content || "")}</textarea>
-        <div class="ed-foot"><span id="varLine">${vars}</span>
-          <span style="margin-left:auto" id="lintLine" class="${lint.status === "valid" ? "" : "muted"}" style="color:var(--live)">${lint.status === "valid" ? "includes resolve ✓ · no cycles ✓" : ""}</span></div>
-      </div>
-      <div class="card testpanel">
-        <div style="padding:12px 16px;border-bottom:1px solid var(--line2);display:flex;align-items:center;gap:8px">
-          <span style="font-size:12px;font-weight:700">Test render</span>
-          <span style="font-size:10.5px;color:var(--faint)">live · fragments expanded</span></div>
-        <div style="display:flex;gap:6px;padding:12px 16px 4px;flex-wrap:wrap">${chips || '<span class="faint">No test contexts</span>'}</div>
-        <div class="render-out" id="renderOut">Pick a context and Save draft to render.</div>
-      </div>
-    </div>
-    <div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn live" data-act="commit">Commit draft</button>
-      <label style="font-size:11px;color:var(--mut)"><input type="checkbox" id="forceCommit"> force (override concurrency)</label>
-      <span class="faint" style="font-size:11px">Commit is gated by the project review policy.</span>
-    </div></div>`;
-  if (window._tcActive) doRender();
+}
+function varsLine(draft) {
+  if (!draft.variables) return "";
+  const req = draft.variables.required.map((n) => "<b>" + esc(n) + "</b>").join(" · ");
+  const opt = draft.variables.optional.length
+    ? " · " + draft.variables.optional.map((n) => esc(n) + "?").join(" · ") : "";
+  return `variables: ${req}${opt}`;
+}
+// The single primary action — its label is always the next step in the flow.
+function draftPrimary(draft) {
+  const lint = draft.lint || {};
+  if (lint.status !== "valid")
+    return `<button class="btn primary" disabled>Fix template error</button>`;
+  const need = draft.review_policy || 0, have = draft.reviewers.length;
+  if (need > 0 && have < need)   // a pointer to the review tab, not a dead end
+    return `<button class="btn primary" data-act="draftTab" data-tab="review">Awaiting ${need - have} approval(s)</button>`;
+  return `<button class="btn primary" data-act="openCommit">Commit…</button>`;
+}
+function applyDraftUpdate(r) {
+  window._dp.draft = r;
+  const lc = el("draftLintChip"); if (lc) lc.innerHTML = lintChipHtml(r);
+  const pw = el("draftPrimaryWrap"); if (pw) pw.innerHTML = draftPrimary(r);
+  const vl = el("varLine"); if (vl) vl.innerHTML = varsLine(r);
 }
 
-async function doRender() {
-  const out = el("renderOut");
-  if (!out) return;
+async function screenDraft() {
+  await flushAutosave();               // never lose a pending edit when re-entering
+  const pid = State.route.pid, q = State.route.q;
+  const vq = q.v ? parseInt(q.v) : null;
+  const tab = q.tab || "write";
+  el("main").innerHTML = `<div class="empty">Opening draft…</div>`;
+
+  if (!State.me) State.me = await GET(`/mgmt/whoami`);
+  const [list, dv] = await Promise.all([
+    GET(`/mgmt/prompts/${enc(pid)}/drafts`),
+    GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`),
+  ]);
+
+  // Draft resolution: open ?draft; else the current user's own draft on ?v; else
+  // their newest open draft; else create one. NEVER auto-open another author's draft.
+  let draftId = q.draft;
+  if (!draftId) {
+    const mine = list.drafts.filter((d) => d.author === State.me.name);
+    const chosen = (vq != null && mine.find((d) => d.version_number === vq)) || mine[0] || null;
+    if (chosen) draftId = chosen.id;
+  }
+  if (!draftId) {
+    const targetV = vq || dv.versions.find((x) => x.is_default)?.version || dv.versions[0]?.version || 1;
+    const created = await POST(`/mgmt/prompts/${enc(pid)}/drafts`, {
+      version_number: targetV, seed_from_version: targetV, title: "Draft v" + targetV,
+    });
+    draftId = created.id;
+    // The listing was fetched pre-creation — add the new draft so the switcher shows it.
+    list.drafts.unshift({ id: created.id, title: created.title, author: created.author,
+      status: created.status, version_number: created.version_number,
+      base_sha: created.base_sha, updated_at: null, approvals: [] });
+  }
+
+  const [draft, tcs] = await Promise.all([
+    GET(`/mgmt/drafts/${enc(draftId)}`),
+    GET(`/mgmt/prompts/${enc(pid)}/test-contexts`),
+  ]);
+
+  // Page state survives in-tab updates (test contexts, diff controls); autosave is
+  // tracked separately in Auto so it isn't lost across re-renders.
+  window._dp = {
+    draft, drafts: list.drafts, versions: dv.versions, tcs: tcs.test_contexts,
+    tcActive: tcs.test_contexts[0]?.name || null,
+    diffAgainst: "base", diffMode: "source", diffTc: tcs.test_contexts[0]?.name || null,
+    pendingMsg: "",
+  };
+  window._draft = draft;   // codebase idiom — keep the alias current
+  Auto.draftId = draft.id;
+
+  const switcherOpts = list.drafts.map((d) => {
+    // "awaiting review" is only meaningful under a review policy; otherwise open
+    // drafts are just open.
+    const st = d.status === "approved" ? "approved"
+             : draft.review_policy > 0 ? "awaiting review" : "open";
+    const label = [`v${d.version_number}`, esc(d.author), ago(d.updated_at), st]
+      .filter(Boolean).join(" · ");
+    return `<option value="${esc(d.id)}"${d.id === draft.id ? " selected" : ""}>${label}</option>`;
+  }).join("") +
+    `<option value="__new">＋ New draft on v${draft.version_number}…</option>` +
+    `<option value="__discard">Discard this draft…</option>`;
+
+  const tabs = [["write", "Write"], ["diff", "Diff"], ["review", "Review"]];
+  const tabsHtml = tabs.map(([id, label]) =>
+    `<span class="tab ${tab === id ? "active" : ""}" data-act="draftTab" data-tab="${id}">${label}</span>`).join("");
+
+  const body = tab === "diff" ? draftDiffTabShell(window._dp)
+             : tab === "review" ? draftReviewTab(window._dp)
+             : draftWriteTab(window._dp);
+
+  el("main").innerHTML = `<div class="screen">
+    <div class="crumb"><a data-act="go" data-hash="#/prompts">Prompts</a> /
+      <a data-act="go" data-hash="#/p/${enc(pid)}/overview">${esc(pid)}</a> /</div>
+    <div class="h1row"><span class="h1 sm serif">Draft — <i>v${draft.version_number}</i></span>
+      <span class="sub">based on <span class="mono">${esc(draft.base_sha || "—")}</span> ·
+        <span class="autochip faint" id="autoChip">saved</span> ·
+        <span id="draftLintChip">${lintChipHtml(draft)}</span></span>
+      <div class="grow"></div>
+      <select class="envsel" data-act="switchDraft" style="max-width:240px">${switcherOpts}</select>
+      <span id="draftPrimaryWrap">${draftPrimary(draft)}</span></div>
+    <div class="tabs">${tabsHtml}</div>
+    <div id="draftTabBody">${body}</div></div>`;
+
+  if (tab === "write" && window._dp.tcActive) doRenderDraft();
+  if (tab === "diff") loadDraftDiff();
+}
+
+function draftWriteTab(dp) {
+  const draft = dp.draft;
+  const chips = dp.tcs.map((t) =>
+    `<span class="chip ${t.name === dp.tcActive ? "active" : ""}" data-act="tc" data-name="${esc(t.name)}">${esc(t.name)}</span>`).join("");
+  return `<div class="editor-wrap">
+    <div class="card editor">
+      <div class="ed-head"><span class="mono">v${draft.version_number}.j2</span><span>·</span><span>Jinja2</span>
+        <span style="margin-left:auto" class="mono">${esc(draft.id)}</span></div>
+      <textarea class="ta" id="draftTa" data-act="draftInput" spellcheck="false">${esc(draft.content || "")}</textarea>
+      <div class="ed-foot"><span id="varLine">${varsLine(draft)}</span>
+        <span style="margin-left:auto" class="faint">autosaves as you type</span></div>
+    </div>
+    <div class="card testpanel">
+      <div style="padding:12px 16px;border-bottom:1px solid var(--line2);display:flex;align-items:center;gap:8px">
+        <span style="font-size:12px;font-weight:700">Test render</span>
+        <span style="font-size:10.5px;color:var(--faint)">live · fragments expanded</span></div>
+      <div style="display:flex;gap:6px;padding:12px 16px 4px;flex-wrap:wrap">${chips || '<span class="faint">No test contexts</span>'}</div>
+      <div class="render-out" id="renderOut">Pick a test context — renders live as you type.</div>
+    </div></div>`;
+}
+
+function draftReviewTab(dp) {
+  const draft = dp.draft, selfOk = draft.allow_self_review;
+  const isAuthor = draft.author === (State.me && State.me.name);
+  const blocked = isAuthor && !selfOk;
+  const policyText = draft.review_policy > 0
+    ? `${draft.review_policy} approval(s) to commit · ${selfOk
+        ? "self-review counts — the author can approve their own draft"
+        : "distinct reviewer required — the author's own approval doesn't count"}`
+    : "no approvals required to commit";
+  const approvers = draft.reviewers.length
+    ? draft.reviewers.map((r) => `<span class="pill live">✓ ${esc(r)}</span>`).join(" ")
+    : '<span class="faint">No approvals yet.</span>';
+  const notice = _draftNotice
+    ? `<div class="banner warn"><span style="font-size:12.5px;font-weight:600">${esc(_draftNotice)}</span></div>` : "";
+  _draftNotice = null;   // one-shot
+  return `${notice}
+    <div class="panelrow">
+      <div style="flex:10 1 440px;min-width:0"><div class="card">
+        <div style="padding:14px 18px;border-bottom:1px solid var(--line2);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span style="font-size:13px;font-weight:700">Reviewers judge what will be served</span>
+          <span class="mono muted" style="font-size:10.5px">${esc(draft.id)} · base ${esc(draft.base_sha || "")}</span>
+          <div class="grow"></div>
+          ${blocked ? `<button class="btn" disabled>Approve ✓</button>`
+                    : `<button class="btn" data-act="approve" data-draft="${esc(draft.id)}">Approve ✓</button>`}</div>
+        <div style="padding:12px 18px;font-size:11.5px;color:var(--mut)">${esc(policyText)}</div>
+        ${blocked ? `<div style="padding:0 18px 10px;font-size:11.5px;color:var(--warn);font-weight:600">You authored this draft — a distinct reviewer must approve.</div>` : ""}
+        <div style="padding:0 18px 14px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">${approvers}</div>
+        <div class="render-out" style="margin:0 18px 18px">${esc(draft.content || "")}</div></div>
+      </div>
+      <div style="flex:1 1 240px;min-width:0"><div class="card pad">
+        <div class="groupname">Review policy</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+          <span class="pill ${selfOk ? "live" : "warn"}">${selfOk ? "self-review on" : "four-eyes"}</span>
+          <span class="link ${selfOk ? "faint" : ""}" data-act="toggleSelfReview" data-project="${esc(draft.project)}" data-to="${selfOk ? "false" : "true"}">${selfOk ? "require distinct reviewer" : "allow self-review"}</span></div>
+        <div style="font-size:10.5px;color:var(--faint);border-top:1px solid var(--line2);padding-top:10px">Review gates what enters the repo — targeting gates who sees it.</div>
+      </div></div>
+    </div>`;
+}
+
+async function doRenderDraft() {
+  const out = el("renderOut"); if (!out || !window._dp) return;
+  const tc = window._dp.tcActive;
+  if (!tc) { out.textContent = "Pick a test context — renders live as you type."; return; }
   out.textContent = "rendering…";
   try {
-    const r = await POST(`/mgmt/drafts/${window._draft.id}/render`, {
-      environment: State.env, test_context: window._tcActive || undefined,
+    const r = await POST(`/mgmt/drafts/${window._dp.draft.id}/render`, {
+      environment: State.env, test_context: tc,
     });
-    out.textContent = r.rendered;
+    if (el("renderOut")) el("renderOut").textContent = r.rendered;
   } catch (e) {
-    out.textContent = "⚠ " + errText(e);
+    if (el("renderOut")) el("renderOut").textContent = "⚠ " + errText(e);
   }
 }
 
-async function screenDiff() {
+// ── draft diff tab ───────────────────────────────────────────────────
+// "What did I change" — the draft vs its base by default, or vs any live/tip SHA.
+function draftDiffTabShell(dp) {
+  const draft = dp.draft;
+  // Reuse Compare's revision enumeration: each version at its live and/or tip SHA.
+  const revs = [];
+  for (const v of dp.versions) {
+    if (v.tip_full_sha && v.tip_full_sha !== v.live_full_sha)
+      revs.push({ v: v.version, sha: v.tip_full_sha, label: `v${v.version} · tip · ${v.tip_sha}` });
+    if (v.live_full_sha)
+      revs.push({ v: v.version, sha: v.live_full_sha, label: `v${v.version} · live · ${v.live_sha}` });
+  }
+  const sel = dp.diffAgainst || "base";
+  const opts = `<option value="base"${sel === "base" ? " selected" : ""}>base — v${draft.version_number} @ ${esc(draft.base_sha || "—")}</option>` +
+    revs.map((r) => { const tok = r.v + ":" + r.sha;
+      return `<option value="${esc(tok)}"${sel === tok ? " selected" : ""}>${esc(r.label)}</option>`; }).join("");
+  const mode = dp.diffMode || "source";
+  const tcRow = mode === "rendered"
+    ? `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">${
+        dp.tcs.map((t) => `<span class="chip ${t.name === dp.diffTc ? "active" : ""}" data-act="diffTc" data-name="${esc(t.name)}">${esc(t.name)}</span>`).join("")
+        || '<span class="faint">No test contexts</span>'}</div>` : "";
+  return `<div style="display:flex;gap:9px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <span class="faint" style="font-size:12px">against</span>
+      <select class="envsel" data-act="diffAgainst" style="min-width:240px">${opts}</select></div>
+    <div class="tabs">
+      <span class="tab ${mode === "source" ? "active" : ""}" data-act="diffMode" data-mode="source">Source</span>
+      <span class="tab ${mode === "rendered" ? "active" : ""}" data-act="diffMode" data-mode="rendered">Rendered</span></div>
+    ${tcRow}
+    <div class="card"><div id="draftDiffBox"><div class="empty">Loading diff…</div></div></div>`;
+}
+function draftDiffBody(res) {
+  if (res.error) return `<div class="empty">⚠ ${esc(res.error)}</div>`;
+  if (res.mode === "rendered") {
+    if ((res.left || "") === (res.right || "")) return '<div class="empty">No differences — identical rendered output.</div>';
+    return `<div class="sxs">${renderSideBySide(res.left, res.right)}</div>`;
+  }
+  const html = renderUnifiedDiff(res.diff);
+  return html ? `<div class="diffbox">${html}</div>`
+              : '<div class="empty">No differences — nothing changed vs this revision.</div>';
+}
+function fetchDraftDiff() {
+  const dp = window._dp;
+  let q = `mode=${dp.diffMode}&environment=${enc(State.env)}`;
+  if (dp.diffAgainst && dp.diffAgainst !== "base") {   // omitting against_* defaults to base
+    const [ver, sha] = dp.diffAgainst.split(":");
+    q += `&against_version=${enc(ver)}&against_sha=${enc(sha)}`;
+  }
+  if (dp.diffMode === "rendered" && dp.diffTc) q += `&test_context=${enc(dp.diffTc)}`;
+  return GET(`/mgmt/drafts/${enc(dp.draft.id)}/diff?${q}`);
+}
+async function loadDraftDiff() {
+  const box = el("draftDiffBox"); if (!box) return;
+  box.innerHTML = '<div class="empty">Loading diff…</div>';
+  try {
+    const res = await fetchDraftDiff();
+    if (el("draftDiffBox")) el("draftDiffBox").innerHTML = draftDiffBody(res);
+  } catch (e) {
+    if (el("draftDiffBox")) el("draftDiffBox").innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`;
+  }
+}
+function renderDraftDiffTab() {   // rebuild the diff-tab controls in place (mode toggle) + reload
+  const host = el("draftTabBody"); if (!host) return;
+  host.innerHTML = draftDiffTabShell(window._dp);
+  loadDraftDiff();
+}
+
+// ── draft page: commit + conflict ────────────────────────────────────
+function commitModalHtml(draft) {
+  return `
+    <h3>Commit v${draft.version_number}</h3>
+    <p class="hint">Lands a commit on <span class="mono">${esc(draft.prompt_id)}</span> — validated and audited. Serving is unchanged until a pointer moves.</p>
+    <div class="field"><label>Commit message</label>
+      <input id="commitMsg" placeholder="what changed and why" spellcheck="false"></div>
+    <div class="groupname" style="margin:2px 0 6px">Source diff vs base ${esc(draft.base_sha || "")}</div>
+    <div class="card"><div class="diffbox modal-diff" id="commitDiffBox"><div class="empty">Loading diff…</div></div></div>
+    <div class="modal-actions">
+      <button class="btn" data-act="closeModal">Cancel</button>
+      <button class="btn primary" data-act="commitDraft" data-id="${esc(draft.id)}">Commit</button></div>`;
+}
+// 409 → the version moved since this draft's base. Show what landed in between and
+// let the author force their edit on top. Replaces the old always-on force checkbox.
+function openConflictModal(draftId, c) {
+  const diffHtml = c.diff ? renderUnifiedDiff(c.diff) : "";
+  openModal(`
+    <h3>v${window._dp.draft.version_number} changed since your draft</h3>
+    <p class="hint">${esc(c.detail || "The version moved since your draft's base.")} Review what landed in between (${esc(c.base_sha || "")} → ${esc(c.current_sha || "")}), then commit anyway to put your version on top.</p>
+    <div class="card"><div class="diffbox modal-diff">${diffHtml || '<div class="empty">No intervening source diff.</div>'}</div></div>
+    <div class="modal-actions">
+      <button class="btn" data-act="closeModal">Cancel</button>
+      <button class="btn danger" data-act="commitForce" data-id="${esc(draftId)}">Commit anyway</button></div>`, "wide");
+}
+// 412 → review required. Don't strand the user with a toast: land them on the review tab.
+function goReviewNotice() {
+  _draftNotice = "Review required before commit — approve below (or adjust the policy).";
+  closeModal();
+  go(`#/p/${enc(State.route.pid)}/draft?draft=${enc(window._dp.draft.id)}&tab=review`);
+}
+
+// Compare — the history tool: any two committed states, A → B (renamed from the old
+// Diff screen). Human labels; rendered mode stays unified (this endpoint has no left/right).
+async function screenCompare() {
   const pid = State.route.pid;
   const d = await GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`);
   const mode = State.route.q.mode || "source";
@@ -403,15 +700,17 @@ async function screenDiff() {
   // tip before live within a version).
   const revs = [];
   for (const v of d.versions) {
-    if (v.tip_ahead > 0 && v.tip_full_sha)
+    // Tip is listed whenever it differs from live — tip_ahead is 0 for a version
+    // that was committed but never made live, and those must still be comparable.
+    if (v.tip_full_sha && v.tip_full_sha !== v.live_full_sha)
       revs.push({ token: `${v.version}@tip`, version: v.version, sha: v.tip_full_sha,
-                  short: v.tip_sha, label: `v${v.version} · tip · ${v.tip_sha}` });
+                  short: v.tip_sha, label: `v${v.version} · latest commit (tip) · ${v.tip_sha}` });
     if (v.live_full_sha)
       revs.push({ token: `${v.version}@live`, version: v.version, sha: v.live_full_sha,
-                  short: v.live_sha, label: `v${v.version} · live · ${v.live_sha}` });
+                  short: v.live_sha, label: `v${v.version} · what ${State.env} serves (live) · ${v.live_sha}` });
   }
   if (revs.length < 2) {
-    el("main").innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Diff</span></div><div class="empty">Nothing to diff yet — need two committed states.</div></div>`;
+    el("main").innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Compare</span></div><div class="empty">Nothing to compare yet — need two committed states.</div></div>`;
     return;
   }
 
@@ -433,79 +732,31 @@ async function screenDiff() {
   const opts = (sel) => revs.map((r) =>
     `<option value="${esc(r.token)}"${r.token === sel ? " selected" : ""}>${esc(r.label)}</option>`).join("");
 
-  const q = `a_version=${a.version}&a_sha=${a.sha}&b_version=${b.version}&b_sha=${b.sha}&mode=${mode}&environment=${enc(State.env)}`;
-  const res = await GET(`/mgmt/prompts/${enc(pid)}/diff?${q}`);
+  const query = `a_version=${a.version}&a_sha=${a.sha}&b_version=${b.version}&b_sha=${b.sha}&mode=${mode}&environment=${enc(State.env)}`;
+  const res = await GET(`/mgmt/prompts/${enc(pid)}/diff?${query}`);
   let body;
   if (res.error) {
     body = `<div class="empty">⚠ ${esc(res.error)}</div>`;
   } else {
-    const lines = (res.diff || "").split("\n").map((ln) => {
-      let cls = "";
-      if (ln.startsWith("+") && !ln.startsWith("+++")) cls = "add";
-      else if (ln.startsWith("-") && !ln.startsWith("---")) cls = "del";
-      if (ln.startsWith("@@") || ln.startsWith("+++") || ln.startsWith("---")) return `<div class="diffline"><span class="gut"></span><span class="txt faint">${esc(ln)}</span></div>`;
-      return `<div class="diffline ${cls}"><span class="gut">${cls === "add" ? "+" : cls === "del" ? "−" : ""}</span><span class="txt">${esc(ln.replace(/^[+-]/, ""))}</span></div>`;
-    }).join("");
-    body = lines || '<div class="empty">No differences — these two states are identical.</div>';
+    const html = renderUnifiedDiff(res.diff);
+    body = html || '<div class="empty">No differences — these two states are identical.</div>';
   }
 
   const qs = `a=${enc(aTok)}&b=${enc(bTok)}`;
   el("main").innerHTML = `<div class="screen">
-    <div class="h1row"><span class="h1 sm serif">Diff — <i>${esc(pid)}</i></span>
+    <div class="h1row"><span class="h1 sm serif">Compare — <i>${esc(pid)}</i></span>
       ${res.context ? `<span class="pill acc">${esc(res.context)}</span>` : ""}</div>
     <div style="display:flex;gap:9px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-      <select class="envsel" data-act="diffPick" data-side="a" style="min-width:160px">${opts(aTok)}</select>
+      <select class="envsel" data-act="diffPick" data-side="a" style="min-width:230px">${opts(aTok)}</select>
       <span class="faint" style="font-size:13px">→</span>
-      <select class="envsel" data-act="diffPick" data-side="b" style="min-width:160px">${opts(bTok)}</select>
+      <select class="envsel" data-act="diffPick" data-side="b" style="min-width:230px">${opts(bTok)}</select>
       <span class="mono muted" style="font-size:10.5px;margin-left:4px">${esc(a.short)} → ${esc(b.short)}</span></div>
     <div class="tabs">
-      <span class="tab ${mode === "source" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/diff?mode=source&${qs}">Source</span>
-      <span class="tab ${mode === "rendered" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/diff?mode=rendered&${qs}">Rendered</span></div>
+      <span class="tab ${mode === "source" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/compare?mode=source&${qs}">Source</span>
+      <span class="tab ${mode === "rendered" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/compare?mode=rendered&${qs}">Rendered</span></div>
     <div class="card"><div style="display:flex;gap:14px;padding:9px 18px;border-bottom:1px solid var(--line2);font-size:11px;color:var(--mut)">
       <span class="mono">${esc(pid)}</span><span style="margin-left:auto">${mode === "rendered" ? "rendered · fragments expanded" : "unified source"}</span></div>
       <div class="diffbox">${body}</div></div></div>`;
-}
-
-async function screenReview() {
-  const pid = State.route.pid;
-  const list = await GET(`/mgmt/prompts/${enc(pid)}/drafts`);
-  const sel = State.route.q.draft || list.drafts[0]?.id;
-  const cards = list.drafts.map((dr) => {
-    const badge = dr.status === "approved"
-      ? `<span class="pill live">approved</span>` : `<span class="pill warn">awaiting review</span>`;
-    return `<div class="card pad" style="${dr.id === sel ? "border:1.5px solid var(--acc)" : ""};cursor:pointer" data-act="go" data-hash="#/p/${enc(pid)}/review?draft=${dr.id}">
-      <div style="display:flex;gap:8px;align-items:center;font-size:12.5px;font-weight:700">${esc(dr.title || "v" + dr.version_number + " draft")}<span style="margin-left:auto">${badge}</span></div>
-      <div style="font-size:11px;color:var(--mut);margin-top:4px">${esc(dr.author)} · v${dr.version_number} · approvals: ${dr.approvals.length}</div></div>`;
-  }).join("") || '<div class="empty">No open drafts.</div>';
-
-  let detail = '<div class="empty">Select a draft.</div>';
-  let policyNote = "";
-  if (sel) {
-    const draft = await GET(`/mgmt/drafts/${sel}`);
-    const lint = draft.lint || {};
-    const selfOk = draft.allow_self_review;
-    const policyText = draft.review_policy > 0
-      ? `${draft.review_policy} approval(s) to commit · ${selfOk
-          ? "self-review counts — the author can approve their own draft"
-          : "distinct reviewer required — the author's own approval doesn't count"}`
-      : "no approvals required to commit";
-    policyNote = `<span class="pill ${selfOk ? "live" : "warn"}">${selfOk ? "self-review on" : "four-eyes"}</span>
-      <span class="link ${selfOk ? "faint" : ""}" data-act="toggleSelfReview" data-project="${esc(draft.project)}" data-to="${selfOk ? "false" : "true"}">${selfOk ? "require distinct reviewer" : "allow self-review"}</span>`;
-    detail = `<div class="card"><div style="padding:14px 18px;border-bottom:1px solid var(--line2);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-        <span style="font-size:13px;font-weight:700">${esc(draft.title || "Draft")}</span>
-        <span class="mono muted" style="font-size:10.5px">${esc(draft.id)} · base ${esc(draft.base_sha || "")}</span>
-        <div class="grow"></div>
-        <button class="btn" data-act="approve" data-draft="${draft.id}">Approve ✓</button>
-        <button class="btn live" data-act="commitReview" data-draft="${draft.id}">Commit</button></div>
-      <div style="padding:12px 18px;font-size:10.5px;color:var(--faint)">${lint.status === "valid" ? "✓ validates — includes resolve, no cycles" : "⚠ " + esc(lint.error || "")}
-        · ${esc(policyText)}${draft.reviewers.length ? " · approved by " + draft.reviewers.map(esc).join(", ") : ""}</div>
-      <div class="render-out" style="margin:8px 18px 18px">${esc(draft.content || "")}</div></div>`;
-  }
-  el("main").innerHTML = `<div class="screen">
-    <div class="h1row"><span class="h1 sm serif">Review</span><span class="sub">${esc(pid)} · reviewers judge what will be served</span>
-      <div class="grow"></div>${policyNote}</div>
-    <div class="panelrow"><div style="flex:1 1 240px;display:flex;flex-direction:column;gap:10px">${cards}</div>
-      <div style="flex:10 1 440px;min-width:0">${detail}</div></div></div>`;
 }
 
 async function screenRules() {
@@ -772,8 +1023,8 @@ async function screenPlay() {
 }
 
 const SCREENS = {
-  prompts: screenPrompts, overview: screenOverview, editor: screenEditor, diff: screenDiff,
-  review: screenReview, rules: screenRules, pointers: screenPointers, segments: screenSegments,
+  prompts: screenPrompts, overview: screenOverview, draft: screenDraft, compare: screenCompare,
+  rules: screenRules, pointers: screenPointers, segments: screenSegments,
   play: screenPlay, audit: screenAudit, access: screenAccess,
 };
 
@@ -794,6 +1045,7 @@ const Actions = {
   setToken() {
     State.token = el("tokenIn").value.trim();
     localStorage.setItem("incant_token", State.token);
+    State.me = null;   // identity changes with the key — re-fetch on next draft page
     toast("API key updated");
     render();
   },
@@ -841,7 +1093,7 @@ const Actions = {
         { version_number: 1, title: "v1", content: "" });
       closeModal();
       toast(`Created ${id} — start writing v1`);
-      go(`#/p/${enc(id)}/editor?draft=${draft.id}`);
+      go(`#/p/${enc(id)}/draft?draft=${draft.id}`);
     } catch (e) {
       if (e.status === 409) errEl.textContent = "A prompt with that id already exists.";
       else if (e.status === 403) errEl.textContent = "You don't have editor access on that project.";
@@ -854,61 +1106,116 @@ const Actions = {
       const dv = await GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`);
       const seed = dv.versions.find((x) => x.is_default)?.version || dv.versions[0]?.version;
       const created = await POST(`/mgmt/prompts/${enc(pid)}/drafts`, { seed_from_version: seed, title: "New version" });
-      go(`#/p/${enc(pid)}/editor?draft=${created.id}`);
+      go(`#/p/${enc(pid)}/draft?draft=${created.id}`);
     } catch (e) { toast(errText(e), true); }
   },
   async edit(ds) {
-    go(`#/p/${enc(State.route.pid)}/editor?v=${ds.v}`);
+    go(`#/p/${enc(State.route.pid)}/draft?v=${ds.v}`);
   },
   diffPick() {
     // Read both selects so changing one side preserves the other.
     const aSel = document.querySelector('select[data-side="a"]');
     const bSel = document.querySelector('select[data-side="b"]');
     const mode = State.route.q.mode || "source";
-    go(`#/p/${enc(State.route.pid)}/diff?mode=${mode}&a=${enc(aSel.value)}&b=${enc(bSel.value)}`);
+    go(`#/p/${enc(State.route.pid)}/compare?mode=${mode}&a=${enc(aSel.value)}&b=${enc(bSel.value)}`);
   },
-  tc(ds) { window._tcActive = ds.name; document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.name === ds.name)); doRender(); },
-  async saveDraft() {
+  // ── draft page ──────────────────────────────────────────────────
+  draftInput() { scheduleAutosave(); },
+  tc(ds) {
+    window._dp.tcActive = ds.name;
+    document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.name === ds.name));
+    doRenderDraft();
+  },
+  draftTab(ds) { go(`#/p/${enc(State.route.pid)}/draft?draft=${enc(window._dp.draft.id)}&tab=${ds.tab}`); },
+  switchDraft(ds, ev) {
+    const v = ev.target.value;
+    if (v === "__new" || v === "__discard") {
+      ev.target.value = window._dp.draft.id;   // don't leave the menu on an action item
+      return v === "__new" ? Actions.newDraftHere() : Actions.discardDraft();
+    }
+    go(`#/p/${enc(State.route.pid)}/draft?draft=${enc(v)}`);
+  },
+  async newDraftHere() {
+    const pid = State.route.pid, v = window._dp.draft.version_number;
     try {
-      const content = el("draftTa").value;
-      const r = await PUT(`/mgmt/drafts/${window._draft.id}/content`, { content });
-      window._draft = r;
-      const lint = r.lint || {};
-      el("lintLine").innerHTML = lint.status === "valid" ? "includes resolve ✓ · no cycles ✓" : "";
-      if (r.variables) el("varLine").innerHTML = `variables: ${r.variables.required.map((n) => "<b>" + esc(n) + "</b>").join(" · ")}`;
-      toast(lint.status === "valid" ? "Draft saved · lint clean" : "Saved · lint: " + (lint.error || "invalid"), lint.status !== "valid");
-      doRender();
+      const d = await POST(`/mgmt/prompts/${enc(pid)}/drafts`, {
+        version_number: v, seed_from_version: v, title: "Draft v" + v });
+      go(`#/p/${enc(pid)}/draft?draft=${d.id}`);
     } catch (e) { toast(errText(e), true); }
   },
-  async commit() {
+  discardDraft() {
+    const id = window._dp.draft.id;
+    openModal(`
+      <h3>Discard draft</h3>
+      <p class="hint">This closes the draft and drops its uncommitted content. It can't be undone — start a new draft if you change your mind.</p>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn danger" data-act="discardConfirm" data-id="${esc(id)}">Discard draft</button></div>`);
+  },
+  async discardConfirm(ds) {
     try {
-      const force = el("forceCommit")?.checked;
-      // Identity (author) comes from the authenticated key, not the client.
-      const r = await POST(`/mgmt/drafts/${window._draft.id}/commit`, { force });
+      await POST(`/mgmt/drafts/${enc(ds.id)}/discard`, {});
+      closeModal();
+      toast("Draft discarded");
+      go(`#/p/${enc(State.route.pid)}/overview`);
+    } catch (e) { toast(errText(e), true); }
+  },
+  diffAgainst(ds, ev) { window._dp.diffAgainst = ev.target.value; loadDraftDiff(); },
+  diffMode(ds) { window._dp.diffMode = ds.mode; renderDraftDiffTab(); },
+  diffTc(ds) {
+    window._dp.diffTc = ds.name;
+    document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.name === ds.name));
+    loadDraftDiff();
+  },
+  async openCommit() {
+    await flushAutosave();
+    const draft = window._dp.draft;
+    openModal(commitModalHtml(draft), "wide");
+    try {   // compact source diff vs base, fetched into the modal
+      const res = await GET(`/mgmt/drafts/${enc(draft.id)}/diff?mode=source&environment=${enc(State.env)}`);
+      const box = el("commitDiffBox");
+      if (box) box.innerHTML = res.error ? `<div class="empty">⚠ ${esc(res.error)}</div>`
+        : (renderUnifiedDiff(res.diff) || '<div class="empty">No changes vs base.</div>');
+    } catch (e) {
+      const box = el("commitDiffBox");
+      if (box) box.innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`;
+    }
+  },
+  async commitDraft(ds) {
+    await flushAutosave();
+    const msg = (el("commitMsg") && el("commitMsg").value || "").trim();
+    window._dp.pendingMsg = msg;   // stash for a possible force-retry on conflict
+    try {
+      const r = await POST(`/mgmt/drafts/${enc(ds.id)}/commit`, { message: msg });
+      closeModal();
       toast(`Committed ${r.sha} · v${r.version_number} · ${r.validation.status}`);
       go(`#/p/${enc(State.route.pid)}/overview`);
     } catch (e) {
-      if (e.status === 412) toast("Review required before commit — approve in Review", true);
+      const detail = e.data && e.data.detail;
+      if (e.status === 409 && detail && typeof detail === "object") openConflictModal(ds.id, detail);
+      else if (e.status === 412) goReviewNotice();
+      else toast(errText(e), true);
+    }
+  },
+  async commitForce(ds) {
+    try {
+      const r = await POST(`/mgmt/drafts/${enc(ds.id)}/commit`,
+        { message: (window._dp && window._dp.pendingMsg) || "", force: true });
+      closeModal();
+      toast(`Committed ${r.sha} · v${r.version_number} · ${r.validation.status}`);
+      go(`#/p/${enc(State.route.pid)}/overview`);
+    } catch (e) {
+      if (e.status === 412) goReviewNotice();
       else toast(errText(e), true);
     }
   },
   async approve(ds) {
     try {
-      // The reviewer is the authenticated principal; you can't approve your own draft.
+      // The reviewer is the authenticated principal; self-review is a per-project opt-out.
       await POST(`/mgmt/drafts/${ds.draft}/review`, { state: "approved" });
       toast("Approved — commit unlocked");
       render();
     } catch (e) { toast(errText(e), true); }
-  },
-  async commitReview(ds) {
-    try {
-      const r = await POST(`/mgmt/drafts/${ds.draft}/commit`, {});
-      toast(`Committed ${r.sha} · v${r.version_number}`);
-      go(`#/p/${enc(State.route.pid)}/overview`);
-    } catch (e) {
-      if (e.status === 412) toast("Needs an approval first", true);
-      else toast(errText(e), true);
-    }
   },
   async ruleStatus(ds) {
     try { await PATCH(`/mgmt/envs/${enc(State.env)}/rules/${ds.id}`, { status: ds.status }); toast(`Rule ${ds.id} → ${ds.status}`); render(); }
@@ -1123,6 +1430,7 @@ const Actions = {
 
 // ── render + wire ────────────────────────────────────────────────────
 function render() {
+  if (Auto.timer) fireAutosave();   // flush a pending autosave before the DOM is replaced
   document.body.dataset.theme = State.theme;
   State.route = parseRoute();
   el("app").innerHTML = shell(`<div class="empty">Loading…</div>`);
@@ -1148,7 +1456,9 @@ document.addEventListener("change", (ev) => {
 });
 document.addEventListener("input", (ev) => {
   const t = ev.target.closest("[data-act]");
-  if (t && t.dataset.act === "search") Actions.search(t.dataset, ev);
+  if (!t) return;
+  const act = t.dataset.act;
+  if (act === "search" || act === "draftInput") Actions[act](t.dataset, ev);
 });
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") closeModal();

@@ -140,6 +140,21 @@ table.grid{width:100%;border-collapse:collapse}
 .diffline.del .txt,.diffline.del .gut{color:var(--danger)}
 .diffline .txt{white-space:pre-wrap}
 
+/* side-by-side rendered diff (draft diff tab) — LCS-aligned two columns */
+.sxs{display:grid;grid-template-columns:1fr 1fr;font-family:'IBM Plex Mono',monospace;font-size:12px;
+  line-height:1.9;background:var(--code);overflow-x:auto}
+.sxs-row{display:contents}
+.sxs-cell{padding:0 14px;white-space:pre-wrap;min-width:0;border-right:1px solid var(--line2)}
+.sxs-cell.add{background:var(--live-soft);color:var(--live)}
+.sxs-cell.del{background:var(--danger-soft);color:var(--danger)}
+
+/* draft page */
+.autochip{font-size:11px}
+.autochip.ok{color:var(--live)}
+.autochip.err{color:var(--danger);font-weight:600}
+.autochip.faint{color:var(--faint)}
+.banner.warn{background:var(--warn-soft);border:1.5px solid var(--warn);color:var(--warn);margin-bottom:12px}
+
 /* rules */
 .rule{padding:14px 20px;border-bottom:1px solid var(--line2)}
 .rule-head{display:flex;gap:10px;align-items:center;margin-bottom:9px;flex-wrap:wrap}
@@ -195,6 +210,8 @@ input.search:focus{border-color:var(--acc)}
   justify-content:center;z-index:60;animation:inc-rise .18s ease}
 .modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 24px;
   width:460px;max-width:92vw;box-shadow:0 24px 70px rgba(0,0,0,.3)}
+.modal.wide{width:640px}
+.modal-diff{max-height:260px;overflow:auto}
 .modal h3{margin:0 0 4px;font-family:'Instrument Serif',serif;font-size:22px;font-weight:500}
 .modal .hint{font-size:11.5px;color:var(--mut);margin:0 0 16px}
 .field{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}

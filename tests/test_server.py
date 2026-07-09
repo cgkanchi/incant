@@ -493,3 +493,126 @@ def test_kill_switch_over_http(client):
     r = client.post("/prompt/support/system/evaluate",
                     json={"flags": {"user_id": "u_12"}}, headers=auth())
     assert r.json()["matched_rule"] == "default"
+
+
+def test_whoami(client):
+    r = client.get("/mgmt/whoami", headers=auth())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["principal_id"] and body["name"] == "bootstrap-admin"
+    # any authenticated identity works; a viewer (no authoring role) still gets it
+    viewer = make_key(client, "viewer", project="support")
+    assert client.get("/mgmt/whoami", headers=auth(viewer)).json()["name"]
+    # no credential -> 401
+    assert client.get("/mgmt/whoami").status_code == 401
+
+
+def test_draft_diff_default_against_base_source(client):
+    from incant.seed import SYSTEM_V2_WARM
+    body = SYSTEM_V2_WARM + "\nAn extra safety line."
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": body}, headers=auth()).json()
+    r = client.get(f"/mgmt/drafts/{d['id']}/diff", headers=auth())
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["mode"] == "source"
+    # default target is the draft's own v2 at its base -> "what did I change"
+    assert "An extra safety line." in j["diff"]
+    assert j["right"] == body
+    assert "support agent" in j["left"]        # v2's committed text at base
+    assert d["base_sha"][:7] in j["diff"]      # fromfile label = v2@<base7>
+
+
+def test_draft_diff_explicit_against(client):
+    v = client.get("/mgmt/prompts/support/system/versions?environment=prod", headers=auth()).json()
+    v2 = next(x for x in v["versions"] if x["version"] == 2)
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2,
+                          "content": "Totally new body for {{ customer_name }}."},
+                    headers=auth()).json()
+    q = f"against_version=2&against_sha={v2['live_full_sha']}"
+    r = client.get(f"/mgmt/drafts/{d['id']}/diff?{q}", headers=auth())
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert "Totally new body" in j["diff"]
+    assert v2["live_full_sha"][:7] in j["diff"]   # fromfile references the explicit sha
+
+
+def test_draft_diff_rendered_has_left_right(client):
+    from incant.seed import SYSTEM_V2_WARM
+    v = client.get("/mgmt/prompts/support/system/versions?environment=prod", headers=auth()).json()
+    v2 = next(x for x in v["versions"] if x["version"] == 2)
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": SYSTEM_V2_WARM}, headers=auth()).json()
+    q = (f"against_version=2&against_sha={v2['live_full_sha']}"
+         f"&mode=rendered&environment=prod&test_context=enterprise-us")
+    r = client.get(f"/mgmt/drafts/{d['id']}/diff?{q}", headers=auth())
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["mode"] == "rendered"
+    assert j["context"] == "enterprise-us"
+    # left = v2@live (formal), right = draft (warm + fragment) — both rendered
+    assert "formal, professional tone" in j["left"]
+    assert "Write in plain English" in j["right"]
+    assert "formal, professional tone" in j["diff"]   # removed line
+    assert "Write in plain English" in j["diff"]       # added line
+
+
+def test_discard_draft_removes_from_listing(client):
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": "temp draft body"}, headers=auth()).json()
+    lst = client.get("/mgmt/prompts/support/system/drafts", headers=auth()).json()
+    assert any(x["id"] == d["id"] for x in lst["drafts"])
+    r = client.post(f"/mgmt/drafts/{d['id']}/discard", headers=auth())
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "draft_id": d["id"], "status": "discarded"}
+    # list_drafts filters to open/approved -> a discarded draft vanishes
+    lst = client.get("/mgmt/prompts/support/system/drafts", headers=auth()).json()
+    assert not any(x["id"] == d["id"] for x in lst["drafts"])
+    # discarding again is a no-op error
+    assert client.post(f"/mgmt/drafts/{d['id']}/discard", headers=auth()).status_code == 400
+
+
+def test_discard_after_commit_is_400(client):
+    # Fresh project (review_policy 0) -> commit needs no approval.
+    client.post("/mgmt/prompts", json={"prompt_id": "growth/done"}, headers=auth())
+    d = client.post("/mgmt/prompts/growth/done/drafts",
+                    json={"version_number": 1, "content": "hello {{ name }}"}, headers=auth()).json()
+    assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 200
+    r = client.post(f"/mgmt/drafts/{d['id']}/discard", headers=auth())
+    assert r.status_code == 400, r.text
+
+
+def test_structured_409_on_commit_conflict(client):
+    # Fresh project (review_policy 0). Establish a v1 baseline, then branch two
+    # drafts off the same base; committing the second after the first conflicts.
+    client.post("/mgmt/prompts", json={"prompt_id": "growth/conflict"}, headers=auth())
+    d0 = client.post("/mgmt/prompts/growth/conflict/drafts",
+                     json={"version_number": 1, "content": "v1 base line"}, headers=auth()).json()
+    assert client.post(f"/mgmt/drafts/{d0['id']}/commit", json={}, headers=auth()).status_code == 200
+    a = client.post("/mgmt/prompts/growth/conflict/drafts",
+                    json={"version_number": 1, "content": "A change wins"}, headers=auth()).json()
+    b = client.post("/mgmt/prompts/growth/conflict/drafts",
+                    json={"version_number": 1, "content": "B change loses"}, headers=auth()).json()
+    assert client.post(f"/mgmt/drafts/{a['id']}/commit", json={}, headers=auth()).status_code == 200
+    r = client.post(f"/mgmt/drafts/{b['id']}/commit", json={}, headers=auth())
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "changed since this draft's base" in detail["detail"]
+    assert detail["base_sha"] and detail["current_sha"]
+    assert detail["base_sha"] != detail["current_sha"]
+    # the diff shows the intervening change (base -> current tip)
+    assert "A change wins" in detail["diff"]
+    assert "v1 base line" in detail["diff"]
+
+
+def test_draft_listing_enriched_fields(client):
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": "listing draft"}, headers=auth()).json()
+    lst = client.get("/mgmt/prompts/support/system/drafts", headers=auth()).json()
+    item = next(x for x in lst["drafts"] if x["id"] == d["id"])
+    assert item["base_sha"] and len(item["base_sha"]) == 7
+    assert item["updated_at"]                      # ISO timestamp
+    # single-draft GET exposes the full base sha
+    one = client.get(f"/mgmt/drafts/{d['id']}", headers=auth()).json()
+    assert one["base_full_sha"] and one["base_full_sha"].startswith(item["base_sha"])
