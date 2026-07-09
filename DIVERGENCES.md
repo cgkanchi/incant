@@ -14,6 +14,20 @@ behavior missing or materially wrong · **P2** deviation worth a deliberate deci
 
 ## Fix log
 
+- **Access dashboard + revision diff picker** (advances §2.8 key lifecycle; UI):
+  - **Admin access management.** New admin-only endpoints — `GET /mgmt/principals`
+    (users with their role bindings + keys), `POST /mgmt/principals/{id}/bindings` and
+    `DELETE …/{binding_id}` (assign/remove roles, scoped instance/project/env),
+    `POST /mgmt/principals/{id}/keys` (issue another key), `POST /mgmt/keys/{id}/revoke`.
+    A revoked key stops authenticating on the next `invalidate_auth()` reload. New
+    **Access** UI screen: per-user cards with role chips, keys, and modals to create a
+    user, grant a role, issue/revoke keys (the key is shown once). This covers most of
+    §2.8 (key lifecycle) short of expiry/rotation policy.
+  - **Diff revision picker.** The Diff screen now has two dropdowns listing each
+    version at its live and tip SHA; it defaults to the two newest versions at live
+    (replacing the auto-picked tweak diff) and threads the selection through the
+    Source/Rendered tabs. The generic `change` handler now dispatches any `data-act`.
+
 - **Governance reshape — unilateral targeting + opt-out self-review** (supersedes the
   §1.6/§1.7 propose→approve model): a deliberate product decision to simplify governance
   for single-operator/small-team installs.

@@ -154,3 +154,9 @@ class KeyRequest(BaseModel):
     role: str = "renderer"
     project_id: Optional[str] = None
     environment_id: Optional[str] = None
+
+
+class BindingRequest(BaseModel):
+    role: str
+    project_id: Optional[str] = None
+    environment_id: Optional[str] = None

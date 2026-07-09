@@ -263,6 +263,56 @@ def test_self_review_optout_requires_distinct_reviewer(client):
     assert client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth()).status_code == 200
 
 
+def test_admin_manage_users_roles_keys(client):
+    # Create a user: principal + first key + initial role binding.
+    r = client.post("/mgmt/keys", json={"principal_name": "dana", "role": "operator",
+                                        "project_id": "support"}, headers=auth())
+    assert r.status_code == 200, r.text
+    dana_key, pid = r.json()["key"], r.json()["principal_id"]
+
+    # It shows up in the admin listing with its binding and key.
+    d = client.get("/mgmt/principals", headers=auth()).json()
+    assert "operator" in d["roles"] and "support" in d["projects"] and "prod" in d["environments"]
+    me = next(p for p in d["principals"] if p["id"] == pid)
+    assert me["name"] == "dana"
+    assert any(b["role"] == "operator" and b["project_id"] == "support" for b in me["bindings"])
+    assert len(me["keys"]) == 1 and me["keys"][0]["revoked"] is False
+    # The new key authenticates.
+    assert client.get("/mgmt/envs", headers=auth(dana_key)).status_code == 200
+
+    # Grant a second role (env-scoped releaser) -> dana can now release on prod.
+    assert client.post(f"/mgmt/principals/{pid}/bindings",
+                       json={"role": "releaser", "environment_id": "prod"},
+                       headers=auth()).status_code == 200
+    sha = _tip_sha(client)
+    move = {"prompt_id": "support/system", "version_number": 2, "to_sha": sha,
+            "confirm": "support/system"}
+    assert client.post("/mgmt/envs/prod/pointers", json=move, headers=auth(dana_key)).status_code == 200
+
+    # Remove the releaser binding -> dana loses release rights.
+    me = next(p for p in client.get("/mgmt/principals", headers=auth()).json()["principals"]
+              if p["id"] == pid)
+    bid = next(b["id"] for b in me["bindings"] if b["role"] == "releaser")
+    assert client.delete(f"/mgmt/principals/{pid}/bindings/{bid}", headers=auth()).status_code == 200
+    assert client.post("/mgmt/envs/prod/pointers", json=move, headers=auth(dana_key)).status_code == 403
+
+    # Issue a second key, revoke the first -> first stops authenticating, second works.
+    k2 = client.post(f"/mgmt/principals/{pid}/keys", headers=auth()).json()["key"]
+    first_kid = next(k["id"] for k in
+                     next(p for p in client.get("/mgmt/principals", headers=auth()).json()["principals"]
+                          if p["id"] == pid)["keys"] if not k["revoked"])
+    assert client.post(f"/mgmt/keys/{first_kid}/revoke", headers=auth()).status_code == 200
+    assert client.get("/mgmt/envs", headers=auth(dana_key)).status_code == 401
+    assert client.get("/mgmt/envs", headers=auth(k2)).status_code == 200
+
+
+def test_access_management_requires_admin(client):
+    viewer = make_key(client, "viewer", project="support")
+    assert client.get("/mgmt/principals", headers=auth(viewer)).status_code == 403
+    assert client.post("/mgmt/keys", json={"principal_name": "x", "role": "viewer"},
+                       headers=auth(viewer)).status_code == 403
+
+
 def test_create_new_prompt_flow(client):
     # New prompt in a new project (review_policy 0 -> commit needs no approval).
     r = client.post("/mgmt/prompts", json={"prompt_id": "growth/welcome",

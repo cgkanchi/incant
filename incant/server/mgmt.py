@@ -19,10 +19,14 @@ from ..core import extract
 from ..registry import ConcurrencyError, RegistryError, ReviewRequired
 from ..service import AppContext, ServingError
 from ..targeting import TargetingError, build_snapshot
+from ..targeting.audit import record_audit
 from . import metrics
-from .auth import AuthError, Identity, hash_key, key_prefix
+from .auth import _IMPLIES, AuthError, Identity, hash_key, key_prefix
+
+ROLES = list(_IMPLIES)  # renderer → admin, canonical order
 from .deps import app_context, get_session, identity
 from .schemas import (
+    BindingRequest,
     CommitRequest,
     CreateDraftRequest,
     CreatePromptRequest,
@@ -913,8 +917,129 @@ def create_key(
     session.flush()  # parent row before FK-bearing children
     session.add(models.ApiKey(principal_id=pid, prefix=key_prefix(raw), hash=hash_key(raw),
                               name=req.principal_name))
+    if req.role not in _IMPLIES:
+        raise HTTPException(400, f"unknown role {req.role!r}")
     session.add(models.RoleBinding(principal_id=pid, role=req.role,
                                    project_id=req.project_id, environment_id=req.environment_id))
+    record_audit(session, ident.name, "principal.create", "principal", pid,
+                 after={"name": req.principal_name, "role": req.role})
     app.invalidate_auth()  # reload the in-memory key table so the new key authenticates
     return {"key": raw, "principal_id": pid, "role": req.role,
             "note": "store this key now; it is not recoverable"}
+
+
+# ── admin: users, roles, keys ────────────────────────────────────────
+
+def _principal_payload(session: Session, p: models.Principal) -> dict:
+    bindings = session.execute(
+        select(models.RoleBinding).where(models.RoleBinding.principal_id == p.id)
+        .order_by(models.RoleBinding.id)
+    ).scalars().all()
+    keys = session.execute(
+        select(models.ApiKey).where(models.ApiKey.principal_id == p.id)
+        .order_by(models.ApiKey.id)
+    ).scalars().all()
+    return {
+        "id": p.id, "name": p.name, "kind": p.kind, "created_at": p.created_at.isoformat(),
+        "bindings": [{"id": b.id, "role": b.role, "project_id": b.project_id,
+                      "environment_id": b.environment_id} for b in bindings],
+        "keys": [{"id": k.id, "prefix": k.prefix, "name": k.name, "revoked": k.revoked,
+                  "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+                  "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None}
+                 for k in keys],
+    }
+
+
+@router.get("/principals")
+def list_principals(
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "admin")
+    principals = session.execute(
+        select(models.Principal).order_by(models.Principal.created_at)
+    ).scalars().all()
+    projects = [p.id for p in session.execute(
+        select(models.Project).order_by(models.Project.id)).scalars()]
+    envs = [e.id for e in session.execute(
+        select(models.Environment).order_by(models.Environment.id)).scalars()]
+    return {"roles": ROLES, "projects": projects, "environments": envs,
+            "principals": [_principal_payload(session, p) for p in principals]}
+
+
+@router.post("/principals/{pid}/bindings")
+def add_binding(
+    pid: str, req: BindingRequest,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "admin")
+    if session.get(models.Principal, pid) is None:
+        raise HTTPException(404, f"unknown principal {pid}")
+    if req.role not in _IMPLIES:
+        raise HTTPException(400, f"unknown role {req.role!r}")
+    session.add(models.RoleBinding(principal_id=pid, role=req.role,
+                                   project_id=req.project_id, environment_id=req.environment_id))
+    record_audit(session, ident.name, "binding.add", "principal", pid,
+                 after={"role": req.role, "project_id": req.project_id,
+                        "environment_id": req.environment_id})
+    app.invalidate_auth()
+    return {"ok": True}
+
+
+@router.delete("/principals/{pid}/bindings/{binding_id}")
+def remove_binding(
+    pid: str, binding_id: int,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "admin")
+    b = session.get(models.RoleBinding, binding_id)
+    if b is None or b.principal_id != pid:
+        raise HTTPException(404, "unknown binding")
+    record_audit(session, ident.name, "binding.remove", "principal", pid,
+                 before={"role": b.role, "project_id": b.project_id,
+                         "environment_id": b.environment_id})
+    session.delete(b)
+    app.invalidate_auth()
+    return {"ok": True}
+
+
+@router.post("/principals/{pid}/keys")
+def issue_key(
+    pid: str,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "admin")
+    p = session.get(models.Principal, pid)
+    if p is None:
+        raise HTTPException(404, f"unknown principal {pid}")
+    raw = "incant_sk_" + uuid.uuid4().hex
+    session.add(models.ApiKey(principal_id=pid, prefix=key_prefix(raw), hash=hash_key(raw),
+                              name=p.name))
+    record_audit(session, ident.name, "key.issue", "principal", pid)
+    app.invalidate_auth()
+    return {"key": raw, "principal_id": pid,
+            "note": "store this key now; it is not recoverable"}
+
+
+@router.post("/keys/{key_id}/revoke")
+def revoke_key(
+    key_id: int,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    _require(ident, "admin")
+    k = session.get(models.ApiKey, key_id)
+    if k is None:
+        raise HTTPException(404, f"unknown key {key_id}")
+    k.revoked = True
+    record_audit(session, ident.name, "key.revoke", "principal", k.principal_id,
+                 after={"key_id": key_id, "prefix": k.prefix})
+    app.invalidate_auth()
+    return {"ok": True, "key_id": key_id}

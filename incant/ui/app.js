@@ -135,6 +135,7 @@ function parseRoute() {
   if (parts[0] === "segments") return { name: "segments", pid: null, q };
   if (parts[0] === "play") return { name: "play", pid: null, q };
   if (parts[0] === "audit") return { name: "audit", pid: null, q };
+  if (parts[0] === "access") return { name: "access", pid: null, q };
   if (parts[0] === "p") {
     const pid = decodeURIComponent(parts[1] || "");
     const screen = parts[2] || "overview";
@@ -179,6 +180,8 @@ function sidebar() {
       <span class="gl">▶</span><span>Playground</span></div>
     <div class="nav ${State.route.name === "audit" ? "active" : ""}" data-act="go" data-hash="#/audit">
       <span class="gl">◷</span><span>Audit</span></div>
+    <div class="nav ${State.route.name === "access" ? "active" : ""}" data-act="go" data-hash="#/access">
+      <span class="gl">⚿</span><span>Access</span></div>
     <div class="spacer"></div>
     ${pid ? `<button class="tweak-btn" data-act="toggleTweak"><span>✦</span> Tweak flow</button>` : ""}
     <div class="envbar">
@@ -396,26 +399,39 @@ async function screenDiff() {
   const d = await GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`);
   const mode = State.route.q.mode || "source";
 
-  // Prefer the classic "v @ live → v @ tip" tweak diff. If tip == live everywhere,
-  // fall back to a cross-version diff of the two newest versions at their live SHAs.
-  const tweak = d.versions.find((v) => v.tip_ahead > 0 && v.live_full_sha && v.tip_full_sha);
-  let a, b, title;
-  if (tweak) {
-    a = { version: tweak.version, sha: tweak.live_full_sha, short: tweak.live_sha };
-    b = { version: tweak.version, sha: tweak.tip_full_sha, short: tweak.tip_sha };
-    title = `v${tweak.version} @ live → @ tip`;
-  } else {
-    const withLive = d.versions.filter((v) => v.live_full_sha);
-    if (withLive.length >= 2) {
-      const [hi, lo] = [withLive[0], withLive[1]];
-      a = { version: lo.version, sha: lo.live_full_sha, short: lo.live_sha };
-      b = { version: hi.version, sha: hi.live_full_sha, short: hi.live_sha };
-      title = `v${lo.version} @ live → v${hi.version} @ live`;
-    } else {
-      el("main").innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Diff</span></div><div class="empty">Nothing to diff yet — need two committed states.</div></div>`;
-      return;
-    }
+  // Selectable revisions: each version at its live and/or tip SHA (newest first,
+  // tip before live within a version).
+  const revs = [];
+  for (const v of d.versions) {
+    if (v.tip_ahead > 0 && v.tip_full_sha)
+      revs.push({ token: `${v.version}@tip`, version: v.version, sha: v.tip_full_sha,
+                  short: v.tip_sha, label: `v${v.version} · tip · ${v.tip_sha}` });
+    if (v.live_full_sha)
+      revs.push({ token: `${v.version}@live`, version: v.version, sha: v.live_full_sha,
+                  short: v.live_sha, label: `v${v.version} · live · ${v.live_sha}` });
   }
+  if (revs.length < 2) {
+    el("main").innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Diff</span></div><div class="empty">Nothing to diff yet — need two committed states.</div></div>`;
+    return;
+  }
+
+  // Default: the two newest versions at their live SHA (base = older, target = newer).
+  // Single version with a tip ahead falls back to live→tip.
+  const liveByVer = [];
+  const seenVer = new Set();
+  for (const r of revs) if (r.token.endsWith("@live") && !seenVer.has(r.version)) {
+    seenVer.add(r.version); liveByVer.push(r);
+  }
+  const [defA, defB] = liveByVer.length >= 2
+    ? [liveByVer[1].token, liveByVer[0].token]
+    : [revs[revs.length - 1].token, revs[0].token];
+  const has = (tok) => revs.some((r) => r.token === tok);
+  const aTok = has(State.route.q.a) ? State.route.q.a : defA;
+  const bTok = has(State.route.q.b) ? State.route.q.b : defB;
+  const a = revs.find((r) => r.token === aTok);
+  const b = revs.find((r) => r.token === bTok);
+  const opts = (sel) => revs.map((r) =>
+    `<option value="${esc(r.token)}"${r.token === sel ? " selected" : ""}>${esc(r.label)}</option>`).join("");
 
   const q = `a_version=${a.version}&a_sha=${a.sha}&b_version=${b.version}&b_sha=${b.sha}&mode=${mode}&environment=${enc(State.env)}`;
   const res = await GET(`/mgmt/prompts/${enc(pid)}/diff?${q}`);
@@ -433,13 +449,18 @@ async function screenDiff() {
     body = lines || '<div class="empty">No differences — these two states are identical.</div>';
   }
 
+  const qs = `a=${enc(aTok)}&b=${enc(bTok)}`;
   el("main").innerHTML = `<div class="screen">
-    <div class="h1row"><span class="h1 sm serif">Diff — <i>${title}</i></span>
-      <span class="mono muted" style="font-size:10.5px">${esc(a.short)} → ${esc(b.short)}</span>
+    <div class="h1row"><span class="h1 sm serif">Diff — <i>${esc(pid)}</i></span>
       ${res.context ? `<span class="pill acc">${esc(res.context)}</span>` : ""}</div>
+    <div style="display:flex;gap:9px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <select class="envsel" data-act="diffPick" data-side="a" style="min-width:160px">${opts(aTok)}</select>
+      <span class="faint" style="font-size:13px">→</span>
+      <select class="envsel" data-act="diffPick" data-side="b" style="min-width:160px">${opts(bTok)}</select>
+      <span class="mono muted" style="font-size:10.5px;margin-left:4px">${esc(a.short)} → ${esc(b.short)}</span></div>
     <div class="tabs">
-      <span class="tab ${mode === "source" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/diff?mode=source">Source</span>
-      <span class="tab ${mode === "rendered" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/diff?mode=rendered">Rendered</span></div>
+      <span class="tab ${mode === "source" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/diff?mode=source&${qs}">Source</span>
+      <span class="tab ${mode === "rendered" ? "active" : ""}" data-act="go" data-hash="#/p/${enc(pid)}/diff?mode=rendered&${qs}">Rendered</span></div>
     <div class="card"><div style="display:flex;gap:14px;padding:9px 18px;border-bottom:1px solid var(--line2);font-size:11px;color:var(--mut)">
       <span class="mono">${esc(pid)}</span><span style="margin-left:auto">${mode === "rendered" ? "rendered · fragments expanded" : "unified source"}</span></div>
       <div class="diffbox">${body}</div></div></div>`;
@@ -619,6 +640,84 @@ async function screenAudit() {
       <tbody>${rows || '<tr><td colspan="4" class="empty">No audit entries.</td></tr>'}</tbody></table></div></div>`;
 }
 
+function _scopeLabel(b) {
+  if (!b.project_id && !b.environment_id) return "instance-wide";
+  const parts = [];
+  if (b.project_id) parts.push("project " + b.project_id);
+  if (b.environment_id) parts.push("env " + b.environment_id);
+  return parts.join(" · ");
+}
+
+async function screenAccess() {
+  let d;
+  try {
+    d = await GET(`/mgmt/principals`);
+  } catch (e) {
+    el("main").innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Access</span></div>
+      <div class="empty">${e.status === 403 ? "Admin access required to manage users." : esc(errText(e))}</div></div>`;
+    return;
+  }
+  State._access = d;  // roles/projects/envs cached for the modals
+  const cards = d.principals.map((p) => {
+    const bindings = p.bindings.map((b) =>
+      `<span class="tag acc" style="display:inline-flex;gap:6px;align-items:center">
+        ${esc(b.role)} · <span class="faint" style="font-weight:400">${esc(_scopeLabel(b))}</span>
+        <span class="link" data-act="removeBinding" data-pid="${esc(p.id)}" data-bid="${b.id}" title="remove"
+          style="color:var(--danger)">✕</span></span>`).join(" ") ||
+      '<span class="faint" style="font-size:11px">no roles</span>';
+    const keys = p.keys.map((k) =>
+      `<div style="display:flex;gap:10px;align-items:center;font-size:11px">
+        <span class="mono ${k.revoked ? "faint" : ""}">${esc(k.prefix)}…</span>
+        ${k.revoked ? '<span class="pill warn">revoked</span>'
+                    : '<span class="pill live">active</span>'}
+        <span class="faint">${k.last_used_at ? "used " + ago(k.last_used_at) : "never used"}</span>
+        ${k.revoked ? "" : `<span class="link" data-act="revokeKey" data-kid="${k.id}"
+           style="color:var(--danger);margin-left:auto">revoke</span>`}</div>`).join("") ||
+      '<span class="faint" style="font-size:11px">no keys</span>';
+    return `<div class="card pad">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <span style="font-size:13.5px;font-weight:700">${esc(p.name || p.id)}</span>
+        <span class="tag mut">${esc(p.kind)}</span>
+        <span class="mono faint" style="font-size:10.5px">${esc(p.id)}</span>
+        <div class="grow"></div>
+        <button class="btn" data-act="addBinding" data-pid="${esc(p.id)}">+ role</button>
+        <button class="btn" data-act="issueKey" data-pid="${esc(p.id)}" data-name="${esc(p.name)}">+ key</button></div>
+      <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">${bindings}</div>
+      <div style="margin-top:12px;border-top:1px solid var(--line2);padding-top:10px;display:flex;flex-direction:column;gap:6px">${keys}</div>
+    </div>`;
+  }).join("") || '<div class="empty">No users yet.</div>';
+
+  el("main").innerHTML = `<div class="screen">
+    <div class="h1row"><span class="h1 sm serif">Access</span>
+      <span class="sub">users, roles, and API keys</span>
+      <div class="grow"></div>
+      <button class="btn primary" data-act="newUser">+ New user</button></div>
+    <div style="display:flex;flex-direction:column;gap:12px">${cards}</div>
+    <div style="font-size:11px;color:var(--faint);margin-top:14px">Roles: renderer &lt; viewer &lt; editor &lt; operator &lt; releaser &lt; admin. A role can be scoped instance-wide, to a project, to an environment, or to both. Keys are shown once at creation and can only be revoked, not recovered.</div></div>`;
+}
+
+// Options helpers for the role/scope selectors in the access modals.
+function _roleOpts(sel) {
+  return (State._access?.roles || []).map((r) =>
+    `<option value="${esc(r)}"${r === sel ? " selected" : ""}>${esc(r)}</option>`).join("");
+}
+function _projectOpts() {
+  return '<option value="">— all projects —</option>' +
+    (State._access?.projects || []).map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join("");
+}
+function _envOpts() {
+  return '<option value="">— all environments —</option>' +
+    (State._access?.environments || []).map((e) => `<option value="${esc(e)}">${esc(e)}</option>`).join("");
+}
+function _showKeyModal(key) {
+  openModal(`
+    <h3>API key created</h3>
+    <p class="hint">Copy it now — it is <b>not recoverable</b>. This is the only time it's shown.</p>
+    <input readonly onclick="this.select()" value="${esc(key)}"
+      style="width:100%;font-family:'IBM Plex Mono',monospace;font-size:12px">
+    <div class="modal-actions"><button class="btn primary" data-act="closeModal">Done</button></div>`);
+}
+
 function renderPlayResult(r, pinned) {
   const matched = typeof r.matched_rule === "string"
     ? r.matched_rule : `${r.matched_rule.scope}:${r.matched_rule.id}`;
@@ -675,7 +774,7 @@ async function screenPlay() {
 const SCREENS = {
   prompts: screenPrompts, overview: screenOverview, editor: screenEditor, diff: screenDiff,
   review: screenReview, rules: screenRules, pointers: screenPointers, segments: screenSegments,
-  play: screenPlay, audit: screenAudit,
+  play: screenPlay, audit: screenAudit, access: screenAccess,
 };
 
 // ── actions ──────────────────────────────────────────────────────────
@@ -760,6 +859,13 @@ const Actions = {
   },
   async edit(ds) {
     go(`#/p/${enc(State.route.pid)}/editor?v=${ds.v}`);
+  },
+  diffPick() {
+    // Read both selects so changing one side preserves the other.
+    const aSel = document.querySelector('select[data-side="a"]');
+    const bSel = document.querySelector('select[data-side="b"]');
+    const mode = State.route.q.mode || "source";
+    go(`#/p/${enc(State.route.pid)}/diff?mode=${mode}&a=${enc(aSel.value)}&b=${enc(bSel.value)}`);
   },
   tc(ds) { window._tcActive = ds.name; document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.name === ds.name)); doRender(); },
   async saveDraft() {
@@ -923,6 +1029,88 @@ const Actions = {
       render();
     } catch (e) { toast(errText(e), true); }
   },
+  // ── access / users ──────────────────────────────────────────────
+  newUser() {
+    openModal(`
+      <h3>New user</h3>
+      <p class="hint">Creates a principal with an initial role and issues its first API key.</p>
+      <div class="field"><label>Name</label>
+        <input id="auName" placeholder="e.g. dana or ci-deploy" spellcheck="false"></div>
+      <div class="field"><label>Role</label><select id="auRole" class="envsel" style="width:100%">${_roleOpts("editor")}</select></div>
+      <div class="field"><label>Project scope</label><select id="auProject" class="envsel" style="width:100%">${_projectOpts()}</select></div>
+      <div class="field"><label>Environment scope</label><select id="auEnv" class="envsel" style="width:100%">${_envOpts()}</select></div>
+      <div class="err" id="auErr"></div>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn primary" data-act="createUser">Create &amp; issue key</button>
+      </div>`);
+  },
+  async createUser() {
+    const name = (el("auName").value || "").trim();
+    if (!name) { el("auErr").textContent = "Enter a name."; return; }
+    try {
+      const r = await POST(`/mgmt/keys`, {
+        principal_name: name, role: el("auRole").value,
+        project_id: el("auProject").value || null, environment_id: el("auEnv").value || null,
+      });
+      _showKeyModal(r.key);
+      render();
+    } catch (e) { el("auErr").textContent = errText(e); }
+  },
+  addBinding(ds) {
+    openModal(`
+      <h3>Add role</h3>
+      <p class="hint">Grant another role to this user, optionally scoped to a project and/or environment.</p>
+      <div class="field"><label>Role</label><select id="abRole" class="envsel" style="width:100%">${_roleOpts("viewer")}</select></div>
+      <div class="field"><label>Project scope</label><select id="abProject" class="envsel" style="width:100%">${_projectOpts()}</select></div>
+      <div class="field"><label>Environment scope</label><select id="abEnv" class="envsel" style="width:100%">${_envOpts()}</select></div>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn primary" data-act="addBindingConfirm" data-pid="${esc(ds.pid)}">Add role</button>
+      </div>`);
+  },
+  async addBindingConfirm(ds) {
+    try {
+      await POST(`/mgmt/principals/${enc(ds.pid)}/bindings`, {
+        role: el("abRole").value,
+        project_id: el("abProject").value || null, environment_id: el("abEnv").value || null,
+      });
+      closeModal();
+      toast("Role added");
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  async removeBinding(ds) {
+    try {
+      await api("DELETE", `/mgmt/principals/${enc(ds.pid)}/bindings/${ds.bid}`);
+      toast("Role removed");
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  async issueKey(ds) {
+    try {
+      const r = await POST(`/mgmt/principals/${enc(ds.pid)}/keys`, {});
+      _showKeyModal(r.key);
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  revokeKey(ds) {
+    openModal(`
+      <h3>Revoke key</h3>
+      <p class="hint">This key stops authenticating immediately. This can't be undone (issue a new key instead).</p>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn danger" data-act="revokeKeyConfirm" data-kid="${esc(ds.kid)}">Revoke</button>
+      </div>`);
+  },
+  async revokeKeyConfirm(ds) {
+    try {
+      await POST(`/mgmt/keys/${enc(ds.kid)}/revoke`, {});
+      closeModal();
+      toast("Key revoked");
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
   async toggleReq(ds) {
     try {
       const newReq = !(ds.req === "true");
@@ -956,7 +1144,7 @@ document.addEventListener("click", (ev) => {
 });
 document.addEventListener("change", (ev) => {
   const t = ev.target.closest("[data-act]");
-  if (t && t.dataset.act === "env") Actions.env(t.dataset, ev);
+  if (t && Actions[t.dataset.act]) Actions[t.dataset.act](t.dataset, ev);
 });
 document.addEventListener("input", (ev) => {
   const t = ev.target.closest("[data-act]");
