@@ -191,14 +191,50 @@ class RegistryService:
             )
         ).scalars())
 
+    def reviews(self, draft_id: str) -> list[models.Review]:
+        """Every principal's *current* review state (one row per reviewer)."""
+        return list(self.s.execute(
+            select(models.Review).where(models.Review.draft_id == draft_id)
+            .order_by(models.Review.id)
+        ).scalars())
+
     def add_review(self, draft_id: str, reviewer: str, state: str = "approved") -> models.Review:
         d = self.get_draft(draft_id)
-        r = models.Review(draft_id=draft_id, reviewer=reviewer, state=state)
-        self.s.add(r)
-        if state == "approved" and self._policy_met(d):
-            d.status = "approved"
+        # A principal holds a single, current review state: a later verdict replaces
+        # the earlier one. So "changes_requested" clears a prior "approved" (and vice
+        # versa) — only "approved" rows count toward the review policy (see approvals()).
+        r = self.s.execute(
+            select(models.Review).where(
+                models.Review.draft_id == draft_id, models.Review.reviewer == reviewer
+            )
+        ).scalar_one_or_none()
+        if r is None:
+            r = models.Review(draft_id=draft_id, reviewer=reviewer, state=state)
+            self.s.add(r)
+        else:
+            r.state = state
+        self.s.flush()
+        # Keep the draft's status in sync with the (possibly changed) approval count,
+        # so a withdrawn approval re-locks the draft. commit re-checks _policy_met too.
+        if d.status not in ("committed", "discarded", "abandoned"):
+            d.status = "approved" if self._policy_met(d) else "open"
         self.s.flush()
         return r
+
+    # ── comments ─────────────────────────────────────────────────────
+
+    def list_comments(self, draft_id: str) -> list[models.ReviewComment]:
+        return list(self.s.execute(
+            select(models.ReviewComment).where(models.ReviewComment.draft_id == draft_id)
+            .order_by(models.ReviewComment.created_at, models.ReviewComment.id)
+        ).scalars())
+
+    def add_comment(self, draft_id: str, author: str, body: str,
+                    anchor: str = "") -> models.ReviewComment:
+        c = models.ReviewComment(draft_id=draft_id, author=author, anchor=anchor, body=body)
+        self.s.add(c)
+        self.s.flush()
+        return c
 
     def _policy_met(self, draft: models.Draft) -> bool:
         prompt = self.s.get(models.Prompt, draft.prompt_id)

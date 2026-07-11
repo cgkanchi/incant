@@ -11,7 +11,7 @@ import difflib
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -27,6 +27,7 @@ ROLES = list(_IMPLIES)  # renderer → admin, canonical order
 from .deps import app_context, get_session, identity
 from .schemas import (
     BindingRequest,
+    CommentRequest,
     CommitRequest,
     CreateDraftRequest,
     CreatePromptRequest,
@@ -183,7 +184,14 @@ def _effective_variables(app, session, prompt_id, version) -> list[dict]:
 
 @router.get("/whoami")
 def whoami(ident: Identity = Depends(identity)):
-    return {"principal_id": ident.principal_id, "name": ident.name}
+    return {
+        "principal_id": ident.principal_id,
+        "name": ident.name,
+        "roles": [
+            {"role": b.role, "project_id": b.project_id, "environment_id": b.environment_id}
+            for b in ident.bindings
+        ],
+    }
 
 
 # ── overview / prompts list ──────────────────────────────────────────
@@ -215,8 +223,18 @@ def overview(
         newest_vinfo = vers.get(newest_version) if newest_version is not None else None
         hist = app.git.history(f"{pid}/v{default_v}.j2") if default_v else []
         updated = hist[0] if hist else None
+        # Drafts still in flight (not committed/discarded) — drives the library's
+        # "N open drafts" affordance and filter.
+        open_drafts = session.execute(
+            select(func.count()).select_from(models.Draft).where(
+                models.Draft.prompt_id == pid,
+                models.Draft.status.in_(["open", "approved"]),
+            )
+        ).scalar_one()
         projects.setdefault(prompt.project_id, []).append({
             "prompt_id": pid,
+            "description": prompt.description or "",
+            "open_drafts": open_drafts,
             "versions": len(vers),
             "live_version": default_v,
             "live": bool(vinfo and vinfo.live_sha),
@@ -351,7 +369,10 @@ def _draft_payload(app, reg, d) -> dict:
         "project": _project_of(d.prompt_id),
         "review_policy": project.review_policy if project else 0,
         "allow_self_review": project.allow_self_review if project else True,
+        # `reviewers` = approvals only (backward-compat). `reviews` = every
+        # principal's current verdict, including changes_requested.
         "reviewers": [r.reviewer for r in reg.approvals(d.id)],
+        "reviews": [{"reviewer": r.reviewer, "state": r.state} for r in reg.reviews(d.id)],
     }
 
 
@@ -481,9 +502,56 @@ def review_draft(
     # Self-review is allowed by default (per-project opt-out); either way the
     # recorded reviewer is the real identity, not a spoofable name.
     _require(ident, "editor", project=_project_of(d.prompt_id))
+    # "approved" counts toward the review policy; "changes_requested" is recorded and
+    # visible but does not, and it clears this principal's earlier approval (and v.v.).
     reg.add_review(draft_id, reviewer=ident.name, state=req.state)
     return {"draft_id": draft_id, "status": reg.get_draft(draft_id).status,
-            "approvals": [r.reviewer for r in reg.approvals(draft_id)]}
+            "approvals": [r.reviewer for r in reg.approvals(draft_id)],
+            "reviews": [{"reviewer": r.reviewer, "state": r.state} for r in reg.reviews(draft_id)]}
+
+
+def _comment_payload(c) -> dict:
+    return {"id": c.id, "author": c.author, "anchor": c.anchor, "body": c.body,
+            "created_at": c.created_at.isoformat()}
+
+
+@router.get("/drafts/{draft_id}/comments")
+def get_comments(
+    draft_id: str,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    reg = app.registry(session, ident.name)
+    try:
+        d = reg.get_draft(draft_id)
+    except RegistryError as exc:
+        raise HTTPException(404, str(exc))
+    # Viewer is the loosest sensible role: reviewers who can see a draft may comment,
+    # even without editor on the project.
+    _require(ident, "viewer", project=_project_of(d.prompt_id))
+    return {"comments": [_comment_payload(c) for c in reg.list_comments(draft_id)]}
+
+
+@router.post("/drafts/{draft_id}/comments")
+def create_comment(
+    draft_id: str, req: CommentRequest,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    reg = app.registry(session, ident.name)
+    try:
+        d = reg.get_draft(draft_id)
+    except RegistryError as exc:
+        raise HTTPException(404, str(exc))
+    _require(ident, "viewer", project=_project_of(d.prompt_id))
+    # A committed/discarded draft is settled — no further review conversation on it.
+    if d.status in ("committed", "discarded", "abandoned"):
+        raise HTTPException(409, f"cannot comment on a {d.status} draft")
+    # Author is always the authenticated principal, never body-supplied.
+    c = reg.add_comment(draft_id, author=ident.name, body=req.body, anchor=req.anchor)
+    return _comment_payload(c)
 
 
 @router.post("/drafts/{draft_id}/commit")
@@ -914,20 +982,41 @@ def kill_switch(
 
 @router.get("/audit")
 def get_audit(
+    actor: str | None = None,
+    action: str | None = None,
+    object: str | None = None,     # substring match on object_id
     limit: int = 100,
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "viewer")
-    rows = session.execute(
-        select(models.AuditLog).order_by(models.AuditLog.at.desc()).limit(limit)
-    ).scalars()
-    return {"audit": [
-        {"actor": a.actor, "action": a.action, "object_type": a.object_type,
-         "object_id": a.object_id, "before": a.before, "after": a.after,
-         "at": a.at.isoformat()}
-        for a in rows
-    ]}
+    limit = max(1, min(limit, 500))  # hard cap
+    q = select(models.AuditLog)
+    if actor:
+        q = q.where(models.AuditLog.actor == actor)
+    if action:
+        q = q.where(models.AuditLog.action == action)
+    if object:
+        q = q.where(models.AuditLog.object_id.contains(object))
+    q = q.order_by(models.AuditLog.at.desc(), models.AuditLog.id.desc()).limit(limit)
+    rows = session.execute(q).scalars()
+    # Distinct values for the filter dropdowns (over the whole log, not the page).
+    actors = list(session.execute(
+        select(models.AuditLog.actor).distinct().order_by(models.AuditLog.actor)
+    ).scalars())
+    actions = list(session.execute(
+        select(models.AuditLog.action).distinct().order_by(models.AuditLog.action)
+    ).scalars())
+    return {
+        "audit": [
+            {"id": a.id, "actor": a.actor, "action": a.action, "object_type": a.object_type,
+             "object_id": a.object_id, "before": a.before, "after": a.after,
+             "at": a.at.isoformat()}
+            for a in rows
+        ],
+        "actors": actors,
+        "actions": actions,
+    }
 
 
 @router.post("/projects")

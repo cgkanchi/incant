@@ -637,3 +637,137 @@ def test_draft_listing_enriched_fields(client):
     # single-draft GET exposes the full base sha
     one = client.get(f"/mgmt/drafts/{d['id']}", headers=auth()).json()
     assert one["base_full_sha"] and one["base_full_sha"].startswith(item["base_sha"])
+
+
+# ── review: comments + changes_requested ─────────────────────────────
+
+def test_draft_comments_create_and_list(client):
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": "commented draft"}, headers=auth()).json()
+    # empty listing to start
+    r = client.get(f"/mgmt/drafts/{d['id']}/comments", headers=auth())
+    assert r.status_code == 200 and r.json()["comments"] == []
+    # a viewer (no editor on the project) may still comment — reviewers need only read.
+    viewer = make_key(client, "viewer", project="support")
+    r = client.post(f"/mgmt/drafts/{d['id']}/comments",
+                    json={"anchor": "source:2", "body": "tighten this line",
+                          "author": "spoofed"}, headers=auth(viewer))
+    assert r.status_code == 200, r.text
+    c = r.json()
+    assert c["body"] == "tighten this line" and c["anchor"] == "source:2"
+    # author is the authenticated principal, never the body-supplied "spoofed".
+    assert c["author"] == "viewer-support" and c["author"] != "spoofed"
+    assert c["id"] and c["created_at"]
+    lst = client.get(f"/mgmt/drafts/{d['id']}/comments", headers=auth()).json()["comments"]
+    assert [x["body"] for x in lst] == ["tighten this line"]
+
+
+def test_comment_empty_body_is_422(client):
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": "x"}, headers=auth()).json()
+    assert client.post(f"/mgmt/drafts/{d['id']}/comments",
+                       json={"body": ""}, headers=auth()).status_code == 422
+    assert client.post(f"/mgmt/drafts/{d['id']}/comments",
+                       json={"body": "   "}, headers=auth()).status_code == 422
+
+
+def test_comment_on_committed_draft_is_409(client):
+    # fresh project (review_policy 0) -> commit needs no approval.
+    client.post("/mgmt/prompts", json={"prompt_id": "growth/cdone"}, headers=auth())
+    d = client.post("/mgmt/prompts/growth/cdone/drafts",
+                    json={"version_number": 1, "content": "hi {{ name }}"}, headers=auth()).json()
+    assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 200
+    r = client.post(f"/mgmt/drafts/{d['id']}/comments", json={"body": "too late"}, headers=auth())
+    assert r.status_code == 409
+
+
+def test_changes_requested_review_flow(client):
+    from incant.seed import SYSTEM_V2_WARM
+    body = SYSTEM_V2_WARM + "\nExtra review line."
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": body}, headers=auth()).json()
+    reviewer = make_key(client, "editor", project="support")
+    # 1. changes_requested is recorded + visible but does NOT count -> commit blocked.
+    r = client.post(f"/mgmt/drafts/{d['id']}/review",
+                    json={"state": "changes_requested"}, headers=auth(reviewer)).json()
+    assert r["approvals"] == []
+    assert {"reviewer": "editor-support", "state": "changes_requested"} in r["reviews"]
+    assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 412
+    # 2. same principal approving replaces changes_requested -> now counts, commit unlocks.
+    r = client.post(f"/mgmt/drafts/{d['id']}/review",
+                    json={"state": "approved"}, headers=auth(reviewer)).json()
+    assert r["approvals"] == ["editor-support"]
+    assert r["reviews"] == [{"reviewer": "editor-support", "state": "approved"}]
+    assert client.get(f"/mgmt/drafts/{d['id']}", headers=auth()).json()["status"] == "approved"
+    # 3. flipping back to changes_requested clears the approval -> re-locks.
+    r = client.post(f"/mgmt/drafts/{d['id']}/review",
+                    json={"state": "changes_requested"}, headers=auth(reviewer)).json()
+    assert r["approvals"] == []
+    assert client.get(f"/mgmt/drafts/{d['id']}", headers=auth()).json()["status"] == "open"
+    assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 412
+    # 4. re-approve -> commit succeeds.
+    client.post(f"/mgmt/drafts/{d['id']}/review", json={"state": "approved"}, headers=auth(reviewer))
+    assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 200
+
+
+# ── audit: detail + filters ──────────────────────────────────────────
+
+def test_audit_detail_and_filters(client):
+    # creating a key emits a `principal.create` audit row; a binding add emits `binding.add`.
+    r = client.post("/mgmt/keys", json={"principal_name": "aud", "role": "viewer",
+                                        "project_id": "support"}, headers=auth())
+    pid = r.json()["principal_id"]
+    client.post(f"/mgmt/principals/{pid}/bindings",
+                json={"role": "editor", "project_id": "support"}, headers=auth())
+    body = client.get("/mgmt/audit", headers=auth()).json()
+    # distinct-value lists for the filter dropdowns.
+    assert "principal.create" in body["actions"] and "binding.add" in body["actions"]
+    assert "bootstrap-admin" in body["actors"]
+    # each row carries the full detail incl. id/object_type/before/after.
+    row = body["audit"][0]
+    assert {"id", "actor", "action", "object_type", "object_id", "before", "after", "at"} <= row.keys()
+    # action filter.
+    only = client.get("/mgmt/audit?action=principal.create", headers=auth()).json()["audit"]
+    assert only and all(a["action"] == "principal.create" for a in only)
+    creates = [a for a in only if a["object_id"] == pid]
+    assert creates and creates[0]["after"]["name"] == "aud"      # before/after present
+    # substring filter on object_id.
+    byobj = client.get(f"/mgmt/audit?object={pid}", headers=auth()).json()["audit"]
+    assert byobj and all(pid in a["object_id"] for a in byobj)
+    # actor filter.
+    byactor = client.get("/mgmt/audit?actor=bootstrap-admin", headers=auth()).json()["audit"]
+    assert byactor and all(a["actor"] == "bootstrap-admin" for a in byactor)
+    # limit is honoured (and capped at 500 server-side).
+    assert len(client.get("/mgmt/audit?limit=1", headers=auth()).json()["audit"]) == 1
+
+
+# ── overview + whoami extras ─────────────────────────────────────────
+
+def test_overview_description_and_open_drafts(client):
+    client.post("/mgmt/prompts", json={"prompt_id": "growth/welcome",
+                                       "description": "welcome message"}, headers=auth())
+    ov = client.get("/mgmt/overview?environment=prod", headers=auth()).json()
+    projects = {p["project"]: p for p in ov["projects"]}
+    wp = next(p for p in projects["growth"]["prompts"] if p["prompt_id"] == "growth/welcome")
+    assert wp["description"] == "welcome message" and wp["open_drafts"] == 0
+    # support/system carries one seeded open draft and no description.
+    sysrow = next(p for p in projects["support"]["prompts"] if p["prompt_id"] == "support/system")
+    assert sysrow["description"] == "" and sysrow["open_drafts"] == 1
+    # opening another draft bumps the count.
+    client.post("/mgmt/prompts/support/system/drafts",
+                json={"version_number": 2, "content": "another"}, headers=auth())
+    ov2 = client.get("/mgmt/overview?environment=prod", headers=auth()).json()
+    support2 = next(p for p in ov2["projects"] if p["project"] == "support")
+    sysrow2 = next(p for p in support2["prompts"] if p["prompt_id"] == "support/system")
+    assert sysrow2["open_drafts"] == 2
+
+
+def test_whoami_roles(client):
+    # bootstrap admin holds an instance-wide admin binding (project/env unscoped).
+    me = client.get("/mgmt/whoami", headers=auth()).json()
+    assert {"role": "admin", "project_id": None, "environment_id": None} in me["roles"]
+    # a project+env scoped key reports exactly its scoped binding.
+    op = make_key(client, "operator", project="support", env="prod", name="opx")
+    who = client.get("/mgmt/whoami", headers=auth(op)).json()
+    assert who["name"] == "opx"
+    assert who["roles"] == [{"role": "operator", "project_id": "support", "environment_id": "prod"}]

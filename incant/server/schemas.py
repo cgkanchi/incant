@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── serving ──────────────────────────────────────────────────────────
@@ -53,7 +53,20 @@ class DraftRenderRequest(BaseModel):
 class ReviewRequest(BaseModel):
     # `reviewer` is ignored — the reviewer is the authenticated principal.
     reviewer: Optional[str] = None
-    state: str = "approved"
+    state: str = "approved"                     # "approved" | "changes_requested"
+
+
+class CommentRequest(BaseModel):
+    # `author` is never body-supplied — it is the authenticated principal.
+    anchor: str = ""                            # "source:4" | "rendered" | ""
+    body: str
+
+    @field_validator("body")
+    @classmethod
+    def _nonempty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("comment body must not be empty")
+        return v
 
 
 class CommitRequest(BaseModel):
