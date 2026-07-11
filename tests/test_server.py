@@ -186,6 +186,12 @@ def test_mgmt_overview_and_versions(client):
     sysprompt = next(p for p in projects["support"]["prompts"] if p["prompt_id"] == "support/system")
     assert sysprompt["live_version"] == 2
     assert sysprompt["tip_ahead"] == 2  # two tweak commits ahead of the live pointer
+    # v2's live pointer in prod was published by Dana (the v2 baseline author/releaser).
+    assert sysprompt["live_by"] == "Dana"
+    assert sysprompt["live_at"]  # ISO timestamp of the pointer move
+    # v3 exists and has a prod live pointer -> newest version is published.
+    assert sysprompt["newest_version"] == 3
+    assert sysprompt["newest_version_live"] is True
 
     r = client.get("/mgmt/prompts/support/system/versions?environment=prod", headers=auth())
     assert r.status_code == 200, r.text
@@ -193,8 +199,23 @@ def test_mgmt_overview_and_versions(client):
     versions = {v["version"]: v for v in data["versions"]}
     assert versions[3]["label"] == "voice-v2"
     assert versions[1]["status"] == "archived"
+    # each live version reports the publishing principal.
+    assert versions[2]["live_by"] == "Dana"
     names = {v["name"] for v in data["variables"]}
     assert "customer_name" in names
+
+
+def test_overview_flags_unpublished_newer_version(client):
+    # support/greeting has v1 live (default) + v2 committed but never made live in prod.
+    r = client.get("/mgmt/overview?environment=prod", headers=auth())
+    assert r.status_code == 200, r.text
+    projects = {p["project"]: p for p in r.json()["projects"]}
+    greeting = next(p for p in projects["support"]["prompts"]
+                    if p["prompt_id"] == "support/greeting")
+    assert greeting["live_version"] == 1
+    assert greeting["live_by"] == "Maya"          # v1 published by Maya
+    assert greeting["newest_version"] == 2         # v2 exists...
+    assert greeting["newest_version_live"] is False  # ...but was never published -> draft badge
 
 
 def test_rules_console(client):

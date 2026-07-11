@@ -202,17 +202,17 @@ def overview(
         if not ident.has("viewer", project=prompt.project_id, environment=environment):
             continue
         vers = snap.versions.get(pid, {})
-        live_v = None
-        live_sha = None
-        for vnum, vinfo in vers.items():
-            if vinfo.live_sha:
-                # env default determines the "live" version shown
-                pass
         default_v = snap.defaults.get(pid)
         vinfo = vers.get(default_v) if default_v else None
         tip_ahead = 0
         if vinfo and vinfo.live_sha:
             tip_ahead = _tip_ahead(session, environment, pid, default_v, vinfo.live_sha)
+        # Who/when published the default version's current live pointer.
+        live = _current_live(session, environment, pid, default_v) if default_v else None
+        # Newest minted version and whether it has ever been published in this env —
+        # drives the "vN draft, not live" badge when a new version exists but is unpublished.
+        newest_version = max(vers) if vers else None
+        newest_vinfo = vers.get(newest_version) if newest_version is not None else None
         hist = app.git.history(f"{pid}/v{default_v}.j2") if default_v else []
         updated = hist[0] if hist else None
         projects.setdefault(prompt.project_id, []).append({
@@ -220,7 +220,11 @@ def overview(
             "versions": len(vers),
             "live_version": default_v,
             "live": bool(vinfo and vinfo.live_sha),
+            "live_by": (live.moved_by or None) if live else None,
+            "live_at": (live.moved_at.isoformat() if live else None),
             "tip_ahead": tip_ahead,
+            "newest_version": newest_version,
+            "newest_version_live": bool(newest_vinfo and newest_vinfo.live_sha),
             "updated": {"when": updated.date, "who": updated.author} if updated else None,
         })
     return {
@@ -264,6 +268,7 @@ def get_versions(
             "live_sha": (live.to_sha[:7] if live else None),
             "live_full_sha": (live.to_sha if live else None),
             "live_at": (live.moved_at.isoformat() if live else None),
+            "live_by": (live.moved_by or None) if live else None,
             "tip_sha": (tip.sha[:7] if tip else None),
             "tip_full_sha": (tip.sha if tip else None),
             "tip_author": (tip.author if tip else None),
@@ -651,14 +656,15 @@ def diff_versions(
             left.splitlines(), right.splitlines(), lineterm="", n=3,
             fromfile=f"v{a_version}@{a_sha[:7]}", tofile=f"v{b_version}@{b_sha[:7]}",
         ))
-        return {"mode": "rendered", "diff": "\n".join(diff), "context": (tc.name if tc else None)}
+        return {"mode": "rendered", "diff": "\n".join(diff), "left": left, "right": right,
+                "context": (tc.name if tc else None)}
     left = app.git.read(f"{prompt_id}/v{a_version}.j2", ref=a_sha) or ""
     right = app.git.read(f"{prompt_id}/v{b_version}.j2", ref=b_sha) or ""
     diff = list(difflib.unified_diff(
         left.splitlines(), right.splitlines(), lineterm="", n=3,
         fromfile=f"v{a_version}@{a_sha[:7]}", tofile=f"v{b_version}@{b_sha[:7]}",
     ))
-    return {"mode": "source", "diff": "\n".join(diff)}
+    return {"mode": "source", "diff": "\n".join(diff), "left": left, "right": right}
 
 
 # ── targeting ────────────────────────────────────────────────────────
