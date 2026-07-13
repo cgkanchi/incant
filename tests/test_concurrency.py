@@ -44,6 +44,13 @@ def _rules_version(env_id="prod") -> int:
 
 
 def test_concurrent_rule_upserts_never_lose_a_bump(app):
+    # A prompt-scoped rule may only target a version that exists (§7 integrity), so
+    # author support/system v1 before the concurrent upserts.
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        reg.create_prompt("support/system")
+        d = reg.create_draft("support/system", version_number=1, author="sam", content="v1 {{ x }}")
+        reg.commit_draft(d.id, author="sam")
     start = _rules_version()
     N = 24
 

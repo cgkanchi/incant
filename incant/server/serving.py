@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -32,18 +33,33 @@ def _env(app: AppContext, req_env: str | None) -> str:
     return req_env or app.settings.default_environment
 
 
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
 def _parse_pin(pin: dict | None) -> dict | None:
     """Turn a request pin ({"versions": {pid: {version, commit}}}) into the render
-    engine's shape (pid -> (version, commit))."""
+    engine's shape (pid -> (version, commit)).
+
+    Pins must carry FULL 40-char SHAs (the serving `versions[].commit` a caller feeds
+    back). Abbreviated SHAs are rejected with 422 — an ambiguous prefix must never
+    silently resolve to the wrong content (§4, §9)."""
     if not pin:
         return None
     versions = pin.get("versions", pin)  # accept the bare versions map too
     out: dict[str, tuple[int, str]] = {}
     for pid, entry in (versions or {}).items():
         try:
-            out[pid] = (int(entry["version"]), str(entry["commit"]))
+            version = int(entry["version"])
+            commit = str(entry["commit"])
         except (KeyError, TypeError, ValueError):
             raise HTTPException(422, f"invalid pin entry for {pid!r}")
+        if not _FULL_SHA.fullmatch(commit):
+            raise HTTPException(
+                422,
+                f"pin for {pid!r}: commit must be a full 40-character SHA, "
+                f"got {commit!r}",
+            )
+        out[pid] = (version, commit)
     return out or None
 
 
@@ -61,7 +77,7 @@ def evaluate_prompt(
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
     return {
-        "prompt_id": prompt_id, "version": res.version, "commit": res.commit[:7],
+        "prompt_id": prompt_id, "version": res.version, "commit": res.commit,
         "label": res.label, "matched_rule": (
             "default" if res.match_scope == "default"
             else {"scope": res.match_scope, "id": res.rule_id}
@@ -109,7 +125,7 @@ def evaluate_all(
         if not ident.has("renderer", project=_project_of(pid), environment=env):
             continue
         out[pid] = {
-            "version": res.version, "commit": res.commit[:7], "label": res.label,
+            "version": res.version, "commit": res.commit, "label": res.label,
             "matched_rule": ("default" if res.match_scope == "default"
                              else {"scope": res.match_scope, "id": res.rule_id}),
         }

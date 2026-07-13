@@ -58,7 +58,9 @@ class AppContext:
         self.content = ContentStore(self.git)
         # Lazy import avoids an import cycle (server.auth -> ... -> service).
         from .server.auth import AuthCache
-        self.auth = AuthCache()
+        from .server.throttle import AuthThrottler
+        self.auth = AuthCache(ttl=self.settings.auth_ttl)
+        self.throttle = AuthThrottler()
 
     # ── auth (in-memory; survives DB outages) ─────────────────────────
 
@@ -219,7 +221,9 @@ class AppContext:
 
         versions = {}
         for pid, res in result.contributions.items():
-            entry = {"version": res.version, "commit": res.commit[:7], "label": res.label}
+            # Full 40-char SHAs: the reproducibility tuple must be SHA-exact and is fed
+            # back verbatim as a `pin` (which now accepts only full SHAs — §9, §4).
+            entry = {"version": res.version, "commit": res.commit, "label": res.label}
             if res.content_fallback:
                 entry["fallback"] = True
             versions[pid] = entry

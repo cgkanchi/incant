@@ -12,13 +12,15 @@ The app runs fine on SQLite for verification. From a scratch dir:
 ```bash
 export INCANT_DATABASE_URL="sqlite:///$(pwd)/incant.db"
 export INCANT_REPO_PATH="$(pwd)/repo"
+export INCANT_ALLOW_DEV_KEY=1 INCANT_BOOTSTRAP_ADMIN_KEY=incant_sk_dev_admin  # dev key needs explicit opt-in
 uv run --project /home/cgkanchi/code/incant incant init
 uv run --project /home/cgkanchi/code/incant incant seed     # example dataset; prints a renderer key
 uv run --project /home/cgkanchi/code/incant incant serve --host 127.0.0.1 --port 8765  # background
 ```
 
 - `uv run incant` must resolve the project — use `--project` when cwd is elsewhere.
-- Admin auth: `Authorization: Bearer incant_sk_dev_admin` (bootstrap key; the UI defaults to it in localStorage).
+- Admin auth: `Authorization: Bearer incant_sk_dev_admin` — but ONLY with `INCANT_ALLOW_DEV_KEY=1`; without a configured key the server generates one and prints it once at first boot. The UI has NO baked-in key: every fresh browser context lands on the sign-in card (fill `input[type=password]`, click "Sign in"). sessionStorage is per-tab — each new Playwright page must sign in again unless "Remember on this device" was checked.
+- The client is split across `incant/ui/js/**` (ordered classic scripts listed in index.html); the DOM harnesses load them via `scratchpad/load-app.js`.
 - Seed data: `support/system` (v2 live by Dana, v3 testing via rules, 2 unpublished edits by Sam), `support/greeting` (v2 committed, never published — the "draft, not live" case), `shared/style/language-rules`. `prod` is protected (type-to-confirm on publish/rollback), `staging` is track_tip.
 
 ## Drive the UI

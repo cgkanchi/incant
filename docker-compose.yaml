@@ -13,7 +13,18 @@ services:
       INCANT_REPO_PATH: /var/lib/incant/repo
       INCANT_DATABASE_URL: postgresql+psycopg://incant:incant@db/incant
       INCANT_MODE: full                            # full | serve (read-only, no mgmt/UI)
-      INCANT_BOOTSTRAP_ADMIN_KEY: ${INCANT_BOOTSTRAP_ADMIN_KEY:-incant_sk_dev_admin}
+      # Bootstrap admin credential. Leave unset: on first boot Incant generates a
+      # strong random admin key and prints it once (watch `docker compose logs incant`).
+      # Set INCANT_BOOTSTRAP_ADMIN_KEY to pin your own key instead.
+      # INCANT_BOOTSTRAP_ADMIN_KEY: incant_sk_your_own_key
+      # INCANT_ALLOW_DEV_KEY: "1"                   # dev/test only: allow incant_sk_dev_admin
+      # Security (see README "Security"). TLS terminates at your proxy:
+      # INCANT_ENFORCE_TLS: "1"                     # emit HSTS (only behind a TLS proxy)
+      # INCANT_KEY_PEPPER: change-me-to-a-secret    # peppered v2$ key hashing (keep stable)
+      # INCANT_METRICS_TOKEN: change-me             # let a principal-less Prometheus read /metrics
+      # INCANT_AUTH_TTL: "5.0"                       # key-cache TTL ⇒ cross-replica revocation bound
+      # INCANT_AUTH_THROTTLE_LIMIT: "20"            # failed bearer auths/IP/window before 429 (0=off)
+      # INCANT_AUTH_THROTTLE_WINDOW: "60"           # throttle window (seconds)
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
       interval: 10s

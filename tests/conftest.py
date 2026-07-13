@@ -10,6 +10,10 @@ from dataclasses import dataclass
 # Production uses real wall-clock (this env var is never set there).
 os.environ.setdefault("INCANT_FIXED_GIT_DATE", "1700000000 +0000")
 
+# The suite exercises the well-known dev admin key (`incant_sk_dev_admin`); opt into
+# the escape hatch so ensure_bootstrap_admin accepts it instead of refusing to boot.
+os.environ.setdefault("INCANT_ALLOW_DEV_KEY", "1")
+
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url

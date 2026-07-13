@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -21,12 +23,15 @@ from .conftest import db_url_for, reset_schema
 ADMIN = "incant_sk_dev_admin"
 
 
-@pytest.fixture()
-def client(tmp_path):
+@contextmanager
+def make_client(tmp_path, **settings_overrides):
+    """Boot a fresh app + TestClient. `settings_overrides` tweak Settings (e.g.
+    key_pepper, metrics_token, auth_throttle_limit) for a specific scenario."""
     set_settings(Settings(
         database_url=db_url_for(tmp_path),
         repo_path=str(tmp_path / "repo"),
         bootstrap_admin_key=ADMIN,
+        **settings_overrides,
     ))
     db.reset_engine()
     reset_app()
@@ -35,6 +40,12 @@ def client(tmp_path):
     from incant.server.app import create_app
     with TestClient(create_app()) as c:
         c.renderer_key = renderer_key
+        yield c
+
+
+@pytest.fixture()
+def client(tmp_path):
+    with make_client(tmp_path) as c:
         yield c
 
 
@@ -483,6 +494,24 @@ def test_pin_replay_roundtrip(client):
     # Without the pin these differ (default = v2@live, no fragment); with it they match.
     assert b2["prompt"] == b1["prompt"]
     assert b2["versions"]["support/system"]["commit"] == b1["versions"]["support/system"]["commit"]
+    # Serving now reports FULL 40-char SHAs (SHA-exact reproducibility, §4/§9).
+    assert len(b1["versions"]["support/system"]["commit"]) == 40
+
+
+def test_pin_rejects_abbreviated_sha(client):
+    # An abbreviated (7-char) SHA must not silently resolve — 422 naming the problem.
+    b1 = client.post("/prompt/support/system",
+                     json={"flags": {"user_id": "u_12"},
+                           "variables": {"customer_name": "Acme", "history": []}},
+                     headers=auth(client.renderer_key)).json()
+    entry = dict(b1["versions"]["support/system"])
+    entry["commit"] = entry["commit"][:7]  # abbreviate the pin
+    r = client.post("/prompt/support/system",
+                    json={"variables": {"customer_name": "Acme", "history": []},
+                          "pin": {"versions": {"support/system": entry}}},
+                    headers=auth(client.renderer_key))
+    assert r.status_code == 422, r.text
+    assert "40-character" in str(r.json()["detail"])
 
 
 def test_effective_schema_unions_include_closure(client):
@@ -691,13 +720,18 @@ def test_changes_requested_review_flow(client):
     r = client.post(f"/mgmt/drafts/{d['id']}/review",
                     json={"state": "changes_requested"}, headers=auth(reviewer)).json()
     assert r["approvals"] == []
-    assert {"reviewer": "editor-support", "state": "changes_requested"} in r["reviews"]
+    rev = next(x for x in r["reviews"] if x["reviewer"] == "editor-support")
+    # verdict is recorded against the current content -> current: True (Finding 1).
+    assert rev["state"] == "changes_requested" and rev["current"] is True
     assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 412
     # 2. same principal approving replaces changes_requested -> now counts, commit unlocks.
     r = client.post(f"/mgmt/drafts/{d['id']}/review",
                     json={"state": "approved"}, headers=auth(reviewer)).json()
     assert r["approvals"] == ["editor-support"]
-    assert r["reviews"] == [{"reviewer": "editor-support", "state": "approved"}]
+    assert len(r["reviews"]) == 1
+    rev = r["reviews"][0]
+    assert rev["reviewer"] == "editor-support" and rev["state"] == "approved"
+    assert rev["current"] is True and rev["reviewed_sha"]
     assert client.get(f"/mgmt/drafts/{d['id']}", headers=auth()).json()["status"] == "approved"
     # 3. flipping back to changes_requested clears the approval -> re-locks.
     r = client.post(f"/mgmt/drafts/{d['id']}/review",
@@ -708,6 +742,87 @@ def test_changes_requested_review_flow(client):
     # 4. re-approve -> commit succeeds.
     client.post(f"/mgmt/drafts/{d['id']}/review", json={"state": "approved"}, headers=auth(reviewer))
     assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 200
+
+
+# ── review binds to reviewed revision (Finding 1) ────────────────────
+
+def test_approval_does_not_survive_content_edit(client):
+    # An approval is bound to the exact draft revision it reviewed. Editing the content
+    # afterwards drops the draft back to "open", blocks commit (412), and lists the old
+    # verdict as current:false — until the current content is re-approved.
+    base = "You are a support agent for {{ customer_name }}."
+    r = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": base + "\nLINE ONE."}, headers=auth())
+    draft_id = r.json()["id"]
+
+    # self-approval (allowed by default) satisfies the 1-approval policy.
+    client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth())
+    got = client.get(f"/mgmt/drafts/{draft_id}", headers=auth()).json()
+    assert got["status"] == "approved"
+    assert got["reviewers"] == ["bootstrap-admin"]
+    assert got["reviews"][0]["current"] is True
+
+    # edit the content under the approval -> the verdict is no longer current.
+    put = client.put(f"/mgmt/drafts/{draft_id}/content",
+                     json={"content": base + "\nLINE TWO EDITED."}, headers=auth())
+    assert put.status_code == 200, put.text
+    body = put.json()
+    assert body["status"] == "open"                     # dropped back to open
+    assert body["reviewers"] == []                      # stale approval no longer counts
+    stale = next(x for x in body["reviews"] if x["reviewer"] == "bootstrap-admin")
+    assert stale["state"] == "approved" and stale["current"] is False   # kept as history
+
+    # commit is blocked again until the current content is re-approved.
+    assert client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth()).status_code == 412
+    client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth())
+    assert client.get(f"/mgmt/drafts/{draft_id}", headers=auth()).json()["status"] == "approved"
+    assert client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth()).status_code == 200
+
+
+def test_commit_succeeds_when_content_unchanged_after_approval(client):
+    # Regression: an approval that is NOT followed by a content edit stays current, so
+    # commit proceeds normally.
+    r = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2,
+                          "content": "You are a support agent for {{ customer_name }}.\nUNCHANGED."},
+                    headers=auth())
+    draft_id = r.json()["id"]
+    client.post(f"/mgmt/drafts/{draft_id}/review", json={}, headers=auth())
+    assert client.post(f"/mgmt/drafts/{draft_id}/commit", json={}, headers=auth()).status_code == 200
+
+
+# ── autosave optimistic concurrency (Finding 2) ──────────────────────
+
+def test_put_content_optimistic_concurrency(client):
+    base = "You are a support agent for {{ customer_name }}."
+    r = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": base + "\nR0."}, headers=auth())
+    d = r.json()
+    draft_id, sha0 = d["id"], d["draft_sha"]
+    assert sha0                                        # create response exposes draft_sha
+
+    # correct base_revision -> 200 and a NEW draft_sha for the client to chain from.
+    r1 = client.put(f"/mgmt/drafts/{draft_id}/content",
+                    json={"content": base + "\nR1.", "base_revision": sha0}, headers=auth())
+    assert r1.status_code == 200, r1.text
+    sha1 = r1.json()["draft_sha"]
+    assert sha1 and sha1 != sha0
+
+    # a second, in-flight autosave still based on sha0 (stale) -> 409 stale_write with
+    # the current tip + content so the client can recover instead of clobbering R1.
+    r2 = client.put(f"/mgmt/drafts/{draft_id}/content",
+                    json={"content": base + "\nLOSER.", "base_revision": sha0}, headers=auth())
+    assert r2.status_code == 409, r2.text
+    detail = r2.json()["detail"]
+    assert detail["error"] == "stale_write"
+    assert detail["current_sha"] == sha1
+    assert "R1." in detail["current_content"] and "LOSER" not in detail["current_content"]
+
+    # omitting base_revision -> legacy unconditional write (back-compat).
+    r3 = client.put(f"/mgmt/drafts/{draft_id}/content",
+                    json={"content": base + "\nR2."}, headers=auth())
+    assert r3.status_code == 200, r3.text
+    assert "R2." in client.get(f"/mgmt/drafts/{draft_id}", headers=auth()).json()["content"]
 
 
 # ── audit: detail + filters ──────────────────────────────────────────
@@ -771,3 +886,234 @@ def test_whoami_roles(client):
     who = client.get("/mgmt/whoami", headers=auth(op)).json()
     assert who["name"] == "opx"
     assert who["roles"] == [{"role": "operator", "project_id": "support", "environment_id": "prod"}]
+
+
+# ── Security review: headers, key pepper, throttling, /metrics, key lifecycle ──
+
+from incant.server.auth import verify_key, needs_upgrade  # noqa: E402
+from incant.service import get_app  # noqa: E402
+
+_SEC_HEADERS = {
+    "Content-Security-Policy",
+    "X-Content-Type-Options",
+    "X-Frame-Options",
+    "Referrer-Policy",
+    "Permissions-Policy",
+}
+
+
+def test_security_headers_present_on_ui_and_mgmt(client):
+    for resp in (client.get("/"), client.get("/mgmt/overview?environment=prod", headers=auth())):
+        for h in _SEC_HEADERS:
+            assert h in resp.headers, (resp.request.url, h)
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert resp.headers["Referrer-Policy"] == "no-referrer"
+        assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+        assert "frame-ancestors 'none'" in resp.headers["Content-Security-Policy"]
+    # HSTS is off unless TLS enforcement is enabled.
+    assert "Strict-Transport-Security" not in client.get("/").headers
+
+
+def test_hsts_emitted_when_tls_enforced(tmp_path):
+    with make_client(tmp_path, enforce_tls=True) as c:
+        r = c.get("/")
+        assert r.headers["Strict-Transport-Security"] == "max-age=31536000; includeSubDomains"
+
+
+# ── key pepper (defense-in-depth, versioned hashing) ──
+
+def test_hash_and_verify_key_formats():
+    # pepper-less: legacy plain SHA-256, no version tag.
+    legacy = hash_key("incant_sk_abc", pepper="")
+    assert not legacy.startswith("v2$") and len(legacy) == 64
+    assert verify_key("incant_sk_abc", legacy, pepper="")
+    assert not verify_key("wrong", legacy, pepper="")
+    # peppered: v2$ HMAC, and a legacy hash still verifies (both formats accepted).
+    v2 = hash_key("incant_sk_abc", pepper="pep")
+    assert v2.startswith("v2$")
+    assert verify_key("incant_sk_abc", v2, pepper="pep")
+    assert not verify_key("incant_sk_abc", v2, pepper="")  # v2 unverifiable w/o pepper
+    assert verify_key("incant_sk_abc", legacy, pepper="pep")  # legacy still ok w/ pepper
+    assert needs_upgrade(legacy, pepper="pep") and not needs_upgrade(v2, pepper="pep")
+    assert not needs_upgrade(legacy, pepper="")
+
+
+def test_pepper_v2_issue_and_verify(tmp_path):
+    with make_client(tmp_path, key_pepper="s3cr3t") as c:
+        r = c.post("/mgmt/keys", json={"principal_name": "svc", "role": "viewer"}, headers=auth())
+        assert r.status_code == 200, r.text
+        new_key, pid = r.json()["key"], r.json()["principal_id"]
+        # the new key authenticates...
+        assert c.get("/mgmt/whoami", headers=auth(new_key)).status_code == 200
+        # ...and is stored in v2$ form.
+        with session_scope() as s:
+            k = s.execute(select(models.ApiKey).where(models.ApiKey.principal_id == pid)).scalars().first()
+            assert k.hash.startswith("v2$")
+
+
+def test_legacy_key_upgraded_when_pepper_set(tmp_path):
+    # Boot with no pepper: bootstrap admin key is stored legacy (plain SHA-256).
+    with make_client(tmp_path) as c:
+        with session_scope() as s:
+            before = s.execute(
+                select(models.ApiKey).where(models.ApiKey.prefix == key_prefix(ADMIN))
+            ).scalars().first()
+            assert not before.hash.startswith("v2$")
+        # Now a pepper is configured; the cache must be reloaded to re-read from DB.
+        get_app().settings.key_pepper = "later-pepper"
+        get_app().invalidate_auth()
+        # A successful auth with the legacy key upgrades it in place.
+        assert c.get("/mgmt/whoami", headers=auth()).status_code == 200
+        with session_scope() as s:
+            after = s.execute(
+                select(models.ApiKey).where(models.ApiKey.prefix == key_prefix(ADMIN))
+            ).scalars().first()
+            assert after.hash.startswith("v2$")
+        # It still authenticates on the next request (now via the v2 path).
+        assert c.get("/mgmt/whoami", headers=auth()).status_code == 200
+
+
+def test_pepperless_legacy_behavior_unchanged(client):
+    # Default fixture has no pepper: issued keys stay legacy plain SHA-256.
+    r = client.post("/mgmt/keys", json={"principal_name": "svc2", "role": "viewer"}, headers=auth())
+    pid = r.json()["principal_id"]
+    with session_scope() as s:
+        k = s.execute(select(models.ApiKey).where(models.ApiKey.principal_id == pid)).scalars().first()
+        assert not k.hash.startswith("v2$") and len(k.hash) == 64
+
+
+# ── failed-auth throttling ──
+
+BAD = "incant_sk_not_a_real_key_000000000000"
+
+
+def test_failed_auth_throttled_after_limit(tmp_path):
+    with make_client(tmp_path, auth_throttle_limit=3, auth_throttle_window=60) as c:
+        for _ in range(3):
+            assert c.get("/mgmt/envs", headers=auth(BAD)).status_code == 401
+        # 4th failure from this IP is refused with 429 + Retry-After.
+        r = c.get("/mgmt/envs", headers=auth(BAD))
+        assert r.status_code == 429 and int(r.headers["Retry-After"]) >= 1
+        # Even a *valid* key is refused while the IP is throttled.
+        assert c.get("/mgmt/envs", headers=auth()).status_code == 429
+
+
+def test_missing_or_empty_credential_never_throttles(tmp_path):
+    # A signed-out UI fires unauthenticated fetches on every load; those must not
+    # count as brute-force attempts or the browser throttles itself out of the
+    # sign-in screen. Only presented-and-wrong tokens count.
+    with make_client(tmp_path, auth_throttle_limit=3, auth_throttle_window=60) as c:
+        for _ in range(10):
+            assert c.get("/mgmt/envs").status_code == 401                       # no header
+            assert c.get("/mgmt/envs", headers={"Authorization": "Bearer "}).status_code == 401
+        # not throttled: a presented valid key still works immediately
+        assert c.get("/mgmt/envs", headers=auth()).status_code == 200
+
+
+def test_successful_auth_never_throttles(tmp_path):
+    with make_client(tmp_path, auth_throttle_limit=3, auth_throttle_window=60) as c:
+        for _ in range(10):
+            assert c.get("/mgmt/envs", headers=auth()).status_code == 200
+
+
+def test_throttle_disabled_when_limit_zero(tmp_path):
+    with make_client(tmp_path, auth_throttle_limit=0) as c:
+        for _ in range(25):
+            assert c.get("/mgmt/envs", headers=auth(BAD)).status_code == 401
+
+
+def test_throttle_window_expiry_resets(tmp_path):
+    with make_client(tmp_path, auth_throttle_limit=2, auth_throttle_window=30) as c:
+        clock = {"t": 1000.0}
+        get_app().throttle._now = lambda: clock["t"]
+        assert c.get("/mgmt/envs", headers=auth(BAD)).status_code == 401
+        assert c.get("/mgmt/envs", headers=auth(BAD)).status_code == 401
+        assert c.get("/mgmt/envs", headers=auth()).status_code == 429  # throttled now
+        clock["t"] += 31  # advance past the window
+        assert c.get("/mgmt/envs", headers=auth()).status_code == 200  # reset
+
+
+def test_throttle_is_per_ip_via_xff(tmp_path):
+    with make_client(tmp_path, auth_throttle_limit=2, auth_throttle_window=60) as c:
+        h = {**auth(BAD), "X-Forwarded-For": "9.9.9.9"}
+        for _ in range(2):
+            assert c.get("/mgmt/envs", headers=h).status_code == 401
+        assert c.get("/mgmt/envs", headers=h).status_code == 429
+        # A different client IP (first XFF hop) is unaffected.
+        assert c.get("/mgmt/envs",
+                     headers={**auth(), "X-Forwarded-For": "8.8.8.8"}).status_code == 200
+
+
+# ── /metrics authentication ──
+
+def test_metrics_requires_auth(client):
+    assert client.get("/metrics").status_code == 401
+
+
+def test_metrics_ok_with_viewer_key(client):
+    r = client.get("/metrics", headers=auth())  # admin implies viewer
+    assert r.status_code == 200 and "incant_render_seconds" in r.text
+    # a renderer-only key holds no viewer -> refused.
+    assert client.get("/metrics", headers=auth(client.renderer_key)).status_code == 401
+
+
+def test_metrics_ok_with_metrics_token(tmp_path):
+    with make_client(tmp_path, metrics_token="prom-tok") as c:
+        assert c.get("/metrics", headers={"Authorization": "Bearer prom-tok"}).status_code == 200
+        assert c.get("/metrics", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert c.get("/metrics").status_code == 401
+
+
+# ── key lifecycle: expiry at issuance + rotation ──
+
+def test_key_issued_with_expiry(client):
+    r = client.post("/mgmt/keys",
+                    json={"principal_name": "temp", "role": "viewer", "expires_in_days": 7},
+                    headers=auth())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expires_at"] is not None
+    pid = body["principal_id"]
+    # the listing surfaces expires_at for the UI.
+    d = client.get("/mgmt/principals", headers=auth()).json()
+    me = next(p for p in d["principals"] if p["id"] == pid)
+    assert me["keys"][0]["expires_at"] is not None
+
+
+def test_issue_key_on_principal_with_expiry(client):
+    pid = client.post("/mgmt/keys", json={"principal_name": "p", "role": "viewer"},
+                      headers=auth()).json()["principal_id"]
+    r = client.post(f"/mgmt/principals/{pid}/keys", json={"expires_in_days": 1}, headers=auth())
+    assert r.status_code == 200 and r.json()["expires_at"] is not None
+    # body-less issuance still works (no expiry).
+    r2 = client.post(f"/mgmt/principals/{pid}/keys", headers=auth())
+    assert r2.status_code == 200 and r2.json()["expires_at"] is None
+
+
+def test_rotate_key_roundtrip(client):
+    r = client.post("/mgmt/keys", json={"principal_name": "rot", "role": "operator",
+                                        "project_id": "support"}, headers=auth())
+    old_key, pid = r.json()["key"], r.json()["principal_id"]
+    old_kid = next(k["id"] for k in
+                   next(p for p in client.get("/mgmt/principals", headers=auth()).json()["principals"]
+                        if p["id"] == pid)["keys"])
+    assert client.get("/mgmt/envs", headers=auth(old_key)).status_code == 200
+
+    rot = client.post(f"/mgmt/keys/{old_kid}/rotate", json={"expires_in_days": 30}, headers=auth())
+    assert rot.status_code == 200, rot.text
+    new_key = rot.json()["key"]
+    assert rot.json()["expires_at"] is not None and rot.json()["revoked_key_id"] == old_kid
+    # Old key stops authenticating; new key works and keeps the same principal/role.
+    assert client.get("/mgmt/envs", headers=auth(old_key)).status_code == 401
+    assert client.get("/mgmt/envs", headers=auth(new_key)).status_code == 200
+    who = client.get("/mgmt/whoami", headers=auth(new_key)).json()
+    assert who["roles"] == [{"role": "operator", "project_id": "support", "environment_id": None}]
+    # An audit row records the rotation.
+    with session_scope() as s:
+        actions = [a.action for a in s.execute(select(models.AuditLog)).scalars()]
+    assert "key.rotate" in actions
+
+
+def test_rotate_unknown_key_404(client):
+    assert client.post("/mgmt/keys/999999/rotate", headers=auth()).status_code == 404

@@ -50,6 +50,8 @@ def _author_version(ctx, prompt_id, version, content, *, seed=None, make_live=Tr
 def test_rule_cannot_be_captured_across_environments(app):
     from incant.targeting.service import TargetingError
 
+    # A prompt-scoped rule may only target a version that exists (§7 integrity).
+    _author_version(app, "support/system", 1, "capture {{ x }}", make_live=False)
     with session_scope() as s:
         s.add(models.Environment(id="staging", name="staging", protected=False, track_tip=False))
     # A rule 'r1' lives in prod.
@@ -326,3 +328,51 @@ def test_missing_required_variable_is_422(app):
         with pytest.raises(ServingError) as e:
             app.serve(s, "prod", "support/system", {}, {})
     assert e.value.status == 422 and e.value.extra.get("variable") == "name"
+
+
+# ── §7 targeting integrity ────────────────────────────────────────────
+
+def test_upsert_rule_rejects_missing_version(app):
+    from incant.targeting.service import TargetingError
+
+    _author_version(app, "support/system", 1, "v1 {{ x }}", make_live=False)
+    with session_scope() as s:
+        with pytest.raises(TargetingError):
+            # v7 was never authored for this prompt.
+            app.targeting(s, "op").upsert_rule("prod", {
+                "id": "bad", "scope": "prompt", "prompt_id": "support/system",
+                "priority": 5, "when": None, "serve": {"version": 7}})
+
+
+def test_upsert_rule_rejects_unvalidated_pinned_sha(app):
+    from incant.targeting.service import TargetingError
+
+    _author_version(app, "support/system", 1, "v1 {{ x }}", make_live=False)
+    with session_scope() as s:
+        with pytest.raises(TargetingError):
+            app.targeting(s, "op").upsert_rule("prod", {
+                "id": "pinned", "scope": "prompt", "prompt_id": "support/system",
+                "priority": 5, "when": None,
+                "serve": {"version": 1, "at": "sha", "sha": "deadbeef" * 5}})
+
+
+def test_upsert_rule_rejects_missing_version_in_rollout(app):
+    from incant.targeting.service import TargetingError
+
+    _author_version(app, "support/system", 1, "v1 {{ x }}", make_live=False)
+    with session_scope() as s:
+        with pytest.raises(TargetingError):
+            app.targeting(s, "op").upsert_rule("prod", {
+                "id": "roll", "scope": "prompt", "prompt_id": "support/system",
+                "priority": 5, "when": None,
+                "serve": {"rollout": {"bucket_by": "user_id", "weights": [
+                    {"version": 9, "weight": 50}, {"default": True, "weight": 50}]}}})
+
+
+def test_set_default_rejects_missing_version(app):
+    from incant.targeting.service import TargetingError
+
+    _author_version(app, "support/system", 1, "v1 {{ x }}", make_live=False)
+    with session_scope() as s:
+        with pytest.raises(TargetingError):
+            app.targeting(s, "op").set_default("prod", "support/system", 42)

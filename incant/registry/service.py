@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..core import ExtractedVars, extract
 from ..gitstore import ContentStore, GitStore, validate_source
+from ..gitstore.store import ConcurrentUpdate
 
 
 class RegistryError(Exception):
@@ -24,6 +25,18 @@ class RegistryError(Exception):
 
 class ReviewRequired(RegistryError):
     pass
+
+
+class StaleDraftWrite(RegistryError):
+    """A draft-content write was based on a draft_sha that is no longer current
+    (optimistic-concurrency conflict — Finding 2). Carries the current draft tip and
+    its content so the caller can surface a 409 and let the client recover/rebase."""
+
+    def __init__(self, message: str = "stale draft write", *,
+                 current_sha: str, current_content: str) -> None:
+        super().__init__(message)
+        self.current_sha = current_sha
+        self.current_content = current_content
 
 
 class ConcurrencyError(RegistryError):
@@ -138,19 +151,28 @@ class RegistryService:
 
         base_sha = self.git.head()
         draft_id = "d_" + uuid.uuid4().hex[:8]
-        draft_sha = self.git.write_draft(
-            draft_id, prompt_id, version_number, content, base_sha=base_sha,
-            author_name=author or "draft",
-        )
+        # DB-first (Git/DB reconciliation): insert the draft row before the git ref
+        # exists, so a DB failure rolls the row back with no git ref stranded. The git
+        # write is compensated (ref deleted) if it fails mid-flight; a failure of the
+        # *outer* commit after the ref lands is repaired by the startup sweep
+        # (reconcile_drafts).
         d = models.Draft(
             id=draft_id, prompt_id=prompt_id,
-            version_number=None if new_version else version_number,
+            version_number=version_number,
             base_sha=base_sha, git_ref=self.git.draft_ref(draft_id),
-            draft_sha=draft_sha, title=title, author=author, status="open",
+            draft_sha=None, title=title, author=author, status="open",
         )
-        # Remember the target version number even for new versions (in draft_sha path).
-        d.version_number = version_number
         self.s.add(d)
+        self.s.flush()
+        try:
+            draft_sha = self.git.write_draft(
+                draft_id, prompt_id, version_number, content, base_sha=base_sha,
+                author_name=author or "draft",
+            )
+        except Exception:
+            self.git.delete_draft(draft_id)  # compensate a partial ref
+            raise
+        d.draft_sha = draft_sha
         self.s.flush()
         return d
 
@@ -164,12 +186,33 @@ class RegistryService:
         d = self.get_draft(draft_id)
         return self.git.read_draft(draft_id, d.prompt_id, d.version_number) or ""
 
-    def put_draft_content(self, draft_id: str, content: str, author: str = "") -> ExtractedVars:
+    def put_draft_content(self, draft_id: str, content: str, author: str = "",
+                          base_revision: str | None = None) -> ExtractedVars:
         d = self.get_draft(draft_id)
-        d.draft_sha = self.git.write_draft(
-            draft_id, d.prompt_id, d.version_number, content,
-            base_sha=d.base_sha, author_name=author or d.author or "draft",
-        )
+        # Optimistic concurrency (Finding 2): when the client tells us which revision
+        # its editor state was based on, the write is compare-and-swapped at the draft
+        # ref — two in-flight autosaves can't finish out of order and let the older text
+        # win. `base_revision is None` => legacy unconditional write (back-compat).
+        try:
+            new_sha = self.git.write_draft(
+                draft_id, d.prompt_id, d.version_number, content,
+                base_sha=d.base_sha, author_name=author or d.author or "draft",
+                expected_old=base_revision,
+            )
+        except ConcurrentUpdate:
+            # The ref moved since `base_revision`; hand back the current tip + content
+            # so the client can rebase rather than clobber.
+            current_sha = self.git.head(self.git.draft_ref(draft_id))
+            raise StaleDraftWrite(current_sha=current_sha,
+                                  current_content=self.draft_content(draft_id))
+        d.draft_sha = new_sha
+        self.s.flush()
+        # The content changed, so any earlier verdict was cast against the old draft_sha
+        # and is no longer current (Finding 1). Re-sync status: an "approved" draft that
+        # no longer meets policy drops back to "open". Stale review rows are kept as
+        # history (approvals()/the commit gate simply stop counting them).
+        if d.status not in ("committed", "discarded", "abandoned"):
+            d.status = "approved" if self._policy_met(d) else "open"
         self.s.flush()
         return extract(content)
 
@@ -178,18 +221,23 @@ class RegistryService:
         if d.status in ("committed", "discarded"):
             raise RegistryError(f"draft {draft_id!r} is already {d.status}")
         d.status = "discarded"
-        self.git.delete_draft(draft_id)
         self.s.flush()
+        # Drop the ref after the status flush (see commit_draft). Discard's end-state
+        # intent is "gone", so a residual open→refless window is repaired to the same
+        # place by the sweep.
+        self.git.delete_draft(draft_id)
         return d
 
     # ── review ───────────────────────────────────────────────────────
 
     def approvals(self, draft_id: str) -> list[models.Review]:
-        return list(self.s.execute(
-            select(models.Review).where(
-                models.Review.draft_id == draft_id, models.Review.state == "approved"
-            )
-        ).scalars())
+        """*Current* approvals: approved verdicts still bound to the draft's current
+        content (reviewed_sha == draft_sha). A verdict cast against content that has
+        since changed no longer counts toward the policy — it survives as history but is
+        not current (Finding 1)."""
+        d = self.get_draft(draft_id)
+        return [r for r in self.reviews(draft_id)
+                if r.state == "approved" and r.reviewed_sha == d.draft_sha]
 
     def reviews(self, draft_id: str) -> list[models.Review]:
         """Every principal's *current* review state (one row per reviewer)."""
@@ -208,11 +256,15 @@ class RegistryService:
                 models.Review.draft_id == draft_id, models.Review.reviewer == reviewer
             )
         ).scalar_one_or_none()
+        # Bind the verdict to the exact revision it reviewed (Finding 1): it counts only
+        # while draft.draft_sha is unchanged. A re-review of edited content re-stamps it.
         if r is None:
-            r = models.Review(draft_id=draft_id, reviewer=reviewer, state=state)
+            r = models.Review(draft_id=draft_id, reviewer=reviewer, state=state,
+                              reviewed_sha=d.draft_sha)
             self.s.add(r)
         else:
             r.state = state
+            r.reviewed_sha = d.draft_sha
         self.s.flush()
         # Keep the draft's status in sync with the (possibly changed) approval count,
         # so a withdrawn approval re-locks the draft. commit re-checks _policy_met too.
@@ -338,8 +390,12 @@ class RegistryService:
         self.s.add(cv)
 
         d.status = "committed"
-        self.git.delete_draft(draft_id)
         self.s.flush()
+        # Delete the draft ref only after the DB rows are staged, so a flush failure
+        # leaves the draft intact (nothing to compensate). If the *outer* transaction
+        # still fails after this point, the startup sweep reconciles the now-refless
+        # open draft. The committed content already lives on `main` as a validated SHA.
+        self.git.delete_draft(draft_id)
 
         # Warm the content cache for the freshly-validated SHA.
         if result.ok:

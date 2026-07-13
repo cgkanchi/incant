@@ -16,6 +16,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "prometheus-client>=0.21",
     "python-multipart>=0.0.12",
+    "alembic>=1.18.5",
 ]
 
 [dependency-groups]

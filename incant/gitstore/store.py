@@ -266,14 +266,20 @@ class GitStore:
     def write_draft(
         self, draft_id: str, prompt_id: str, version_number: int, content: str,
         *, base_sha: str | None = None, author_name: str = "draft", author_email: str = "draft@localhost",
+        expected_old: str | None = None,
     ) -> str:
-        """Create/update a draft commit on refs/incant/drafts/<id>. Returns draft sha."""
+        """Create/update a draft commit on refs/incant/drafts/<id>. Returns draft sha.
+
+        When ``expected_old`` is given, the ref update is compare-and-swapped against it:
+        if the draft ref has moved since (a concurrent autosave), ``ConcurrentUpdate`` is
+        raised instead of clobbering the newer draft. ``None`` => unconditional write.
+        """
 
         path = f"{prompt_id}/v{version_number}.j2"
         parent = base_sha or self.head()
         return self._commit_file(
             path, content, parent, f"draft {draft_id}", author_name, author_email,
-            self.draft_ref(draft_id),
+            self.draft_ref(draft_id), expected_old=expected_old,
         )
 
     def read_draft(self, draft_id: str, prompt_id: str, version_number: int) -> str | None:
@@ -285,3 +291,22 @@ class GitStore:
             self._git("update-ref", "-d", self.draft_ref(draft_id))
         except GitError:
             pass
+
+    def draft_ref_exists(self, draft_id: str) -> bool:
+        """True iff refs/incant/drafts/<id> resolves to a commit."""
+        proc = subprocess.run(
+            ["git", "--git-dir", str(self.repo), "rev-parse", "--verify", "--quiet",
+             self.draft_ref(draft_id)],
+            capture_output=True, text=True,
+        )
+        return proc.returncode == 0
+
+    def list_draft_refs(self) -> list[str]:
+        """Return the draft ids that currently have a ref under refs/incant/drafts/."""
+        try:
+            out = self._git("for-each-ref", "--format=%(refname)", "refs/incant/drafts/")
+        except GitError:
+            return []
+        prefix = "refs/incant/drafts/"
+        return [line[len(prefix):] for line in out.splitlines()
+                if line.startswith(prefix) and line[len(prefix):]]

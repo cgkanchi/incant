@@ -41,6 +41,11 @@ class CreateDraftRequest(BaseModel):
 class DraftContentRequest(BaseModel):
     content: str
     author: str = ""
+    # Optimistic concurrency (Finding 2): the `draft_sha` the client's editor state was
+    # based on. When set and != the draft's current draft_sha, the write is refused with
+    # a 409 stale_write (carrying current_sha + current_content). Omit for a legacy
+    # unconditional write (back-compat for tests/integrations).
+    base_revision: Optional[str] = None
 
 
 class DraftRenderRequest(BaseModel):
@@ -167,6 +172,13 @@ class KeyRequest(BaseModel):
     role: str = "renderer"
     project_id: Optional[str] = None
     environment_id: Optional[str] = None
+    # Optional key lifetime. None ⇒ never expires; N ⇒ expires_at = now + N days.
+    expires_in_days: Optional[int] = None
+
+
+class IssueKeyRequest(BaseModel):
+    # Body for issuing/rotating a key on an existing principal (both optional-bodied).
+    expires_in_days: Optional[int] = None
 
 
 class BindingRequest(BaseModel):

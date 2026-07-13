@@ -68,6 +68,53 @@ class TargetingService:
             )
         ).first() is not None
 
+    def _version_exists(self, prompt_id: str, version_number: int) -> bool:
+        return self.s.execute(
+            select(models.Version).where(
+                models.Version.prompt_id == prompt_id,
+                models.Version.number == version_number,
+            )
+        ).first() is not None
+
+    def _is_validated_for(self, prompt_id: str, version_number: int, sha: str) -> bool:
+        return self.s.execute(
+            select(models.CommitValidation).where(
+                models.CommitValidation.sha == sha,
+                models.CommitValidation.prompt_id == prompt_id,
+                models.CommitValidation.version_number == version_number,
+                models.CommitValidation.status == "valid",
+            )
+        ).first() is not None
+
+    def _validate_rule_targets(self, scope: str, prompt_id: str | None, serve: dict) -> None:
+        """Integrity: a prompt-scoped rule may only serve versions that exist for the
+        prompt (§7), and a pinned SHA must be a validated commit for that
+        prompt/version. Global rules serve labels, so version existence is not checked
+        here (a prompt without the label simply skips the rule)."""
+        if scope != "prompt" or not prompt_id:
+            return
+        # (version_number, at, sha) targets carried by this serve.
+        targets: list[tuple[int, str | None, str | None]] = []
+        if "version" in serve:
+            targets.append((int(serve["version"]), serve.get("at"), serve.get("sha")))
+        if isinstance(serve.get("rollout"), dict):
+            for band in serve["rollout"].get("weights", []):
+                if band.get("version") is not None and not band.get("default"):
+                    targets.append((int(band["version"]), None, None))
+        for version_number, at, sha in targets:
+            if not self._version_exists(prompt_id, version_number):
+                raise TargetingError(
+                    f"version {version_number} does not exist for prompt {prompt_id!r}")
+            if at == "sha":
+                if not sha:
+                    raise TargetingError(
+                        f"serve pins at a SHA but none was given for {prompt_id!r} "
+                        f"v{version_number}")
+                if not self._is_validated_for(prompt_id, version_number, sha):
+                    raise TargetingError(
+                        f"SHA {sha} is not a validated commit for {prompt_id!r} "
+                        f"v{version_number}")
+
     # ── rules ────────────────────────────────────────────────────────
 
     def list_rules(self, env_id: str) -> list[models.Rule]:
@@ -97,6 +144,9 @@ class TargetingService:
         existing.serve = rule["serve"]
         existing.status = rule.get("status", existing.status or "active")
         existing.comment = rule.get("comment", existing.comment or "")
+        # Integrity: reject targets that reference a non-existent version or an
+        # unvalidated pinned SHA before this write bumps rules_version.
+        self._validate_rule_targets(existing.scope, existing.prompt_id, existing.serve)
         self.s.flush()
         rv = self._bump(env, "rule", _rule_snapshot(existing), rule_id=rid,
                         comment=existing.comment)
@@ -261,6 +311,9 @@ class TargetingService:
 
     def set_default(self, env_id: str, prompt_id: str, version_number: int) -> models.EnvDefault:
         env = self._env(env_id)
+        if not self._version_exists(prompt_id, version_number):
+            raise TargetingError(
+                f"version {version_number} does not exist for prompt {prompt_id!r}")
         existing = self.s.execute(
             select(models.EnvDefault).where(
                 models.EnvDefault.environment_id == env_id,

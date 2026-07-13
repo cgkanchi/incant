@@ -25,8 +25,37 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
 
-    # Auth: a bootstrap admin key so the instance is usable out of the box.
-    bootstrap_admin_key: str = "incant_sk_dev_admin"
+    # Auth: the bootstrap admin key. Empty by default — on first boot with no admin
+    # yet, Incant generates a strong random key and prints it once (see
+    # ensure_bootstrap_admin). Set this to pin your own key; the well-known
+    # `incant_sk_dev_admin` is refused unless INCANT_ALLOW_DEV_KEY=1 (dev/test only).
+    bootstrap_admin_key: str = ""
+
+    # Key hashing pepper (defense-in-depth). Empty ⇒ legacy plain-SHA256 hashing
+    # (keys are high-entropy, so unsalted SHA-256 is not brute-forceable). Set it and
+    # new/rotated keys are stored as `v2$` HMAC-SHA256(pepper, key); legacy keys are
+    # upgraded in place on their next successful auth. Keep it stable and secret
+    # (a filesystem/env secret, not in the DB) — changing it invalidates v2 hashes.
+    key_pepper: str = ""
+
+    # In-memory API-key cache TTL (seconds). Revocation/issuance is immediate on the
+    # local process (invalidate_auth); on multi-replica deployments a change made on
+    # one node propagates to the others within this TTL.
+    auth_ttl: float = 5.0
+
+    # Failed-auth throttling: per-client-IP sliding window over FAILED bearer auths.
+    # After `limit` failures within `window` seconds, that IP gets 429 (Retry-After)
+    # until the window drains. Successful auth is never throttled. limit=0 disables.
+    auth_throttle_limit: int = 20
+    auth_throttle_window: float = 60.0
+
+    # /metrics access: a Prometheus scraper with no principal can authenticate with
+    # `Authorization: Bearer <this>`. Empty ⇒ /metrics requires a real viewer key.
+    metrics_token: str = ""
+
+    # Emit HSTS (Strict-Transport-Security) on every response. Only enable when TLS
+    # terminates in front of Incant (a reverse proxy); Incant itself speaks plain HTTP.
+    enforce_tls: bool = False
 
     def repo_dir(self) -> Path:
         return Path(self.repo_path).resolve()

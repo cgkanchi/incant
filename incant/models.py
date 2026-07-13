@@ -124,6 +124,12 @@ class Review(Base):
     draft_id: Mapped[str] = mapped_column(ForeignKey("drafts.id"), index=True)
     reviewer: Mapped[str] = mapped_column(String)
     state: Mapped[str] = mapped_column(String, default="pending")      # pending | approved | changes
+    # The draft revision (draft_sha) this verdict was cast against. A verdict only
+    # counts toward the review policy while reviewed_sha == the draft's current
+    # draft_sha: editing the content after approval invalidates (but never deletes)
+    # the verdict — it survives as history, no longer current. (create_all handles the
+    # column for tests/dev; a migration lands with the later migrations agent.)
+    reviewed_sha: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -241,7 +247,10 @@ class ApiKey(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id"), index=True)
     prefix: Mapped[str] = mapped_column(String, index=True)             # incant_sk_xxxx lookup prefix
-    hash: Mapped[str] = mapped_column(String)                           # salted hash of full key
+    # Hash of the full key. Legacy rows are plain SHA-256(key); with INCANT_KEY_PEPPER
+    # set, rows are `v2$` + HMAC-SHA256(pepper, key) and legacy rows upgrade in place on
+    # next successful auth. Keys are high-entropy, so both formats resist brute force.
+    hash: Mapped[str] = mapped_column(String)
     name: Mapped[str] = mapped_column(String, default="")
     expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_used_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
