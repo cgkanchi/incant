@@ -61,26 +61,29 @@ function signInCard() {
   return `<div class="signin-wrap"><div class="signin-card">
     <div class="signin-mark">✦</div>
     <div class="signin-title serif">Sign in to Incant</div>
-    <p class="signin-copy">Paste an API key — you got one from your admin, or use the bootstrap dev key on a fresh install.</p>
+    <p class="signin-copy">Paste an API key — your admin created one for you, or use the admin key printed when this instance first started.</p>
     <input id="signinKey" type="password" class="signin-input" placeholder="incant_sk_…" spellcheck="false" autocomplete="off"
       data-enter="signinBtn">
-    <label class="remember-row"><input type="checkbox" id="signinRemember"> Remember on this device</label>
+    <label class="remember-row"><input type="checkbox" id="signinRemember"> Stay signed in for 30 days on this device</label>
     <button id="signinBtn" class="btn primary" data-act="setToken" style="width:100%;margin-top:10px">Sign in</button>
+    <div class="err" id="signinErr" style="margin-top:8px"></div>
     <div class="signin-hint">Keys are managed in <b>Access</b> — an admin can issue you one.</div>
   </div></div>`;
 }
-// "Switch API key…" — a password-input modal that reuses setToken semantics.
+// "Sign in with a different key…" — a password-input modal that reuses setToken semantics
+// (posts the key to /auth/session for a fresh session cookie).
 function openSwitchKeyModal() {
   openModal(`
-    <h3>Switch API key</h3>
+    <h3>Sign in with a different key</h3>
     <p class="hint">Paste an API key to sign in as a different principal. Keys are managed in Access and never shown here.</p>
     <input id="switchKeyIn" type="password" placeholder="incant_sk_…" spellcheck="false" autocomplete="off"
       style="width:100%;font-family:'IBM Plex Mono',monospace"
       data-enter="switchKeyBtn">
-    <label class="remember-row"><input type="checkbox" id="switchRemember"> Remember on this device</label>
+    <label class="remember-row"><input type="checkbox" id="switchRemember"> Stay signed in for 30 days on this device</label>
+    <div class="err" id="switchKeyErr"></div>
     <div class="modal-actions">
       <button class="btn" data-act="closeModal">Cancel</button>
-      <button id="switchKeyBtn" class="btn primary" data-act="setToken">Set</button></div>`);
+      <button id="switchKeyBtn" class="btn primary" data-act="setToken">Sign in</button></div>`);
 }
 
 function sidebar() {

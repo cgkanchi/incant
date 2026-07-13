@@ -129,6 +129,74 @@ def key_prefix(raw: str) -> str:
     return raw[:16]
 
 
+# ── browser sessions (server-side, HttpOnly cookie) ──────────────────────────
+#
+# The UI authenticates with a session cookie instead of holding a bearer key in
+# JS-readable storage. The raw token lives only in the cookie; the DB keeps its hash
+# (same hashing as API keys). Service/API callers keep using opaque bearer keys.
+
+SESSION_COOKIE = "incant_session"          # cookie name carrying the raw token
+SESSION_TOKEN_PREFIX = "incant_ses_"       # token = prefix + 32 hex chars
+CSRF_HEADER = "x-incant-csrf"              # header carrying the session's CSRF token
+SESSION_TTL_REMEMBER = dt.timedelta(days=30)
+SESSION_TTL_DEFAULT = dt.timedelta(hours=12)
+_LAST_SEEN_MIN_INTERVAL = 300.0            # seconds; suppress last_seen writes below this
+
+
+def new_session_token() -> str:
+    return SESSION_TOKEN_PREFIX + secrets.token_hex(16)
+
+
+def new_session_id() -> str:
+    return "s_" + secrets.token_hex(8)
+
+
+def new_csrf_token() -> str:
+    return secrets.token_hex(32)
+
+
+def lookup_session(session: Session, raw_token: str) -> "models.Session | None":
+    """Resolve a raw cookie token to its live session row, or None if the token is
+    unknown or the session has expired. Does not distinguish the two — both are simply
+    "no session" to the caller (a stale cookie is not a brute-force guess)."""
+    if not raw_token:
+        return None
+    row = session.execute(
+        select(models.Session).where(models.Session.token_hash == hash_key(raw_token))
+    ).scalars().first()
+    if row is None:
+        return None
+    if _expired(row.expires_at, dt.datetime.now(dt.timezone.utc)):
+        return None
+    return row
+
+
+def touch_last_seen(row: "models.Session") -> None:
+    """Bump ``last_seen_at`` at most once per 5 minutes (cheap write suppression)."""
+    now = dt.datetime.now(dt.timezone.utc)
+    last = row.last_seen_at
+    if last is not None and last.tzinfo is None:  # SQLite returns naive UTC
+        last = last.replace(tzinfo=dt.timezone.utc)
+    if last is None or (now - last).total_seconds() >= _LAST_SEEN_MIN_INTERVAL:
+        row.last_seen_at = now
+
+
+def identity_for_principal(session: Session, principal_id: str) -> "Identity | None":
+    """Build the same Identity the bearer path yields, for a principal resolved from a
+    session cookie. Reads the principal's bindings straight from the DB (sessions are
+    control-plane only, so no in-memory cache is involved)."""
+    p = session.get(models.Principal, principal_id)
+    if p is None:
+        return None
+    bindings = [
+        Binding(b.role, b.project_id, b.environment_id)
+        for b in session.execute(
+            select(models.RoleBinding).where(models.RoleBinding.principal_id == principal_id)
+        ).scalars()
+    ]
+    return Identity(p.id, p.name, bindings)
+
+
 @dataclass(frozen=True)
 class _KeyEntry:
     prefix: str

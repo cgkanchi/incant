@@ -14,8 +14,9 @@ from sqlalchemy import select
 from incant import db, models
 from incant.config import Settings, set_settings
 from incant.db import session_scope
+from incant.registry import sweep_expired_sessions
 from incant.seed import seed
-from incant.server.auth import hash_key, key_prefix
+from incant.server.auth import hash_key, key_prefix, new_session_id, new_session_token
 from incant.service import reset_app
 
 from .conftest import db_url_for, reset_schema
@@ -1035,7 +1036,10 @@ def test_throttle_window_expiry_resets(tmp_path):
 
 
 def test_throttle_is_per_ip_via_xff(tmp_path):
-    with make_client(tmp_path, auth_throttle_limit=2, auth_throttle_window=60) as c:
+    # XFF is only honored from a trusted proxy — the TestClient's direct peer is
+    # "testclient", so trust it and the first XFF hop becomes the throttle key.
+    with make_client(tmp_path, auth_throttle_limit=2, auth_throttle_window=60,
+                     trusted_proxies="testclient") as c:
         h = {**auth(BAD), "X-Forwarded-For": "9.9.9.9"}
         for _ in range(2):
             assert c.get("/mgmt/envs", headers=h).status_code == 401
@@ -1117,3 +1121,168 @@ def test_rotate_key_roundtrip(client):
 
 def test_rotate_unknown_key_404(client):
     assert client.post("/mgmt/keys/999999/rotate", headers=auth()).status_code == 404
+
+
+# ── browser sessions (HttpOnly cookie auth + CSRF) ───────────────────
+
+def login(client, key=ADMIN, remember=False):
+    """Exchange an API key for a session cookie (stored in the client's jar).
+    Returns the JSON body (principal_id/name/roles/csrf) plus the raw Set-Cookie."""
+    r = client.post("/auth/session", json={"key": key, "remember": remember})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    body["_set_cookie"] = r.headers.get("set-cookie", "")
+    return body
+
+
+def test_login_sets_httponly_samesite_cookie(client):
+    body = login(client)
+    # Response shape the UI codes against.
+    assert body["principal_id"] and body["name"] == "bootstrap-admin"
+    assert body["csrf"] and isinstance(body["roles"], list)
+    assert {"role": "admin", "project_id": None, "environment_id": None} in body["roles"]
+    # Cookie flags: HttpOnly + SameSite=Strict + Path=/, and (no remember) no Max-Age.
+    cookie = body["_set_cookie"]
+    assert cookie.startswith("incant_session=")
+    low = cookie.lower()
+    assert "httponly" in low and "samesite=strict" in low and "path=/" in low
+    assert "max-age" not in low                       # session cookie (not remembered)
+    # The token itself is never JS-readable content we return in the body.
+    assert "incant_session" not in str(body["roles"])
+
+
+def test_login_remember_sets_max_age(client):
+    body = login(client, remember=True)
+    low = body["_set_cookie"].lower()
+    assert "max-age=" in low                          # persistent cookie
+    # 30-day absolute lifetime.
+    assert "max-age=2592000" in low
+
+
+def test_login_secure_flag_when_tls_enforced(tmp_path):
+    with make_client(tmp_path, enforce_tls=True) as c:
+        body = login(c)
+        assert "secure" in body["_set_cookie"].lower()
+
+
+def test_login_bad_key_throttles(tmp_path):
+    with make_client(tmp_path, auth_throttle_limit=3, auth_throttle_window=60) as c:
+        for _ in range(3):
+            assert c.post("/auth/session", json={"key": BAD}).status_code == 401
+        # 4th bad login from this IP is refused with 429 — a bad key is a presented
+        # credential and counts toward the throttle.
+        r = c.post("/auth/session", json={"key": BAD})
+        assert r.status_code == 429 and int(r.headers["Retry-After"]) >= 1
+        # Even a valid login is refused while the IP is throttled.
+        assert c.post("/auth/session", json={"key": ADMIN}).status_code == 429
+
+
+def test_get_session_roundtrip(client):
+    body = login(client)
+    r = client.get("/auth/session")                   # cookie sent from the jar
+    assert r.status_code == 200, r.text
+    who = r.json()
+    assert who["principal_id"] == body["principal_id"]
+    assert who["name"] == "bootstrap-admin"
+    assert who["csrf"] == body["csrf"]
+    assert {"role": "admin", "project_id": None, "environment_id": None} in who["roles"]
+
+
+def test_get_session_no_cookie_401(client):
+    assert client.get("/auth/session").status_code == 401
+
+
+def test_cookie_auth_get_needs_no_csrf(client):
+    login(client)
+    # A safe GET is cookie-authenticated with no CSRF header required.
+    r = client.get("/mgmt/overview?environment=prod")
+    assert r.status_code == 200, r.text
+
+
+def test_cookie_auth_post_without_csrf_is_403(client):
+    login(client)
+    # A cookie-authenticated mutation without the CSRF header is refused.
+    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/csrf-a"})
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == "csrf_required"
+
+
+def test_cookie_auth_post_with_csrf_succeeds(client):
+    body = login(client)
+    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/csrf-b"},
+                    headers={"X-Incant-CSRF": body["csrf"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["prompt_id"] == "growth/csrf-b"
+    # A wrong CSRF token is still refused.
+    r2 = client.post("/mgmt/prompts", json={"prompt_id": "growth/csrf-c"},
+                     headers={"X-Incant-CSRF": "not-the-token"})
+    assert r2.status_code == 403 and r2.json()["detail"] == "csrf_required"
+
+
+def test_bearer_post_needs_no_csrf_even_with_cookie(client):
+    # Log in (cookie in the jar), then mutate with a bearer header and NO CSRF token.
+    # Bearer takes precedence and is CSRF-immune, so it succeeds.
+    login(client)
+    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/bearer-nocsrf"},
+                    headers=auth())
+    assert r.status_code == 200, r.text
+
+
+def test_delete_session_signs_out(client):
+    body = login(client)
+    assert client.get("/auth/session").status_code == 200
+    # DELETE without CSRF is refused...
+    assert client.delete("/auth/session").status_code == 403
+    # ...with the CSRF header it signs out: cookie cleared + row deleted.
+    r = client.delete("/auth/session", headers={"X-Incant-CSRF": body["csrf"]})
+    assert r.status_code == 204, r.text
+    assert "max-age=0" in r.headers.get("set-cookie", "").lower()
+    with session_scope() as s:
+        assert s.execute(select(models.Session)).scalars().first() is None
+    # Subsequent whoami is unauthenticated (the jar dropped the cleared cookie).
+    assert client.get("/auth/session").status_code == 401
+
+
+def test_expired_session_401_and_swept(client):
+    login(client)
+    # Force the session past its absolute expiry.
+    with session_scope() as s:
+        row = s.execute(select(models.Session)).scalars().first()
+        row.expires_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    # An expired cookie authenticates nothing (and is not a throttle-worthy guess).
+    assert client.get("/auth/session").status_code == 401
+    # The startup sweep deletes expired rows.
+    with session_scope() as s:
+        assert sweep_expired_sessions(s) >= 1
+    with session_scope() as s:
+        assert s.execute(select(models.Session)).scalars().first() is None
+
+
+def test_serving_endpoint_refuses_cookie_auth(client):
+    login(client)
+    # Sessions are control-plane only; the serving hot path is bearer-only. The cookie
+    # in the jar is ignored → 401 (no bearer credential).
+    r = client.post("/prompt/support/system",
+                    json={"variables": {"customer_name": "Acme", "history": []}})
+    assert r.status_code == 401, r.text
+
+
+def test_xff_honored_only_from_trusted_proxy(tmp_path):
+    # Untrusted peer: XFF is ignored, so every request shares the direct-peer bucket.
+    with make_client(tmp_path, auth_throttle_limit=2, auth_throttle_window=60) as c:
+        h = {**auth(BAD), "X-Forwarded-For": "9.9.9.9"}
+        assert c.get("/mgmt/envs", headers=h).status_code == 401
+        assert c.get("/mgmt/envs", headers=h).status_code == 401
+        # A different XFF is the SAME untrusted peer → already throttled.
+        assert c.get("/mgmt/envs",
+                     headers={**auth(), "X-Forwarded-For": "8.8.8.8"}).status_code == 429
+    # Trusted peer: the first XFF hop is honored, so distinct clients bucket apart.
+    with make_client(tmp_path, auth_throttle_limit=2, auth_throttle_window=60,
+                     trusted_proxies="testclient") as c:
+        h = {**auth(BAD), "X-Forwarded-For": "9.9.9.9"}
+        assert c.get("/mgmt/envs", headers=h).status_code == 401
+        assert c.get("/mgmt/envs", headers=h).status_code == 401
+        assert c.get("/mgmt/envs", headers=h).status_code == 429   # 9.9.9.9 throttled
+        # 8.8.8.8 is a different client the proxy saw → unaffected.
+        assert c.get("/mgmt/envs",
+                     headers={**auth(), "X-Forwarded-For": "8.8.8.8"}).status_code == 200

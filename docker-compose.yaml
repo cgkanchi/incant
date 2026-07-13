@@ -25,6 +25,7 @@ services:
       # INCANT_AUTH_TTL: "5.0"                       # key-cache TTL ⇒ cross-replica revocation bound
       # INCANT_AUTH_THROTTLE_LIMIT: "20"            # failed bearer auths/IP/window before 429 (0=off)
       # INCANT_AUTH_THROTTLE_WINDOW: "60"           # throttle window (seconds)
+      # INCANT_TRUSTED_PROXIES: "10.0.0.1,10.0.0.2" # proxy IPs whose X-Forwarded-For is trusted (empty=never)
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
       interval: 10s

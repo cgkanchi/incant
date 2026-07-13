@@ -23,6 +23,15 @@ class EvaluateRequest(BaseModel):
     environment: Optional[str] = None
 
 
+# ── browser sessions ─────────────────────────────────────────────────
+
+class SessionLoginRequest(BaseModel):
+    # An API key presented once to exchange for an HttpOnly session cookie. Verified
+    # through the same machinery (and failed-auth throttle) as bearer auth.
+    key: str
+    remember: bool = False
+
+
 # ── authoring ────────────────────────────────────────────────────────
 
 class CreatePromptRequest(BaseModel):

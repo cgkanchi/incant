@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     # terminates in front of Incant (a reverse proxy); Incant itself speaks plain HTTP.
     enforce_tls: bool = False
 
+    # Trusted reverse-proxy IPs (comma-separated). X-Forwarded-For is honored (its
+    # first hop taken as the client IP for throttling) ONLY when the direct peer
+    # (request.client.host) is in this list; otherwise the direct peer is used. Empty
+    # (default) ⇒ never trust XFF — a client can't spoof its IP past an untrusted hop.
+    trusted_proxies: str = ""
+
+    def trusted_proxy_set(self) -> set[str]:
+        return {p.strip() for p in self.trusted_proxies.split(",") if p.strip()}
+
     def repo_dir(self) -> Path:
         return Path(self.repo_path).resolve()
 

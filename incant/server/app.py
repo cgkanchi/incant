@@ -27,12 +27,13 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..db import engine, session_scope
-from ..registry import reconcile_drafts
+from ..registry import reconcile_drafts, sweep_expired_sessions
 from ..service import get_app
 from .auth import AuthError, _IMPLIES, ensure_bootstrap_admin
 from .deps import get_session
 from .mgmt import router as mgmt_router
 from .serving import router as serving_router
+from .sessions import router as session_router
 
 log = logging.getLogger("incant.server")
 
@@ -110,9 +111,11 @@ async def lifespan(app: FastAPI):
         ctx.initialize()  # git init + schema (create_all on SQLite, Alembic on Postgres)
         with session_scope() as s:
             ensure_bootstrap_admin(s, settings.bootstrap_admin_key)
-        # Reconcile git draft refs against DB draft rows before serving warms.
+        # Reconcile git draft refs against DB draft rows before serving warms, and
+        # sweep any expired browser sessions in the same pass.
         with session_scope() as s:
             reconcile_drafts(s, ctx.git)
+            sweep_expired_sessions(s)
 
     # Warming is required in both modes: any environment's warm failure leaves the node
     # not ready. In full mode a background loop keeps retrying; in serve mode the same
@@ -160,6 +163,7 @@ def create_app() -> FastAPI:
     app.include_router(serving_router)
     if settings.mode == "full":
         app.include_router(mgmt_router)
+        app.include_router(session_router)
 
     # /healthz and /readyz stay public and unauthenticated on purpose: they are
     # load-balancer / orchestrator probes and return no sensitive data (a literal

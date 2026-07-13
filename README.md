@@ -113,6 +113,7 @@ reset any Postgres database whose name doesn't end in `_test`.
 | `INCANT_AUTH_TTL` | `5.0` | in-memory key-cache TTL (s); bounds revocation propagation across replicas |
 | `INCANT_AUTH_THROTTLE_LIMIT` | `20` | failed bearer auths per IP per window before `429`; `0` disables |
 | `INCANT_AUTH_THROTTLE_WINDOW` | `60.0` | sliding window (s) for the failed-auth throttle |
+| `INCANT_TRUSTED_PROXIES` | *(empty)* | comma-separated proxy IPs whose `X-Forwarded-For` is trusted for the client IP; empty ⇒ never trust XFF (use the direct peer) |
 
 ## Security
 
@@ -124,6 +125,18 @@ Incant authenticates every request; there is no side door. A few operational not
   `Content-Security-Policy` (scripts are `'self'` only), `X-Content-Type-Options`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a locked-down
   `Permissions-Policy`.
+- **Browser sessions (the UI's door).** Interactive UI access never keeps a credential
+  in JS-readable storage. The browser exchanges a key once at `POST /auth/session` for a
+  server-side session, delivered as an `HttpOnly`, `SameSite=Strict`, `Path=/` cookie
+  (`incant_session`) — marked `Secure` when TLS is enforced or the request is https, and
+  persistent (`Max-Age`) only for "remember me" (30 days; 12 hours otherwise). Only the
+  token's hash is stored server-side (same hashing as keys). Because cookies ride along
+  automatically, cookie-authenticated **mutations** (any non-GET) must echo the session's
+  CSRF token in an `X-Incant-CSRF` header (returned by `POST`/`GET /auth/session`);
+  mismatch/absent ⇒ `403`. Bearer (header) auth is CSRF-immune and needs no such header.
+  `DELETE /auth/session` (CSRF-guarded) signs out — it deletes the row and clears the
+  cookie. Sessions are control-plane only: the serving hot path is bearer-only and stays
+  memory-only. Expired sessions are swept at startup.
 - **Keys are opaque, high-entropy bearer tokens** (`incant_sk_…`) for service-to-service
   use. They are stored hashed, never in the clear. Set `INCANT_KEY_PEPPER` to a secret
   (kept outside the DB) for defense-in-depth: new and rotated keys are stored as
@@ -139,11 +152,15 @@ Incant authenticates every request; there is no side door. A few operational not
   cache refreshes.
 - **Failed-auth throttling.** Repeated failed bearer auths from one client IP
   (`INCANT_AUTH_THROTTLE_LIMIT` per `INCANT_AUTH_THROTTLE_WINDOW`) earn a `429` with
-  `Retry-After` until the window drains; successful auth is never throttled. Behind a
-  proxy, the first `X-Forwarded-For` hop is used as the client IP.
+  `Retry-After` until the window drains; successful auth is never throttled.
+- **Client IP behind a proxy.** `X-Forwarded-For` is honored (its first hop taken as the
+  client IP) **only** when the direct peer is a listed `INCANT_TRUSTED_PROXIES` address;
+  otherwise the direct peer is used. The default trusts nothing, so a client can't spoof
+  its IP past an untrusted hop — set `INCANT_TRUSTED_PROXIES` to your load balancer's IP(s)
+  when you run behind one, so per-IP throttling keys off the real client.
 - **`/metrics`** requires either a valid key holding `viewer` (any scope) or the
   `INCANT_METRICS_TOKEN` bearer (for principal-less scrapers). `/healthz` and `/readyz`
   stay public — they are LB probes and return no sensitive data.
-- **Roadmap — browser sessions.** Opaque API keys are for service-to-service callers.
-  Interactive browser access (OIDC login + short-lived `HttpOnly`, `SameSite` session
-  cookies) is planned; until then, treat UI access as key-bearing.
+- **Roadmap — SSO.** Browser access already uses short-lived `HttpOnly`, `SameSite`
+  session cookies (above); API keys remain the service-to-service mechanism. Optional
+  OIDC/SSO login (minting the same server-side sessions) is a possible future addition.

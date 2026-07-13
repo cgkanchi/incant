@@ -2,12 +2,17 @@
 "use strict";
 
 const State = {
-  token: readStoredToken(),   // sessionStorage → localStorage → "" (no baked default)
+  // No credential is ever kept in JS-readable storage. Auth is a server-side session in an
+  // HttpOnly cookie the browser holds for us. State.token is an in-memory-only bearer escape
+  // hatch (default ""), used only if something sets it programmatically (harnesses/debug).
+  token: (typeof __HARNESS_TOKEN__ !== "undefined") ? __HARNESS_TOKEN__ : "",
+  csrf: "",               // in-memory CSRF token from the session response (cookie mode only)
+  session: null,          // the /auth/session identity payload, or null when signed out
   env: localStorage.getItem("incant_env") || "prod",
   theme: localStorage.getItem("incant_theme") || "light",
   tech: localStorage.getItem("incant_tech") === "1",   // reveal commit SHAs / rules_version
   envs: [],
-  me: null,               // cached GET /mgmt/whoami — cleared when the key changes
+  me: null,               // account-chip identity (session payload, or GET /mgmt/whoami on the bearer path)
   _meFailed: false,       // whoami rejected (bad/absent key) → account chip shows "not signed in"
   _mePromise: null,       // in-flight whoami fetch, so it runs once per session
   tweakOpen: false,
@@ -15,28 +20,23 @@ const State = {
   route: { name: "prompts", pid: null, q: {} },
 };
 
-// ── credentials / storage ────────────────────────────────────────────
-// The API key is read from sessionStorage first, then localStorage. A "remember on this
-// device" key persists in localStorage; an un-remembered key lives only for the session.
-// There is no baked default — an empty token surfaces the 401 sign-in card.
-function readStoredToken() {
-  try { const s = sessionStorage.getItem("incant_token"); if (s) return s; } catch (_) {}
-  try { const l = localStorage.getItem("incant_token"); if (l) return l; } catch (_) {}
-  return "";
+// ── credentials / session ────────────────────────────────────────────
+// Credentials never live in JS-readable storage. Older builds persisted the API key under a
+// web-storage key; purge any lingering value once on load so nothing readable remains.
+try { localStorage.removeItem("incant_token"); sessionStorage.removeItem("incant_token"); } catch (_) {}
+
+// Adopt a /auth/session identity payload {principal_id, name, roles, csrf}: cache the CSRF
+// token and map the payload to the account-chip shape (name + roles) whoami would produce.
+function applySession(s) {
+  State.session = s;
+  State.csrf = (s && s.csrf) || "";
+  State.me = s ? { principal_id: s.principal_id, name: s.name, roles: s.roles || [] } : null;
+  State._meFailed = false; State._mePromise = null;
 }
-// remember=true → persist in localStorage (survives the browser); false → sessionStorage
-// only. Writing one store always clears the other so the two never disagree.
-function saveToken(val, remember) {
-  State.token = val;
-  try {
-    if (remember) { localStorage.setItem("incant_token", val); sessionStorage.removeItem("incant_token"); }
-    else { sessionStorage.setItem("incant_token", val); localStorage.removeItem("incant_token"); }
-  } catch (_) {}
-}
-// "Forget this key" — clears both stores and the token (the 401 card takes over).
-function forgetToken() {
-  State.token = "";
-  try { localStorage.removeItem("incant_token"); sessionStorage.removeItem("incant_token"); } catch (_) {}
+// Sign-out / expiry: drop the session, CSRF, and cached identity (the sign-in card takes over).
+function clearSession() {
+  State.session = null; State.csrf = "";
+  State.me = null; State._meFailed = false; State._mePromise = null;
 }
 
 // ── role hierarchy (chrome gating) ───────────────────────────────────

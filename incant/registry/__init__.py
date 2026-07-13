@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .reconcile import ReconcileResult, reconcile_drafts
+from .reconcile import ReconcileResult, reconcile_drafts, sweep_expired_sessions
 from .service import (
     CommitOutcome,
     ConcurrencyError,
@@ -21,4 +21,5 @@ __all__ = [
     "ReviewRequired",
     "StaleDraftWrite",
     "reconcile_drafts",
+    "sweep_expired_sessions",
 ]

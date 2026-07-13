@@ -14,10 +14,11 @@ Both directions log, and the sweep emits a one-line summary.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -77,3 +78,15 @@ def reconcile_drafts(session: Session, git: GitStore) -> ReconcileResult:
     )
     log.info(result.summary())
     return result
+
+
+def sweep_expired_sessions(session: Session) -> int:
+    """Delete browser sessions whose absolute expiry has passed. Run once at boot
+    (piggybacks the draft reconcile sweep). Caller owns the transaction. Returns the
+    number of rows deleted and emits one log line."""
+    now = dt.datetime.now(dt.timezone.utc)
+    deleted = session.execute(
+        delete(models.Session).where(models.Session.expires_at <= now)
+    ).rowcount or 0
+    log.info("session sweep: deleted %d expired session(s)", deleted)
+    return deleted

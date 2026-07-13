@@ -266,6 +266,28 @@ class RoleBinding(Base):
     environment_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
+class Session(Base):
+    """Server-side browser session for the UI. The raw token lives only in the user's
+    HttpOnly cookie; here we keep just its hash (hashed exactly like an API key via
+    ``hash_key``, pepper-aware) so a DB read never exposes a live credential. API keys
+    remain the service-to-service mechanism; sessions are control-plane (UI) only.
+    """
+
+    __tablename__ = "sessions"
+    id: Mapped[str] = mapped_column(String, primary_key=True)           # s_<hex>
+    # Hash of the opaque session token (never the token itself). Same hashing as keys.
+    token_hash: Mapped[str] = mapped_column(String, index=True, unique=True)
+    principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id"), index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # Absolute expiry — 30d for "remember me", 12h otherwise. No sliding renewal.
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # Double-submit CSRF token — random hex, stored in the clear (it is not a
+    # credential): the client echoes it in the X-Incant-CSRF header on mutations.
+    csrf_token: Mapped[str] = mapped_column(String)
+    remember: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

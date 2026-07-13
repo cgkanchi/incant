@@ -58,34 +58,48 @@ const Actions = {
     localStorage.setItem("incant_env", State.env);
     render();
   },
-  // Shared by the sign-in card and the "Switch API key…" modal — whichever input is present.
+  // Shared by the sign-in card and the "Sign in with a different key…" modal — whichever
+  // input is present. Exchanges the API key for a server-side session (HttpOnly cookie); the
+  // key is posted once and never stored in the browser.
   async setToken() {
     let val = "";
     for (const id of ["signinKey", "switchKeyIn"]) {
       const e = document.getElementById(id);
       if (e && e.value != null && String(e.value).trim()) { val = String(e.value).trim(); break; }
     }
-    if (!val) { toast("Enter an API key", true); return; }
-    // "Remember on this device" (default OFF) picks the store: checked → localStorage,
-    // unchecked → sessionStorage only (writing one clears the other).
+    const errEl = el("signinErr") || el("switchKeyErr");
+    if (errEl) errEl.textContent = "";
+    if (!val) { if (errEl) errEl.textContent = "Enter an API key."; else toast("Enter an API key", true); return; }
+    // "Stay signed in" (default OFF) maps to the session lifetime: checked → a 30-day
+    // persistent cookie, unchecked → a session-only cookie the browser drops on close.
     let remember = false;
     for (const id of ["signinRemember", "switchRemember"]) {
       const c = document.getElementById(id);
       if (c) { remember = !!c.checked; break; }
     }
-    saveToken(val, remember);
-    // Identity changes with the key — drop the cache + failure flag so it re-fetches.
-    State.me = null; State._meFailed = false; State._mePromise = null;
-    // Re-fetch environments: if boot() ran against a bad key, State.envs is a bare
-    // fallback with no `protected` flags — stale until re-read, which would hide
-    // PROTECTED badges and skip the type-to-confirm the server still enforces.
+    let session;
+    try {
+      session = await POST("/auth/session", { key: val, remember });
+    } catch (e) {
+      const msg = e && e.status === 429 ? "Too many attempts — wait a minute"
+        : e && e.status === 401 ? "That key didn't work — check it and try again"
+        : errText(e);
+      if (errEl) errEl.textContent = msg; else toast(msg, true);
+      return;
+    }
+    applySession(session);   // caches the CSRF token + identity; never touches storage
+    // Clear the just-used key from the input so it doesn't linger in the DOM.
+    for (const id of ["signinKey", "switchKeyIn"]) { const e = document.getElementById(id); if (e) e.value = ""; }
+    // Re-fetch environments: a prior signed-out boot() left State.envs a bare fallback with
+    // no `protected` flags — stale until re-read, which would hide PROTECTED badges and skip
+    // the type-to-confirm the server still enforces.
     try {
       const e = await GET("/mgmt/envs");
       State.envs = e.environments;
       if (!State.envs.find((x) => x.id === State.env)) State.env = State.envs[0]?.id || "prod";
-    } catch (_) { /* key may still be bad — the 401 screen will handle it */ }
+    } catch (_) { /* session may still be bad — the 401 screen will handle it */ }
     closeModal();
-    toast("API key set");
+    toast("Signed in");
     render();
   },
   acctMenu() {
@@ -100,18 +114,19 @@ const Actions = {
       <p class="hint">You're signed in. Your roles and where each one applies:</p>
       <div style="margin-bottom:14px">${roles}</div>
       <div style="display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line2);padding-top:12px;align-items:flex-start">
-        <button type="button" class="link btn-bare" data-act="switchKey">Switch API key…</button>
-        <button type="button" class="link btn-bare" data-act="forgetKey" style="color:var(--danger)">Forget this key</button>
+        <button type="button" class="link btn-bare" data-act="switchKey">Sign in with a different key…</button>
+        <button type="button" class="link btn-bare" data-act="signOut" style="color:var(--danger)">Sign out</button>
         <a href="#/access" data-act="go" data-hash="#/access" style="font-weight:600">Manage access →</a></div>
       <div class="modal-actions"><button class="btn" data-act="closeModal">Close</button></div>`);
   },
   switchKey() { openSwitchKeyModal(); },
-  // "Forget this key" — clears both stores + the identity cache, then the 401 sign-in card.
-  forgetKey() {
-    forgetToken();
-    State.me = null; State._meFailed = false; State._mePromise = null;
+  // "Sign out" — ends the server-side session (DELETE carries the CSRF header via api.js),
+  // then drops the cached identity so the 401 sign-in card takes over.
+  async signOut() {
+    try { await api("DELETE", "/auth/session"); } catch (_) { /* already gone / offline — clear locally regardless */ }
+    clearSession();
     closeModal();
-    toast("Key forgotten");
+    toast("Signed out");
     render();
   },
   toggleTweak() {
@@ -925,10 +940,10 @@ function render() {
   if (document.body && document.body.classList) document.body.classList.toggle("nav-open", State.navOpen);
   State.route = parseRoute();
   el("app").innerHTML = shell(`<div class="empty">Loading…</div>`);
-  // No key at all → straight to the sign-in card. Firing authenticated fetches
-  // with an empty bearer would just 401 (and, repeated, look like a brute-force
-  // attempt to the server's auth throttle).
-  if (!State.token) {
+  // No session and no bearer → straight to the sign-in card. Firing authenticated fetches
+  // unauthenticated would just 401 (and, repeated, look like a brute-force attempt to the
+  // server's auth throttle).
+  if (!State.token && !State.session) {
     el("main").innerHTML = signInCard();
     return;
   }
@@ -936,7 +951,9 @@ function render() {
   const fn = SCREENS[State.route.name] || screenPrompts;
   fn().catch((e) => {
     if (e && e.status === 401) {
-      // Dedicated sign-in card replaces the screen body; the sidebar stays.
+      // Session expired mid-use → drop it so the guard above holds next render, and swap the
+      // dedicated sign-in card into the screen body; the sidebar stays.
+      State.session = null; State.csrf = "";
       el("main").innerHTML = signInCard();
     } else {
       el("main").innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`;
@@ -996,13 +1013,26 @@ window.addEventListener("hashchange", render);
 async function boot() {
   document.body.dataset.theme = State.theme;
   if (State.token) {
+    // Harness/debug bearer path — no session, no CSRF; behaves exactly as before.
     try {
       const e = await GET("/mgmt/envs");
       State.envs = e.environments;
       if (!State.envs.find((x) => x.id === State.env)) State.env = State.envs[0]?.id || "prod";
     } catch (_) { State.envs = [{ id: State.env }]; }
   } else {
-    State.envs = [{ id: State.env }];   // signed out — setToken re-fetches after sign-in
+    // Cookie path: resolve the session first (plain GET, cookie-based). Valid → adopt the
+    // identity + load envs; absent → straight to the sign-in card with zero further fetches.
+    const s = await fetchSession();
+    if (s) {
+      applySession(s);
+      try {
+        const e = await GET("/mgmt/envs");
+        State.envs = e.environments;
+        if (!State.envs.find((x) => x.id === State.env)) State.env = State.envs[0]?.id || "prod";
+      } catch (_) { State.envs = [{ id: State.env }]; }
+    } else {
+      State.envs = [{ id: State.env }];   // signed out — setToken re-fetches after sign-in
+    }
   }
   render();
 }
