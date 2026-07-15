@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from ... import models
 from ...registry import RegistryError
 from ...targeting import build_snapshot
-from ..auth import Identity
+from ..auth import ANY_ENVIRONMENT, Identity
 from ..deps import app_context, get_session, identity
 from ...service import AppContext, ServingError
 from ..schemas import (
@@ -34,6 +34,12 @@ from .helpers import (
 )
 
 router = APIRouter()
+
+# The version-detail response's `history` array is a UI list — the panel shows recent
+# commits, nobody scrolls thousands. Bound the per-version `git log` walk to the newest K
+# rather than letting it grow with a version's edit history. `history()` already caps at 50
+# by default; we pass it explicitly so the bound is visible at the call site (§ scalability).
+_VERSION_HISTORY_LIMIT = 50
 
 
 # ── identity ─────────────────────────────────────────────────────────
@@ -128,7 +134,12 @@ def get_versions(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "viewer", project=_project_of(prompt_id))
+    # Versions ARE environment-divisible — the response carries this env's live pointer,
+    # live_sha and tip-ahead per version — so authorize on the concrete environment. A
+    # viewer scoped to (this project, this env) then passes exactly the screen the overview
+    # already showed them, instead of hitting the old project-only door that a (project, env)
+    # binding could not satisfy.
+    _require(ident, "viewer", project=_project_of(prompt_id), environment=environment)
     reg = app.registry(session)
     if not reg.prompt_exists(prompt_id):
         raise HTTPException(404, f"unknown prompt {prompt_id!r}")
@@ -142,7 +153,7 @@ def get_versions(
     out = []
     for v in version_rows:
         vinfo = vers.get(v.number)
-        hist = app.git.history(f"{prompt_id}/v{v.number}.j2")
+        hist = app.git.history(f"{prompt_id}/v{v.number}.j2", limit=_VERSION_HISTORY_LIMIT)
         tip = hist[0] if hist else None
         live = _current_live(session, environment, prompt_id, v.number)
         out.append({
@@ -201,7 +212,10 @@ def get_variables(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "viewer", project=_project_of(prompt_id))
+    # A prompt's variable schema describes the template itself, not any one environment, so
+    # an env-scoped project viewer should read it — ANY_ENVIRONMENT waives the env dimension
+    # while keeping the project check (see auth.ANY_ENVIRONMENT).
+    _require(ident, "viewer", project=_project_of(prompt_id), environment=ANY_ENVIRONMENT)
     return {"prompt_id": prompt_id, "version": version,
             "variables": _effective_variables(app, session, prompt_id, version)}
 
@@ -228,7 +242,9 @@ def get_test_contexts(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "viewer", project=_project_of(prompt_id))
+    # Test contexts (named flag/variable sets) belong to the prompt, not an environment —
+    # env-scoped project viewer reads them too (ANY_ENVIRONMENT waives only the env dimension).
+    _require(ident, "viewer", project=_project_of(prompt_id), environment=ANY_ENVIRONMENT)
     reg = app.registry(session, ident.name)
     return {"prompt_id": prompt_id, "test_contexts": [
         {"name": t.name, "flags": t.flags, "variables": t.variables}
@@ -257,7 +273,11 @@ def diff_versions(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "viewer", project=_project_of(prompt_id))
+    # Comparing two versions of a prompt is a read of prompt content, not an env-divisible
+    # fact (rendered mode names an env only to resolve includes for the preview). Authorize
+    # env-agnostically so an env-scoped project viewer can diff — ANY_ENVIRONMENT keeps the
+    # project check and waives just the env dimension.
+    _require(ident, "viewer", project=_project_of(prompt_id), environment=ANY_ENVIRONMENT)
     if mode == "rendered":
         reg = app.registry(session)
         tcs = reg.get_test_contexts(prompt_id)

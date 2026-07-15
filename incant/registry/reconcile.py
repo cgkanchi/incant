@@ -1,15 +1,42 @@
-"""Startup reconciliation of git draft refs against DB draft rows.
+"""Reconciliation of git draft refs against DB draft rows, and of the git ``main`` tree
+against the DB control plane.
 
 Draft create/commit/discard mutate git and Postgres in two steps; a failure of the
 outer DB transaction after a git mutation (or vice versa) can leave the two out of
-sync. Full outbox machinery is out of scope — this is the pragmatic repair, run once
-at boot (full mode) before serving is warmed:
+sync. Full outbox/saga machinery is deliberately OUT OF SCOPE — a durable log of
+intended git mutations, two-phase-committed against Postgres, is more moving parts
+(and more failure modes) than this system's drift surface warrants. Instead we make two
+pragmatic guarantees the pieces below implement, and treat anything they can't prevent
+as *detectable, non-destructive residue* rather than lost work:
+
+  1. **Ordering** — the mutation that DESTROYS recoverable state runs LAST, after the DB
+     transaction it depends on has committed. Concretely: ``RegistryService.commit_draft``
+     no longer deletes the draft ref mid-transaction; it defers the delete to an
+     ``after_commit`` hook, so a failed outer commit leaves the draft ref AND its open row
+     intact (fully recoverable, still editable) with only an unvalidated `main` tip as
+     residue. This turns "publish strands user work" into "publish leaves a re-runnable
+     draft".
+  2. **Surfacing** — residue is DETECTED and made loud (logs + metrics + /healthz), never
+     silently swallowed and never auto-repaired: auto-registering an orphan or fabricating
+     a validation row could resurrect a deliberately rolled-back commit. A human decides.
+
+The **draft sweep** (``reconcile_drafts``, run once at boot in full mode before serving
+warms) repairs the two convergent draft states:
 
   * a draft ref in git (``refs/incant/drafts/*``) with no *live* DB draft row
-    (open/approved) → delete the orphan ref;
+    (open/approved) → delete the orphan ref (this is where a leftover ref from a
+    now-``committed`` draft, or a discarded draft, is cleaned up);
   * a DB draft row still open/approved whose ref is missing → mark it discarded.
 
-Both directions log, and the sweep emits a one-line summary.
+The **main sweep** (``reconcile_main_commits``, run at boot AND on an interval —
+``INCANT_RECONCILE_INTERVAL_SECONDS`` — so post-boot drift is caught too) is pure
+detection: it reports orphan commits, DB versions with no file, and unvalidated `main`
+tips left by a rolled-back ``commit_draft`` outer transaction. Its result is recorded on
+the AppContext, exported as ``incant_reconcile_*`` gauges, and folded into /healthz —
+WITHOUT flipping readiness, because a drifted node still serves correctly from the last
+validated SHAs (§3 "git owns content, the DB owns state"; §5 "Validation first").
+
+Every direction logs, and each sweep emits a one-line summary.
 """
 
 from __future__ import annotations

@@ -203,6 +203,53 @@ function _showKeyModal(key) {
     <div class="modal-actions"><button class="btn primary" data-act="closeModal">Done</button></div>`);
 }
 
+// ── environments (admin) ─────────────────────────────────────────────
+// Full lifecycle: add, rename, lock/unlock, remove. Admin-only (canRole("admin") gates the
+// nav link; the server enforces it too). The `default` env can't be renamed or removed.
+function envCardHtml(e) {
+  const badges = [
+    e.protected ? `<span class="pill warn" title="Locked — publishing here asks you to type the name to confirm">🔒 Locked</span>` : "",
+    e.track_tip ? `<span class="pill live" title="Valid saves publish automatically in this environment">Follows latest edits</span>` : "",
+    e.default ? `<span class="pill acc" title="Serves API requests that don't name an environment">Default</span>` : "",
+  ].filter(Boolean).join(" ");
+  const lockBtn = e.protected
+    ? `<button class="btn" data-act="envUnlock" data-env="${esc(e.id)}">Unlock</button>`
+    : `<button class="btn" data-act="envLock" data-env="${esc(e.id)}">Lock</button>`;
+  const renameBtn = e.default
+    ? `<button class="btn" disabled aria-disabled="true" title="The default environment can't be renamed — it would orphan the serving default">Rename</button>`
+    : `<button class="btn" data-act="envRename" data-env="${esc(e.id)}" data-protected="${e.protected ? "1" : ""}">Rename</button>`;
+  const deleteBtn = e.default
+    ? `<button class="btn" disabled aria-disabled="true" title="The default environment can't be removed — point the default elsewhere first">Remove</button>`
+    : `<button class="btn danger" data-act="envDelete" data-env="${esc(e.id)}">Remove</button>`;
+  return `<div class="card pad">
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:14px;font-weight:700" class="mono">${esc(e.id)}</span>
+      ${badges}
+      <div class="grow"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">${renameBtn}${lockBtn}${deleteBtn}</div></div></div>`;
+}
+
+async function screenEnvironments() {
+  const main = el("main");   // capture before any await (Issue B: stale screens write a detached node)
+  let d;
+  try {
+    d = await GET(`/mgmt/envs`);
+  } catch (e) {
+    main.innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Environments</span></div>
+      <div class="empty">${e.status === 403 ? "Admin access required to manage environments." : esc(errText(e))}</div></div>`;
+    return;
+  }
+  const envs = d.environments || [];
+  const cards = envs.map(envCardHtml).join("") || '<div class="empty">No environments yet.</div>';
+  main.innerHTML = `<div class="screen">
+    <div class="h1row"><span class="h1 sm serif">Environments</span>
+      <span class="sub">where prompts get published</span>
+      <div class="grow"></div>
+      <button class="btn primary" data-act="newEnv">+ New environment</button></div>
+    <div style="display:flex;flex-direction:column;gap:12px">${cards}</div>
+    <div style="font-size:11px;color:var(--faint);margin-top:14px">Locking an environment means publishing here asks you to type its name to confirm. “Follows latest edits” publishes valid saves automatically. The default environment serves API requests that don't name one — it can't be renamed or removed.</div></div>`;
+}
+
 function renderPlayResult(r, pinned) {
   const matched = typeof r.matched_rule === "string"
     ? r.matched_rule : `${r.matched_rule.scope}:${r.matched_rule.id}`;

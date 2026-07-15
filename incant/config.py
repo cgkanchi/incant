@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     # (including "make live") propagates to every replica in < 2 s.
     control_poll_seconds: float = 2.0
 
+    # Periodic git↔DB main-commit drift check interval (seconds). `reconcile_main_commits`
+    # runs once at boot and then on this cadence (full mode) so governance drift — an
+    # unvalidated `main` tip or an orphan commit left by a publish whose outer DB
+    # transaction rolled back after `main` moved (§3 "git owns content, the DB owns
+    # state"; §5 "Validation first") — stays visible in metrics and /healthz instead of
+    # being a boot-only log line. Detect-and-log only: it NEVER flips readiness (a drifted
+    # node still serves correct content from the last VALIDATED SHAs).
+    reconcile_interval_seconds: float = 3600.0
+
     # Failed-auth throttling: per-client-IP sliding window over FAILED bearer auths.
     # After `limit` failures within `window` seconds, that IP gets 429 (Retry-After)
     # until the window drains. Successful auth is never throttled. limit=0 disables.

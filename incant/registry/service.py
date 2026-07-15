@@ -7,10 +7,11 @@ pointer or rule.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -18,6 +19,8 @@ from .. import models
 from ..core import ExtractedVars, extract
 from ..gitstore import ContentStore, GitStore, validate_source
 from ..gitstore.store import ConcurrentUpdate
+
+log = logging.getLogger("incant.registry")
 
 
 class RegistryError(Exception):
@@ -223,9 +226,14 @@ class RegistryService:
             raise RegistryError(f"draft {draft_id!r} is already {d.status}")
         d.status = "discarded"
         self.s.flush()
-        # Drop the ref after the status flush (see commit_draft). Discard's end-state
-        # intent is "gone", so a residual open→refless window is repaired to the same
-        # place by the sweep.
+        # Unlike commit_draft, discard deletes the ref INLINE (not deferred to
+        # after_commit) on purpose: the two operations have opposite failure intents.
+        # commit_draft defers because a failed outer commit must leave the user's draft
+        # RECOVERABLE (ref + open row intact). Discard's intent is "gone", so if the outer
+        # commit fails after this delete, the draft row rolls back to open but its ref is
+        # already gone — and the boot sweep's direction 2 (reconcile_drafts: live row, no
+        # ref → discard) converges it right back to the intended end-state. A failure here
+        # therefore strands NOTHING valued, so deferral would buy no safety.
         self.git.delete_draft(draft_id)
         return d
 
@@ -411,18 +419,49 @@ class RegistryService:
 
         d.status = "committed"
         self.s.flush()
-        # Delete the draft ref only after the DB rows are staged, so a *flush* failure
-        # here leaves the draft fully intact — nothing to compensate. Note the asymmetry
-        # once we pass this line, though: commit_version has already advanced `main`, but
-        # the CommitValidation row above is only *staged*, not yet committed. If the
-        # *outer* transaction still fails after this point, that validation row — and the
-        # version-row/status flip — roll back WITH it, leaving an UNVALIDATED commit on
-        # `main` that no CommitValidation row describes (serving keeps using the last
-        # validated SHA; the new tip is NOT "already a validated SHA"). That drift is not
-        # silently repaired: `reconcile_main_commits` detects the row-less tip at next boot
-        # (LOUD log — a human re-validates/re-publishes or rolls back the git commit), and
-        # the now-refless open draft is discarded by the draft sweep (reconcile_drafts).
-        self.git.delete_draft(draft_id)
+        # DEFER the draft-ref deletion until AFTER the OUTER DB transaction commits.
+        #
+        # The DB rows above (CommitValidation + version-row + the status→committed flip)
+        # are only *staged* here, not yet durable — the request-scoped dependency
+        # (server/deps.get_session, db.session_scope) commits later. Deleting the ref
+        # inline, mid-transaction, was the hazard: if that outer commit then FAILED, the
+        # rows rolled back (draft goes back to "open") but the ref was already gone, so at
+        # the next boot the reconcile sweep saw an open draft with no ref and discarded it
+        # — silently stranding recoverable user work.
+        #
+        # Instead we register a one-shot ``after_commit`` listener bound to this session.
+        # It fires only once the outer transaction has actually committed, so the ordering
+        # is now: DB durable → THEN drop the ref. Consequences:
+        #   * Outer commit SUCCEEDS → ref deleted, draft is "committed": the normal happy
+        #     path, unchanged from the caller's view.
+        #   * Outer commit FAILS → the listener never fires, so the draft ref AND the
+        #     still-"open" draft row both survive the rollback: the user's work is fully
+        #     recoverable and the draft stays editable. The only residue is an UNVALIDATED
+        #     commit on `main` (commit_version already advanced it) that no CommitValidation
+        #     row describes — serving keeps using the last validated SHA, and
+        #     `reconcile_main_commits` surfaces the row-less tip (metrics + /healthz + LOUD
+        #     log; a human re-publishes or rolls back the git commit).
+        #   * Deletion itself fails after a good commit → we only log; the draft row is now
+        #     "committed", so the leftover ref is an orphan that the boot sweep's direction 1
+        #     (`reconcile_drafts`: ref with no live row → delete) cleans up. This is the
+        #     deliberate contract — NOT a full outbox/saga (see reconcile.py's docstring).
+        #
+        # We do NOT call ``event.remove`` from inside the listener: SQLAlchemy dispatches
+        # ``after_commit`` while iterating the listener deque, and removing mid-iteration
+        # raises "deque mutated during iteration". ``once=True`` is the safe one-shot.
+        draft_ref_id = draft_id
+
+        def _drop_draft_ref(session: Session) -> None:
+            try:
+                self.git.delete_draft(draft_ref_id)
+            except Exception:  # pragma: no cover - best-effort post-commit cleanup
+                log.warning(
+                    "commit_draft: deferred draft-ref delete for %s failed after commit; "
+                    "the draft row is 'committed', so the leftover ref is an orphan that "
+                    "the boot sweep (reconcile_drafts) removes.", draft_ref_id,
+                )
+
+        event.listen(self.s, "after_commit", _drop_draft_ref, once=True)
 
         # Warm the content cache for the freshly-validated SHA.
         if result.ok:

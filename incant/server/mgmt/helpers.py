@@ -8,7 +8,7 @@ from collections import defaultdict
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from ... import models
 from ...core import extract
@@ -16,6 +16,15 @@ from ..auth import _IMPLIES, AuthError, Identity
 from ...service import AppContext
 
 ROLES = list(_IMPLIES)  # renderer → admin, canonical order
+
+# Newest-K validated commits kept per (prompt, version) in the overview's bulk load. Only
+# the tip and the live pointer's distance-from-tip are ever read, and the UI copy behind
+# that distance ("N edits waiting") saturates long before 50 — a live pointer more than K
+# validated commits behind the tip displays as the honest cap ("50+ edits waiting"
+# territory), so there is no reason to materialise the full history. See
+# `_tip_ahead_from_map`: with the window in force, an ancient live_sha absent from the
+# (capped) list yields exactly K.
+_OVERVIEW_TIP_CAP = 50
 
 
 def _project_of(prompt_id: str) -> str:
@@ -84,25 +93,46 @@ def _current_live(session, env_id, prompt_id, version) -> models.PointerMove | N
 # friends still use them for a single prompt's detail page.
 
 def _validated_by_version(session) -> dict[tuple[str, int], list[str]]:
-    """Every valid commit for every (prompt, version), newest-first — the bulk analogue
-    of ``_validated_newest_first``. Same ordering, so a slice keyed by (prompt, version)
-    is byte-for-byte the per-call helper's result and ``_tip_ahead_from_map`` yields the
-    identical index."""
-    rows = session.execute(
-        select(models.CommitValidation)
+    """The newest ``_OVERVIEW_TIP_CAP`` valid commits for every (prompt, version),
+    newest-first — the bulk analogue of ``_validated_newest_first``, WINDOWED.
+
+    Same ordering as the per-call helper, so a slice keyed by (prompt, version) is
+    byte-for-byte its result *within the window* and ``_tip_ahead_from_map`` yields the
+    identical index for any live pointer within K validated commits of the tip. Beyond
+    that the list is capped at K — an honest cap, not a scan: `_tip_ahead_from_map`
+    returns K for a live_sha that has fallen off the window, which the UI shows as the
+    "50+ edits waiting" territory.
+
+    A window function (``row_number() OVER (PARTITION BY prompt,version ORDER BY newest)``,
+    supported on SQLite ≥3.25 and Postgres) bounds the per-version work to K rows rather
+    than scanning the entire validation history on every overview call."""
+    rn = func.row_number().over(
+        partition_by=(models.CommitValidation.prompt_id, models.CommitValidation.version_number),
+        order_by=(models.CommitValidation.validated_at.desc(), models.CommitValidation.id.desc()),
+    ).label("rn")
+    ranked = (
+        select(models.CommitValidation.prompt_id, models.CommitValidation.version_number,
+               models.CommitValidation.sha, rn)
         .where(models.CommitValidation.status == "valid")
-        .order_by(models.CommitValidation.validated_at.desc(), models.CommitValidation.id.desc())
-    ).scalars()
+        .subquery()
+    )
+    rows = session.execute(
+        select(ranked.c.prompt_id, ranked.c.version_number, ranked.c.sha)
+        .where(ranked.c.rn <= _OVERVIEW_TIP_CAP)
+        .order_by(ranked.c.prompt_id, ranked.c.version_number, ranked.c.rn)
+    ).all()
     out: dict[tuple[str, int], list[str]] = defaultdict(list)
-    for r in rows:
-        out[(r.prompt_id, r.version_number)].append(r.sha)
+    for pid, ver, sha in rows:            # rn-ascending == newest-first within each key
+        out[(pid, ver)].append(sha)
     return out
 
 
 def _tip_ahead_from_map(shas: list[str], live_sha: str) -> int:
     """``_tip_ahead`` against a pre-fetched newest-first SHA list rather than a per-call
-    query. Replicates the per-call logic exactly: distance of the live SHA from the tip,
-    the full count if the live SHA isn't among the validated commits, 0 if none exist."""
+    query. Distance of the live SHA from the tip, or — when the live SHA isn't in the list
+    — the list length, 0 if none exist. With ``_validated_by_version`` now windowed to
+    ``_OVERVIEW_TIP_CAP``, that length branch is the deliberate cap: a live pointer more
+    than K validated commits behind the tip reads as exactly K, never a larger true index."""
     if live_sha in shas:
         return shas.index(live_sha)
     return len(shas) if shas else 0
@@ -110,17 +140,22 @@ def _tip_ahead_from_map(shas: list[str], live_sha: str) -> int:
 
 def _current_live_bulk(session, env_id) -> dict[tuple[str, int], models.PointerMove]:
     """The current (newest) live pointer for every (prompt, version) in one env, one
-    query — the bulk analogue of ``_current_live``. Rows arrive newest-first, so the
-    first row seen per key is the live one (``setdefault`` keeps it)."""
-    rows = session.execute(
-        select(models.PointerMove)
+    query — the bulk analogue of ``_current_live``. A window function picks
+    ``row_number() == 1`` (the newest move) per (prompt, version) in the database, so we
+    materialise one row per key instead of scanning every historical move and reducing in
+    Python."""
+    rn = func.row_number().over(
+        partition_by=(models.PointerMove.prompt_id, models.PointerMove.version_number),
+        order_by=(models.PointerMove.moved_at.desc(), models.PointerMove.id.desc()),
+    ).label("rn")
+    ranked = (
+        select(models.PointerMove, rn)
         .where(models.PointerMove.environment_id == env_id)
-        .order_by(models.PointerMove.moved_at.desc(), models.PointerMove.id.desc())
-    ).scalars()
-    out: dict[tuple[str, int], models.PointerMove] = {}
-    for r in rows:
-        out.setdefault((r.prompt_id, r.version_number), r)
-    return out
+        .subquery()
+    )
+    live = aliased(models.PointerMove, ranked)
+    rows = session.execute(select(live).where(ranked.c.rn == 1)).scalars().all()
+    return {(r.prompt_id, r.version_number): r for r in rows}
 
 
 def _open_draft_counts(session) -> dict[str, int]:

@@ -156,6 +156,9 @@ async function screenDraft() {
     // Targeting data feeds the ad-hoc context form: the flags rules actually
     // check for this prompt (and its includes), with their candidate values. Retries
     // scoped to this prompt's project on a 403 so a project-scoped editor still gets them.
+    // On a limited/unavailable result `rules` is [] and the form simply offers no flag
+    // suggestions (the editor types them by hand) — a graceful degrade, not a misleading
+    // "no rules" claim, so no warning strip is needed here.
     fetchEnvRules(State.env, pid),
     GET(`/mgmt/envs/${enc(State.env)}/segments`).catch(() => ({ segments: [] })),
   ]);

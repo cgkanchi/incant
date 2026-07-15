@@ -108,6 +108,8 @@ function sidebar() {
       <span class="gl">◷</span><span>Audit</span></a>` : ""}
     ${canRole("admin") ? `<a class="nav ${State.route.name === "access" ? "active" : ""}" href="#/access" data-act="go" data-hash="#/access">
       <span class="gl">⚿</span><span>Access</span></a>` : ""}
+    ${canRole("admin") ? `<a class="nav ${State.route.name === "envs" ? "active" : ""}" href="#/envs" data-act="go" data-hash="#/envs">
+      <span class="gl">❖</span><span>Environments</span></a>` : ""}
     <div class="spacer"></div>
     ${pid ? `<button class="tweak-btn" data-act="toggleTweak"><span>✦</span> How to publish</button>` : ""}
     <div class="envbar">
@@ -196,7 +198,11 @@ async function loadTweakData(pid) {
       GET(`/mgmt/prompts/${enc(pid)}/drafts`).catch(() => ({ drafts: [] })),
       fetchEnvRules(env, pid),   // retries scoped to the prompt's project on a 403
     ]);
-    _tweak.data = { versions: dv.versions || [], drafts: dl.drafts || [], rules: rd.rules || [] };
+    // fetchEnvRules resolves (never throws) even on an outage — treat an unavailable rule
+    // list as the panel's existing error state, so we fall back to the static steps rather
+    // than computing the "next step" from a rule set we couldn't actually read.
+    if (rd.status === "unavailable") _tweak.data = { error: true };
+    else _tweak.data = { versions: dv.versions || [], drafts: dl.drafts || [], rules: rd.rules || [] };
   } catch (e) {
     _tweak.data = { error: true };
   } finally {

@@ -31,7 +31,7 @@ from .core import (
 )
 from .db import init_db, session_scope
 from .gitstore import ContentStore, GitStore
-from .registry import RegistryService
+from .registry import MainReconcileResult, RegistryService
 from .targeting import TargetingService, build_snapshot
 
 log = logging.getLogger("incant.service")
@@ -78,6 +78,11 @@ class AppContext:
     # the poller last saw an outage, so warm snapshots are served frozen (§10 "rules
     # freeze") with ``stale_rules: true`` until a healthy poll clears it.
     _db_healthy: bool = True
+    # Latest git↔DB main-commit drift result (``reconcile_main_commits``), set by the boot
+    # sweep and the periodic reconcile loop (server.app). Read by /healthz to SURFACE drift
+    # without flipping readiness (§3, §5) — see :meth:`record_reconcile`. None until the
+    # first sweep runs (e.g. serve replicas, which never sweep main).
+    last_reconcile: MainReconcileResult | None = None
 
     def __post_init__(self) -> None:
         self.git = GitStore(self.settings.repo_dir())
@@ -217,6 +222,19 @@ class AppContext:
         else:
             self._snapshots.pop(env_id, None)
 
+    # ── governance drift (observability, never gates serving) ─────────
+
+    def record_reconcile(self, result: MainReconcileResult) -> None:
+        """Record the latest git↔DB main-commit drift result and publish it to the
+        Prometheus gauges. Called by the boot sweep and the periodic reconcile loop
+        (server.app). The stored value is read by /healthz to surface drift WITHOUT
+        flipping readiness — a drifted node still serves correctly from the last VALIDATED
+        SHAs (§5), so taking it out of rotation would turn a governance alarm into an
+        outage. Lazy import mirrors the __post_init__ idiom (server → service cycle)."""
+        self.last_reconcile = result
+        from .server.metrics import update_reconcile_metrics
+        update_reconcile_metrics(result)
+
     # ── warming ──────────────────────────────────────────────────────
 
     def _warmable(self, prompt_id: str, version: int, sha: str) -> bool:
@@ -265,6 +283,18 @@ class AppContext:
                     )
                     continue
                 raise WarmError(env_id, prompt_id, vnum, vinfo.live_sha)
+
+        # Reaching here means the §10 criterion is satisfied for every live pointer: each
+        # either warmed or has a warm previous-live fallback (the one unservable state
+        # raised WarmError above). Only NOW — after content warming for this env has
+        # succeeded — do we install the snapshot into the same cache the hot path reads
+        # (:meth:`get_snapshot`), in its ``_CachedSnapshot(rules_version, snap)`` shape.
+        # Readiness must mean "can serve THIS env with zero DB reads" (§8 "No DB per
+        # request"; §10 "the DB is never on the per-request path"): without this install
+        # the FIRST render after /readyz went green would do a cold snapshot build (a DB
+        # read), so a node that just reported ready would 503 if Postgres died the instant
+        # after. With it, that first render is a pure memory hit off already-warm content.
+        self._snapshots[env_id] = _CachedSnapshot(snap.rules_version, snap)
 
     # ── serving ──────────────────────────────────────────────────────
 

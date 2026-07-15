@@ -105,16 +105,22 @@ function updatePromptList() { const host = el("promptList"); if (host) host.inne
 
 async function screenPrompts() {
   const main = el("main");   // capture before any await (a superseded screen writes a detached node)
-  // The env-wide rule list needs env-wide viewer. A project-scoped viewer 403s here — we
-  // distinguish that (rules === null → "access limited") from a genuinely empty rule set,
-  // so an empty list is never presented as "nothing is being tested". `.then(ok, err)`
-  // keeps the two fetches concurrent while mapping a 403 to null.
-  const [data, rules] = await Promise.all([
+  // The env-wide rule list needs env-wide viewer. We resolve it to an explicit tri-state so
+  // a rule list we couldn't read is never presented as "nothing is being tested":
+  //   available   — the real list.
+  //   limited     — a 403: access is scoped to specific projects (rule list HIDDEN).
+  //   unavailable — a network error or 5xx: testing status is UNKNOWN (an outage).
+  // `rules` is the array when available, else null; both non-available states suppress the
+  // testing pills, but their MESSAGING differs (quiet access note vs. a warning strip).
+  // `.then(ok, err)` keeps the two fetches concurrent while mapping the failure to the state.
+  const [data, rulesRes] = await Promise.all([
     GET(`/mgmt/overview?environment=${enc(State.env)}`),
     GET(`/mgmt/envs/${enc(State.env)}/rules`).then(
-      (rd) => rd.rules || [],
-      (e) => (e && e.status === 403 ? null : [])),
+      (rd) => ({ state: "available", rules: rd.rules || [] }),
+      (e) => ({ state: e && e.status === 403 ? "limited" : "unavailable", rules: null })),
   ]);
+  const rulesState = rulesRes.state;
+  const rules = rulesRes.rules;   // array when available, null when limited/unavailable
   // Testing status is unknowable without the rule list — don't leave the user stuck on a
   // "Being tested" filter that can't be evaluated.
   if (rules === null && _promptsFilter.key === "testing") _promptsFilter.key = "all";
@@ -125,16 +131,25 @@ async function screenPrompts() {
   for (const [k] of PROMPT_FILTERS) counts[k] = allPrompts.filter((p) => promptMatchesFilter(p, k, rules)).length;
   const chips = PROMPT_FILTERS.map(([k, lbl]) => {
     // Without the rule list the "Being tested" count is unknowable — render that one chip
-    // disabled + explained rather than showing a false "(0)".
+    // disabled + explained rather than showing a false "(0)". The explanation differs by
+    // state: access-limited (403) is HIDDEN on purpose; unavailable (outage) is UNKNOWN.
     const hideTesting = k === "testing" && rules === null;
     const on = k === _promptsFilter.key && !hideTesting;
     const count = hideTesting ? "" : ` (${counts[k]})`;
+    const disabledTitle = rulesState === "unavailable"
+      ? "Couldn't load targeting — testing status is unknown right now"
+      : "Testing status is hidden — your access is limited to specific projects";
     const extra = hideTesting
-      ? ' disabled aria-disabled="true" title="Testing status is hidden — your access is limited to specific projects"' : "";
+      ? ` disabled aria-disabled="true" title="${esc(disabledTitle)}" aria-label="${esc(lbl + " — " + disabledTitle)}"` : "";
     return `<button type="button" class="chip btn-bare ${on ? "active" : ""}"${extra} aria-pressed="${on}" data-act="promptFilter" data-key="${k}">${esc(lbl)}${count}</button>`;
   }).join("");
-  const accessNote = rules === null
-    ? `<div style="font-size:11.5px;color:var(--faint);margin:-10px 0 16px">Testing status hidden — your access is limited to specific projects.</div>` : "";
+  // Outage → a visible warning strip (status unknown). 403 → the quiet access note (hidden
+  // on purpose). Available → nothing.
+  const accessNote = rulesState === "unavailable"
+    ? rulesUnavailableNote(rulesState)
+    : rulesState === "limited"
+      ? `<div style="font-size:11.5px;color:var(--faint);margin:-10px 0 16px">Testing status hidden — your access is limited to specific projects.</div>`
+      : "";
 
   main.innerHTML = `<div class="screen">
     <div class="h1row">

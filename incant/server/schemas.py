@@ -197,6 +197,13 @@ class EnvSettingsRequest(BaseModel):
     track_tip: Optional[bool] = None
 
 
+class RenameEnvRequest(BaseModel):
+    # Rename an environment: move ALL of its targeting rows to `new_id` in one
+    # transaction. A locked (protected) env requires `confirm` to echo the CURRENT id.
+    new_id: str
+    confirm: Optional[str] = None  # locked env: must echo the current env id
+
+
 class KeyRequest(BaseModel):
     principal_name: str
     role: str = "renderer"

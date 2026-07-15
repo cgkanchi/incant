@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from ... import models
 from ...registry import ConcurrencyError, RegistryError, ReviewRequired, StaleDraftWrite
-from ..auth import Identity
+from ..auth import ANY_ENVIRONMENT, Identity
 from ..deps import app_context, get_session, identity
 from ...service import AppContext, ServingError
 from ..schemas import (
@@ -60,7 +60,10 @@ def get_draft(
         d = reg.get_draft(draft_id)
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
-    _require(ident, "viewer", project=_project_of(d.prompt_id))
+    # A draft is prompt content, not an environment-divisible fact (it carries no env), so
+    # an env-scoped project viewer reads it — ANY_ENVIRONMENT waives only the env dimension
+    # while keeping the project check (see auth.ANY_ENVIRONMENT).
+    _require(ident, "viewer", project=_project_of(d.prompt_id), environment=ANY_ENVIRONMENT)
     return _draft_payload(app, reg, d)
 
 
@@ -100,7 +103,9 @@ def render_draft(
         d = reg.get_draft(draft_id)
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
-    _require(ident, "viewer", project=_project_of(d.prompt_id))
+    # Env-agnostic read of draft content (rendering names an env only for the preview);
+    # ANY_ENVIRONMENT lets an env-scoped project viewer render it.
+    _require(ident, "viewer", project=_project_of(d.prompt_id), environment=ANY_ENVIRONMENT)
     source = reg.draft_content(draft_id)
     flags, variables = req.flags, req.variables
     if req.test_context:
@@ -132,7 +137,8 @@ def diff_draft(
         d = reg.get_draft(draft_id)
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
-    _require(ident, "viewer", project=_project_of(d.prompt_id))
+    # Diffing a draft is a read of prompt content — env-agnostic (see auth.ANY_ENVIRONMENT).
+    _require(ident, "viewer", project=_project_of(d.prompt_id), environment=ANY_ENVIRONMENT)
     # Default target is the draft's own version at its base — "what did I change".
     v = against_version if against_version is not None else d.version_number
     sha = against_sha if against_sha is not None else d.base_sha
@@ -223,8 +229,9 @@ def get_comments(
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
     # Viewer is the loosest sensible role: reviewers who can see a draft may comment,
-    # even without editor on the project.
-    _require(ident, "viewer", project=_project_of(d.prompt_id))
+    # even without editor on the project. Reading the thread is env-agnostic prompt content,
+    # so ANY_ENVIRONMENT lets an env-scoped project viewer read it too.
+    _require(ident, "viewer", project=_project_of(d.prompt_id), environment=ANY_ENVIRONMENT)
     return {"comments": [_comment_payload(c) for c in reg.list_comments(draft_id)]}
 
 
@@ -240,6 +247,10 @@ def create_comment(
         d = reg.get_draft(draft_id)
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
+    # POSTING a comment is a WRITE, so deliberately NOT env-agnostic (unlike the GET reads
+    # above): it keeps the plain project-viewer requirement without ANY_ENVIRONMENT, so an
+    # env-scoped viewer can read the thread but not add to it. Widening writes to env-scoped
+    # principals is a policy call left untouched here.
     _require(ident, "viewer", project=_project_of(d.prompt_id))
     # A committed/discarded draft is settled — no further review conversation on it.
     if d.status in ("committed", "discarded", "abandoned"):
@@ -322,7 +333,9 @@ def list_drafts(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "viewer", project=_project_of(prompt_id))
+    # Listing a prompt's open drafts is env-agnostic (drafts carry no env); ANY_ENVIRONMENT
+    # lets an env-scoped project viewer see them (see auth.ANY_ENVIRONMENT).
+    _require(ident, "viewer", project=_project_of(prompt_id), environment=ANY_ENVIRONMENT)
     reg = app.registry(session, ident.name)
     drafts = session.execute(
         select(models.Draft).where(

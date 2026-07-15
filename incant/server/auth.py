@@ -56,13 +56,39 @@ class Binding:
     environment_id: Optional[str]
 
 
+class _AnyEnvironment:
+    """Sentinel accepted by :meth:`Identity.has` / :meth:`Identity.require` as the
+    ``environment=`` argument: match a binding *regardless* of the environment it is
+    scoped to. Passed as ``environment=ANY_ENVIRONMENT``, ``has()`` skips the environment
+    comparison entirely, so a binding scoped to (project=A, env=prod) satisfies a check for
+    project A — while an instance-wide or project-only binding still matches, and a project
+    MISMATCH still fails.
+
+    Use it ONLY for viewer-level reads of prompt content that isn't environment-divisible —
+    variables, test contexts, source/rendered diffs, draft content. Those describe the
+    prompt itself, so an env-scoped project viewer legitimately reads them even though their
+    binding names one environment; requiring the concrete env (the default) 403s them at a
+    screen the overview already let them reach. Write paths (editor/operator/releaser) must
+    keep passing a concrete environment so environment scoping stays enforced where mutations
+    actually happen.
+    """
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # keeps require()'s ".../*" error message readable
+        return "*"
+
+
+ANY_ENVIRONMENT = _AnyEnvironment()
+
+
 @dataclass
 class Identity:
     principal_id: str
     name: str
     bindings: list  # of Binding (cache) or models.RoleBinding — both duck-type here
 
-    def has(self, role: str, *, project: str | None = None, environment: str | None = None) -> bool:
+    def has(self, role: str, *, project: str | None = None,
+            environment: "str | _AnyEnvironment | None" = None) -> bool:
         for b in self.bindings:
             if role not in _IMPLIES.get(b.role, set()):
                 continue
@@ -71,13 +97,21 @@ class Identity:
             # check — otherwise a project operator gains instance-wide power.
             if b.project_id is not None and b.project_id != project:
                 continue
-            if b.environment_id is not None and b.environment_id != environment:
+            # An environment-scoped binding normally satisfies only checks for THAT env.
+            # The one exception is the ANY_ENVIRONMENT sentinel: the caller is reading
+            # something that isn't env-divisible, so we skip the env comparison and a
+            # binding scoped to any environment matches. The project check above still
+            # applies, so scoping is not lost — only the env dimension is waived.
+            if (b.environment_id is not None
+                    and environment is not ANY_ENVIRONMENT
+                    and b.environment_id != environment):
                 continue
             # An instance-scoped binding (both None) covers everything.
             return True
         return False
 
-    def require(self, role: str, *, project: str | None = None, environment: str | None = None) -> None:
+    def require(self, role: str, *, project: str | None = None,
+                environment: "str | _AnyEnvironment | None" = None) -> None:
         if not self.has(role, project=project, environment=environment):
             raise AuthError(403, f"requires {role} on "
                                  f"{project or '*'}/{environment or '*'}")
@@ -132,6 +166,13 @@ def needs_upgrade(stored: str, pepper: str | None = None) -> bool:
 # key the cache by the *stored* prefix and, at auth time, probe both lengths.
 _PREFIX_LEN = 20
 _LEGACY_PREFIX_LEN = 16
+
+# Bound on the on-miss negative cache (see AuthCache). A miss whose prefix is confirmed
+# absent in the DB is remembered here so the repeat costs zero DB work; the cap keeps a
+# distributed invalid-credential flood from growing the set without limit. On overflow we
+# simply clear it (a rare full-probe burst then re-pays one indexed query per prefix, never
+# unbounded memory) rather than track per-entry ages for a set that is pure best-effort.
+_NEG_CACHE_MAX = 4096
 
 
 def key_prefix(raw: str) -> str:
@@ -266,9 +307,18 @@ class AuthCache:
     The whole (small) key set is snapshotted from the DB. The periodic TTL reload runs
     in the BACKGROUND — :meth:`refresh`, driven by the control-plane poll loop — so it
     never lands on a request (§8 "No DB per request"). The request path (:meth:`identify`)
-    only ever reaches the DB to (a) cold-load an empty cache or (b) do one throttled
-    reload on a miss, so a key just issued on another replica still authenticates. If the
-    DB is unreachable we keep serving the last-known-good table.
+    only ever reaches the DB to (a) cold-load an empty cache or (b) probe a miss, so a key
+    just issued on another replica still authenticates. If the DB is unreachable we keep
+    serving the last-known-good table.
+
+    A miss is deliberately *cheap*. An unknown key prefix used to trigger the full
+    three-table reload (once per ``min_refresh``), so distributed invalid-credential
+    traffic could sustain one whole-table SELECT×3 per second on the request path, with
+    every concurrent missing-prefix request blocked on ``_lock`` behind it. Now a miss
+    (i) short-circuits on a bounded *negative cache* of prefixes already probed-and-absent
+    (zero DB work, no lock), and otherwise (ii) runs ONE indexed lookup on the unique
+    ``api_keys.prefix`` (migration a3f1c8e29b41) — only a *hit* there (a genuinely fresh
+    key this replica hasn't snapshotted) escalates to the full reload.
     """
 
     def __init__(self, ttl: float = 5.0, min_refresh: float = 1.0) -> None:
@@ -276,15 +326,28 @@ class AuthCache:
         # prefix that is itself a prefix of a newer key) then costs one extra hash check
         # instead of a wrong 401 — we verify the full hash against each candidate.
         self._entries: dict[str, list[_KeyEntry]] = {}
+        # Prefixes probed on a miss and confirmed to have NO key row. A repeat miss on any
+        # of these 401s with zero DB work. Cleared on every _load (a full reload supersedes
+        # every prior absence verdict) and on invalidate() (an in-process issuance may have
+        # created exactly a key we cached as absent). Bounded by _NEG_CACHE_MAX.
+        self._negcache: set[str] = set()
         self._loaded = False
         self._last_refresh = 0.0
+        # Monotonic time of the last on-miss targeted probe. Gates probes GLOBALLY (one
+        # timestamp for all prefixes, mirroring the _last_refresh idiom): a burst of
+        # distinct unknown prefixes inside the window costs at most one indexed query.
+        self._last_probe = 0.0
         self._ttl = ttl
         self._min_refresh = min_refresh
         self._lock = threading.Lock()
 
     def invalidate(self) -> None:
-        """Force a reload on the next identify (after key issuance/revocation)."""
-        self._loaded = False
+        """Force a reload on the next identify (after key issuance/revocation), and drop
+        the negative cache: an in-process issuance may have minted exactly a key some
+        earlier request probed and recorded as absent, so those verdicts are now stale."""
+        with self._lock:
+            self._loaded = False
+            self._negcache.clear()
 
     def _load(self, session: Session) -> None:
         principals = {p.id: p.name for p in
@@ -301,6 +364,9 @@ class AuthCache:
                 bindings=tuple(bindings.get(k.principal_id, ())),
             ))
         self._entries = dict(entries)
+        # A full reload is the ground truth again: every "probed and absent" verdict is
+        # superseded. Always called under _lock (refresh / _maybe_refresh), so this is safe.
+        self._negcache.clear()
         self._loaded = True
         self._last_refresh = time.monotonic()
 
@@ -332,35 +398,100 @@ class AuthCache:
                 return
             self._load(session)
 
-    def _maybe_refresh(self, session: Session, raw: str) -> None:
-        # Per-request refresh is deliberately minimal — the TTL-elapsed reload moved to
-        # the background :meth:`refresh` (§8). Only two conditions still touch the DB from
-        # a request: (a) a cold cache (nothing loaded yet — we cannot authenticate anyone
-        # until we have), and (b) a throttled reload on a MISS, so a key freshly issued on
-        # this or another replica is picked up promptly rather than waiting for the poll.
-        def _need() -> bool:
-            if not self._loaded:
-                return True
-            present = (raw[:_PREFIX_LEN] in self._entries
-                       or raw[:_LEGACY_PREFIX_LEN] in self._entries)
-            age = time.monotonic() - self._last_refresh
-            return not present and age >= self._min_refresh
+    def _probe_prefixes(self, raw: str) -> list[str]:
+        """The distinct stored-prefix candidates for `raw` — the 20-char store length and,
+        for legacy rows, the 16-char one. These are exactly the keys we look up in
+        :attr:`_entries`, probe in the DB, and record in :attr:`_negcache`."""
+        prefixes = [raw[:_PREFIX_LEN]]
+        if raw[:_LEGACY_PREFIX_LEN] != raw[:_PREFIX_LEN]:  # equal only for very short raw
+            prefixes.append(raw[:_LEGACY_PREFIX_LEN])
+        return prefixes
 
-        if not _need():
+    def _negcache_add(self, prefixes: list[str]) -> None:
+        """Record `prefixes` as confirmed-absent. Caller holds :attr:`_lock`. On overflow
+        we clear the whole set rather than grow it without bound (see :data:`_NEG_CACHE_MAX`)
+        — a distributed miss flood must cost bounded memory, not unbounded."""
+        if len(self._negcache) >= _NEG_CACHE_MAX:
+            self._negcache.clear()
+        self._negcache.update(prefixes)
+
+    def _maybe_refresh(self, session: Session, raw: str) -> None:
+        # Per-request DB contact is deliberately minimal — the TTL-elapsed whole-table
+        # reload moved to the background :meth:`refresh` (§8). What remains here:
+        #
+        #   (a) COLD cache — nothing loaded yet, so we cannot authenticate anyone until the
+        #       first full load lands. This is the one unconditional request-path read; a
+        #       cold cache with the DB down is the only 503.
+        #   (b) WARM hit — either probe length lands in a loaded bucket; the verify loop in
+        #       identify() takes over with no DB read.
+        #   (c) WARM miss — a bounded negative cache and a single indexed probe keep this
+        #       cheap: only a genuinely-fresh key (a probe HIT) pays for the full reload, so
+        #       a key issued on another replica is still picked up promptly, while a flood
+        #       of unknown prefixes can no longer sustain one whole-table reload per second.
+        if not self._loaded:
+            with self._lock:
+                if not self._loaded:
+                    try:
+                        self._load(session)
+                    except SQLAlchemyError:
+                        # DB down: keep the last-known-good table so serving continues.
+                        try:
+                            session.rollback()
+                        except SQLAlchemyError:
+                            pass
+                        if not self._loaded:
+                            raise AuthError(503, "auth cache cold and database unreachable")
             return
+
+        # (b) Warm hit — no DB, no lock.
+        if raw[:_PREFIX_LEN] in self._entries or raw[:_LEGACY_PREFIX_LEN] in self._entries:
+            return
+
+        # (c) Warm miss. Two lock-free short-circuits before any DB work:
+        #   - the negative cache already recorded this prefix as absent → 401 fast. The
+        #     lock-free `in` races benignly with a concurrent clear (worst case: one
+        #     needless probe, never a wrong 401 — a false positive is impossible because
+        #     only a confirmed-absent prefix is ever recorded).
+        #   - the global probe throttle hasn't elapsed → skip the DB. Crucially this miss
+        #     is NOT negative-cached (we never confirmed absence), so it earns a real probe
+        #     once the window passes; a burst of distinct probes inside the window costs at
+        #     most the single probe already in flight.
+        probes = self._probe_prefixes(raw)
+        if any(p in self._negcache for p in probes):
+            return
+        if (time.monotonic() - self._last_probe) < self._min_refresh:
+            return
+
         with self._lock:
-            if not _need():
+            # Re-check under the lock: another thread may have loaded the table, recorded
+            # the absence, or just consumed the probe window while we waited.
+            if raw[:_PREFIX_LEN] in self._entries or raw[:_LEGACY_PREFIX_LEN] in self._entries:
                 return
+            if any(p in self._negcache for p in probes):
+                return
+            if (time.monotonic() - self._last_probe) < self._min_refresh:
+                return
+            self._last_probe = time.monotonic()  # advance the global gate for this probe
             try:
-                self._load(session)
+                found = session.execute(
+                    select(models.ApiKey.id).where(models.ApiKey.prefix.in_(probes))
+                ).first()
             except SQLAlchemyError:
-                # DB down: keep the last-known-good table so serving continues.
+                # DB down mid-probe: treat the key as absent so serving continues on the
+                # last-known-good table, but do NOT negative-cache it — a transient outage
+                # must not poison future lookups (mirrors the cold-load DB-down handling).
                 try:
                     session.rollback()
                 except SQLAlchemyError:
                     pass
-                if not self._loaded:
-                    raise AuthError(503, "auth cache cold and database unreachable")
+                return
+            if found is not None:
+                # A legitimately fresh key this replica hasn't snapshotted — NOW pay for the
+                # full reload (rare, correct); identify()'s verify loop then resolves it.
+                self._load(session)
+            else:
+                # Confirmed absent: remember both probe lengths so the repeat costs nothing.
+                self._negcache_add(probes)
 
     def _upgrade_hash(self, entry: _KeyEntry, raw: str) -> None:
         """Opportunistically re-hash a legacy key to `v2$` once a pepper is configured.

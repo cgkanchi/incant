@@ -122,3 +122,128 @@ def test_overview_drafts_needing_review(client):
     greet = rows_by_id()["support/greeting"]
     assert greet["open_drafts"] == 1                 # open OR approved → in-flight
     assert greet["drafts_needing_review"] == 0       # approved → not awaiting review
+
+
+# ── (project, environment)-scoped viewer: no navigable dead ends ─────
+#
+# A binding scoped to (project=support, env=prod) used to hit dead-end 403s on reads the
+# overview itself linked to: get_versions required project-only viewer (which an env-scoped
+# binding can't satisfy), the env-agnostic prompt reads did the same, and revisions/pointer
+# history required env-WIDE viewer. These pin the fixes end to end.
+
+def test_scoped_viewer_end_to_end(client):
+    # Seed a GLOBAL rule so the revisions log has an env-wide revision to EXCLUDE from the
+    # project-scoped view (the seed's beta-gets-v3/team-x-tip give the support side to INCLUDE).
+    assert client.post(
+        "/mgmt/envs/prod/rules",
+        json={"id": "glob-test", "scope": "global", "priority": 5,
+              "serve": {"label": "voice-v2"}, "comment": "global rule"},
+        headers=auth()).status_code == 200
+
+    v = make_key(client, "viewer", project="support", env="prod")
+
+    # overview — passes `environment`, so the (support, prod) viewer sees support's prompts.
+    ov = client.get("/mgmt/overview?environment=prod", headers=auth(v))
+    assert ov.status_code == 200, ov.text
+    pids = {p["prompt_id"] for proj in ov.json()["projects"] for p in proj["prompts"]}
+    assert "support/system" in pids
+
+    # get_versions — authorizes on the concrete env now, so the env-scoped viewer passes.
+    vs = client.get("/mgmt/prompts/support/system/versions?environment=prod", headers=auth(v))
+    assert vs.status_code == 200, vs.text
+    v2 = next(x for x in vs.json()["versions"] if x["version"] == 2)
+
+    # Env-AGNOSTIC prompt reads (ANY_ENVIRONMENT): variables, test contexts, source diff, drafts.
+    assert client.get("/mgmt/prompts/support/system/variables?version=2",
+                      headers=auth(v)).status_code == 200
+    assert client.get("/mgmt/prompts/support/system/test-contexts",
+                      headers=auth(v)).status_code == 200
+    diff = client.get(
+        f"/mgmt/prompts/support/system/diff?a_version=2&a_sha={v2['live_full_sha']}"
+        f"&b_version=2&b_sha={v2['tip_full_sha']}&mode=source", headers=auth(v))
+    assert diff.status_code == 200, diff.text
+    dl = client.get("/mgmt/prompts/support/system/drafts", headers=auth(v))
+    assert dl.status_code == 200, dl.text
+    assert dl.json()["drafts"], "seed leaves an open draft on support/system"
+    assert client.get(f"/mgmt/drafts/{dl.json()['drafts'][0]['id']}",
+                      headers=auth(v)).status_code == 200
+
+    # rules?project=support — the narrower door (covered in depth above; pinned live in the flow).
+    assert client.get("/mgmt/envs/prod/rules?project=support",
+                      headers=auth(v)).status_code == 200
+
+    # revisions — the env-wide door 403s, a project they can't see 403s, and the project door
+    # 200s filtered to support (its own rule revisions in, the global-rule revision out).
+    assert client.get("/mgmt/envs/prod/revisions", headers=auth(v)).status_code == 403
+    assert client.get("/mgmt/envs/prod/revisions?project=shared",
+                      headers=auth(v)).status_code == 403
+    rv = client.get("/mgmt/envs/prod/revisions?project=support", headers=auth(v))
+    assert rv.status_code == 200, rv.text
+    revs = rv.json()["revisions"]
+    for rev in revs:                                  # every kept revision names a support prompt
+        pid = (rev["snapshot"] or {}).get("prompt_id")
+        assert pid and pid.split("/", 1)[0] == "support", rev
+    assert any(rev["kind"] == "rule" and rev["rule_id"] in ("beta-gets-v3", "team-x-tip")
+               for rev in revs), "support's own rule revisions are included"
+    assert not any(rev.get("rule_id") == "glob-test" for rev in revs), \
+        "global-rule revisions are env-wide info, excluded in project mode"
+
+    # per-prompt publish history — now authorized on (prompt's project, env), not env-wide.
+    assert client.get("/mgmt/envs/prod/pointers?prompt_id=support/system&version=2",
+                      headers=auth(v)).status_code == 200
+
+    # Scoping still enforced: the SAME key can't read another project's versions or variables.
+    assert client.get("/mgmt/prompts/shared/style/language-rules/versions?environment=prod",
+                      headers=auth(v)).status_code == 403
+    assert client.get("/mgmt/prompts/shared/style/language-rules/variables?version=1",
+                      headers=auth(v)).status_code == 403
+
+
+def test_env_wide_revisions_and_history_unchanged(client):
+    # Regression pins for the unscoped callers. WITHOUT the project param, revisions still
+    # returns the full log — global-rule + segment revisions and cross-project defaults all
+    # present — and the per-prompt publish history stays readable by an env-wide viewer.
+    client.post("/mgmt/envs/prod/rules",
+                json={"id": "glob-test", "scope": "global", "priority": 5,
+                      "serve": {"label": "voice-v2"}, "comment": "global rule"},
+                headers=auth())
+    full = client.get("/mgmt/envs/prod/revisions", headers=auth()).json()["revisions"]
+    assert any(rev.get("rule_id") == "glob-test" for rev in full)     # global-rule revision kept
+    assert any(rev["kind"] == "segment" for rev in full)              # segment revision kept
+    assert any((rev["snapshot"] or {}).get("prompt_id") == "shared/style/language-rules"
+               for rev in full)                                       # cross-project default kept
+
+    # An env-wide viewer (project=None, env=prod) reads both, unchanged.
+    ew = make_key(client, "viewer", env="prod")
+    assert client.get("/mgmt/envs/prod/revisions", headers=auth(ew)).status_code == 200
+    assert client.get("/mgmt/envs/prod/pointers?prompt_id=support/system&version=2",
+                      headers=auth(ew)).status_code == 200
+
+
+# ── Identity.has: ANY_ENVIRONMENT sentinel semantics ─────────────────
+
+def test_any_environment_sentinel_semantics():
+    from incant.server.auth import ANY_ENVIRONMENT, Binding, Identity
+
+    env_scoped = Identity("p", "n", [Binding("viewer", "support", "prod")])
+    # The dead-end the sentinel fixes: a project-only check (environment defaults to None) is
+    # NOT satisfied by an env-scoped binding.
+    assert env_scoped.has("viewer", project="support") is False
+    # ANY_ENVIRONMENT waives the env dimension → the env-scoped binding now matches.
+    assert env_scoped.has("viewer", project="support", environment=ANY_ENVIRONMENT) is True
+    # It still matches its OWN concrete env and rejects a different one.
+    assert env_scoped.has("viewer", project="support", environment="prod") is True
+    assert env_scoped.has("viewer", project="support", environment="staging") is False
+    # Project MISMATCH still fails even under ANY_ENVIRONMENT — scoping isn't lost.
+    assert env_scoped.has("viewer", project="other", environment=ANY_ENVIRONMENT) is False
+
+    # An instance-wide binding (both None) covers everything, incl. ANY_ENVIRONMENT.
+    inst = Identity("p", "n", [Binding("admin", None, None)])
+    assert inst.has("viewer", project="support", environment=ANY_ENVIRONMENT) is True
+    assert inst.has("viewer", project="anything", environment="whatever") is True
+
+    # A project-only binding (no env) matches ANY and any concrete env for its project.
+    proj_only = Identity("p", "n", [Binding("viewer", "support", None)])
+    assert proj_only.has("viewer", project="support", environment=ANY_ENVIRONMENT) is True
+    assert proj_only.has("viewer", project="support", environment="prod") is True
+    assert proj_only.has("viewer", project="other", environment=ANY_ENVIRONMENT) is False

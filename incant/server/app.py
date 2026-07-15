@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import inspect, select
@@ -89,16 +89,45 @@ def _warm_all(ctx) -> bool:
     return ok
 
 
+def _prime_auth(ctx) -> bool:
+    """Prime the in-memory auth cache from the DB so readiness also means the node can
+    AUTHENTICATE with zero DB reads (§8 "No DB per request"; §10 "the DB is never on the
+    per-request path"). Without this, a node could report ready with a cold auth cache
+    and 503 the first authenticated request if Postgres died right after readiness — the
+    exact mirror of the cold-snapshot hazard warming closes. Its own short-lived session;
+    priming is a serving concern, so this runs in BOTH modes. Failure is LOGGED (never
+    swallowed) and blocks readiness exactly like a warm failure."""
+    try:
+        with session_scope() as s:
+            ctx.auth.refresh(s)  # AuthCache.refresh — force a cold load past its TTL guard
+        return True
+    except Exception:
+        log.exception("auth-cache priming failed")
+        return False
+
+
+def _boot_prime(ctx) -> bool:
+    """Everything readiness requires: every environment warmed (content + snapshot) AND
+    the auth cache primed. Both are evaluated every pass (no short-circuit) so a single
+    failure is always logged and the retry loop drives BOTH to green; readiness is their
+    AND. Per-concern isolation is preserved — `_warm_all` already isolates each env on its
+    own session so one failure can't poison the others, and auth priming has its own."""
+    warmed = _warm_all(ctx)
+    primed = _prime_auth(ctx)
+    return warmed and primed
+
+
 async def _warm_retry_loop(app: FastAPI, ctx) -> None:
-    """Re-warm in the background until it fully succeeds, then flip readiness green."""
+    """Re-prime in the background until warming AND auth priming both succeed, then flip
+    readiness green. Retries the whole readiness gate, not just warming."""
     while not getattr(app.state, "ready", False):
         await asyncio.sleep(_WARM_RETRY_SECONDS)
         try:
-            if _warm_all(ctx):
+            if _boot_prime(ctx):
                 app.state.ready = True
-                log.info("warm complete; node is ready")
+                log.info("warm + auth priming complete; node is ready")
         except Exception:  # pragma: no cover - defensive; keep the loop alive
-            log.exception("background warm retry errored")
+            log.exception("background readiness retry errored")
 
 
 async def _session_sweep_loop() -> None:
@@ -111,6 +140,23 @@ async def _session_sweep_loop() -> None:
                 sweep_expired_sessions(s)
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("periodic session sweep errored")
+
+
+async def _reconcile_loop(ctx) -> None:
+    """Full mode: re-run the git↔DB main-commit drift check on an interval (the boot sweep
+    only runs once). Drift can appear AFTER boot — a publish whose outer DB transaction
+    rolled back after `commit_version` moved `main` leaves an unvalidated tip (see
+    RegistryService.commit_draft) — so a boot-only check would never notice it. Each pass
+    records the result on the ctx (feeding /healthz + the incant_reconcile_* gauges).
+    Detect-and-log only: it NEVER repairs and NEVER flips readiness (§3, §5)."""
+    interval = get_settings().reconcile_interval_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            with session_scope() as s:
+                ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
+        except Exception:  # pragma: no cover - defensive; keep the loop alive
+            log.exception("periodic main reconcile errored")
 
 
 async def _control_poll_loop(ctx) -> None:
@@ -146,25 +192,32 @@ async def lifespan(app: FastAPI):
         with session_scope() as s:
             ensure_bootstrap_admin(s, settings.bootstrap_admin_key)
         # Reconcile git draft refs against DB draft rows before serving warms, sweep any
-        # expired browser sessions, and detect (log, never repair) main-commit orphans.
+        # expired browser sessions, and detect (log, never repair) main-commit drift. The
+        # main-reconcile result is recorded on the ctx so /healthz + the incant_reconcile_*
+        # gauges reflect drift from the very first boot, not just after the first interval.
         with session_scope() as s:
             reconcile_drafts(s, ctx.git)
             sweep_expired_sessions(s)
-            reconcile_main_commits(s, ctx.git)
+            ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
 
-    # Warming is required in both modes: any environment's warm failure leaves the node
-    # not ready. In full mode a background loop keeps retrying; in serve mode the same
-    # loop lets a replica become ready once the full node has published its content.
-    app.state.ready = _warm_all(ctx)
+    # Readiness (both modes) requires warming EVERY environment (content + snapshot) AND
+    # priming the auth cache — so "ready" honestly means "can serve + authenticate with
+    # zero DB reads" (§8/§10). Any failure leaves the node not ready; in full mode a
+    # background loop keeps retrying both, and in serve mode the same loop lets a replica
+    # become ready once the full node has published its content.
+    app.state.ready = _boot_prime(ctx)
     retry_task = None
     if not app.state.ready:
-        log.warning("warm incomplete at boot — node not ready; retrying in background")
+        log.warning("warm/auth priming incomplete at boot — node not ready; retrying in "
+                    "background")
         retry_task = asyncio.create_task(_warm_retry_loop(app, ctx))
 
-    # Hourly expired-session sweep (full mode only — serve replicas have no sessions).
-    sweep_task = None
+    # Hourly expired-session sweep + periodic main-commit drift check (full mode only —
+    # serve replicas have no sessions and never own the canonical main to reconcile).
+    sweep_task = reconcile_task = None
     if settings.mode == "full":
         sweep_task = asyncio.create_task(_session_sweep_loop())
+        reconcile_task = asyncio.create_task(_reconcile_loop(ctx))
 
     # Control-plane poll (BOTH modes): the serving hot path never reads the DB itself;
     # this loop pulls targeting bumps + auth changes into memory (§7 poll fallback, §8/§10).
@@ -173,7 +226,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task in (retry_task, sweep_task, poll_task):
+        for task in (retry_task, sweep_task, reconcile_task, poll_task):
             if task is not None:
                 task.cancel()
 
@@ -214,8 +267,25 @@ def create_app() -> FastAPI:
     # load-balancer / orchestrator probes and return no sensitive data (a literal
     # "ok"/"ready"/"warming"), so they must answer before any credential is presented.
     @app.get("/healthz", response_class=PlainTextResponse)
-    def healthz() -> str:
-        return "ok"
+    def healthz():
+        # Liveness/health probe — public + unauthenticated (LB/orchestrator poll). We fold
+        # the latest git↔DB drift counts into the body WHEN there is drift, but deliberately
+        # do NOT flip health on it: a drifted node still serves correct content from the
+        # last VALIDATED SHAs (§5), so returning non-200 (pulling it from rotation) would
+        # convert a governance ALARM into an outage. Continuous numeric monitoring lives in
+        # the incant_reconcile_* gauges; this body just makes drift glanceable. A clean (or
+        # not-yet-reconciled, e.g. serve replica) node stays the literal "ok".
+        res = get_app().last_reconcile
+        if res is not None and (res.git_orphans or res.unvalidated_tips or res.missing_files):
+            return JSONResponse({
+                "status": "ok",  # still serving correctly — drift is NOT unhealthy
+                "drift": {
+                    "git_orphans": res.git_orphans,
+                    "unvalidated_tips": res.unvalidated_tips,
+                    "missing_files": res.missing_files,
+                },
+            })
+        return PlainTextResponse("ok")
 
     @app.get("/readyz", response_class=PlainTextResponse)
     def readyz():

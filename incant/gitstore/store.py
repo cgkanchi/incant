@@ -40,6 +40,8 @@ class GitStore:
         # Serialize commits to main within this process so the CAS retry loop only
         # ever has to defend against *other* processes (uvicorn workers/replicas).
         self._main_lock = threading.Lock()
+        # Head-keyed memo for latest_commits (see there): {(ref, suffix) -> (head_sha, map)}.
+        self._latest_cache: dict[tuple[str, str], tuple[str, dict[str, "CommitInfo"]]] = {}
 
     # ── low-level git ────────────────────────────────────────────────
 
@@ -173,7 +175,23 @@ class GitStore:
         delete / the old side of a rename — an *older* commit touching that same path must
         NOT resurrect it. Without this, walking past a ``D old`` would find the original
         ``A old`` and wrongly report a deleted (or renamed-away) file as live.
+
+        Head-keyed memo (scalability): the returned map is a pure function of the ref's
+        current commit — it only changes when the branch tip moves. So we resolve that tip
+        first (one ``rev-parse``-equivalent) and, while it matches the last computed key,
+        return the cached map WITHOUT walking the log at all. A new commit moves the head,
+        the key misses, and we do the one full walk that new commit warrants. Net cost:
+        one ``rev-parse`` per call + one full ``git log`` walk per new commit, in place of
+        a full walk on every /mgmt/overview call.
         """
+        try:
+            head = self.head(ref)
+        except GitError:
+            return {}
+        cache_key = (ref, suffix)
+        cached = self._latest_cache.get(cache_key)
+        if cached is not None and cached[0] == head:
+            return cached[1]
         try:
             out = self._git(
                 "log", ref, "-M", "--name-status",
@@ -214,6 +232,11 @@ class GitStore:
                     gone(fields[1])
                 else:                           # add/modify/type-change: [A|M|T, path]
                     present(fields[1], info)
+        # Atomic swap: publish (head, map) only after the walk fully succeeds, so a reader
+        # never sees a half-built map. Two threads racing on a cold/stale key may both walk
+        # (benign — the walk is a pure function of ``head``, so their maps are identical);
+        # the last dict assignment wins and every caller gets a correct, head-matched map.
+        self._latest_cache[cache_key] = (head, latest)
         return latest
 
     def diff(self, path: str, sha_a: str, sha_b: str) -> str:

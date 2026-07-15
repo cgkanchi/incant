@@ -8,6 +8,7 @@ import datetime as dt
 import logging
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from incant import db, models
 from incant.config import Settings, set_settings
@@ -128,3 +129,53 @@ def test_warm_all_reports_not_ready_then_ready(app):
     assert _warm_all(app) is False                       # nothing servable → not ready
     app.content = FakeContent(servable={"sha_live", "sha_prev"})
     assert _warm_all(app) is True                        # content available → ready
+
+
+class BoomSession:
+    """A session whose every DB access raises — proves the render hot path is DB-free
+    (§8/§10). If get_snapshot touches it at all, the test fails loudly."""
+
+    def execute(self, *a, **k):
+        raise SQLAlchemyError("db down")
+
+    def get(self, *a, **k):
+        raise SQLAlchemyError("db down")
+
+    def rollback(self, *a, **k):
+        pass
+
+
+def test_warm_installs_snapshot_for_zero_db_serving(app):
+    # Issue 1: warm() must INSTALL the snapshot it built, so the first render after
+    # readiness is a pure memory hit — not a cold snapshot build (a DB read) that would
+    # 503 a "ready" node the instant Postgres died.
+    with session_scope() as s:
+        _version(s)
+        _pointer(s, "sha_live", _T0)
+    app.content = FakeContent(servable={"sha_live"})
+    with session_scope() as s:
+        app.warm(s, "prod")
+
+    # A session that raises on ANY DB call still yields the warmed snapshot — no DB read —
+    # and it is NOT stale (the DB is healthy; the freeze flag only sets on an observed
+    # outage, and the cached snapshot was never mutated).
+    snap = app.get_snapshot(BoomSession(), "prod")
+    assert snap.environment == "prod"
+    assert snap.stale is False
+
+
+def test_warm_does_not_install_snapshot_on_failure(app):
+    # The install sits on the happy path only: a WarmError (nothing servable) must leave
+    # NO cached snapshot, so serving falls through to the cold build rather than caching an
+    # environment the node cannot actually serve.
+    with session_scope() as s:
+        _version(s)
+        _pointer(s, "sha_live", _T0)
+    app.content = FakeContent(servable=set())
+    with pytest.raises(WarmError):
+        with session_scope() as s:
+            app.warm(s, "prod")
+    # Nothing cached → get_snapshot over a dead session raises the cold-miss 503.
+    from incant.service import ServingError
+    with pytest.raises(ServingError):
+        app.get_snapshot(BoomSession(), "prod")

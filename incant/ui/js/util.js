@@ -60,20 +60,75 @@ function canRole(min) { return roleRank(bestRole()) >= roleRank(min); }
 // viewer scoped only to `pid`'s project would 403 on the env-wide read. On that 403 retry
 // once scoped to the prompt's project (`?project=<proj>`): the server then returns the rules
 // governing that project's prompts (plus global rules), so a project-scoped viewer still
-// sees their own prompt's testing state. Any other failure (or a 403 with no prompt to scope
-// to) degrades to an empty rule set — the same graceful fallback the inline `.catch` had.
+// sees their own prompt's testing state.
+//
+// The result carries an explicit tri-state `status` so callers never confuse an OUTAGE with
+// "nothing is being tested":
+//   available   — the real rule list (directly or via the project fallback).
+//   limited     — a 403 with no scoped door left (truly no access). Chrome shows the quiet
+//                 access-limited note; testing status is HIDDEN, not unknown.
+//   unavailable — a network error or 5xx. Testing status is UNKNOWN; callers warn.
+// The shape stays backward-compatible: `rules`/`kills`/`defaults` are always present (empty
+// for limited/unavailable), and the available shape spreads the full response (so `protected`,
+// `rules_version`, etc. survive for callers that read them).
 async function fetchEnvRules(env, pid) {
   try {
-    return await GET(`/mgmt/envs/${enc(env)}/rules`);
+    return { status: "available", ...(await GET(`/mgmt/envs/${enc(env)}/rules`)) };
   } catch (e) {
     if (e && e.status === 403 && pid) {
       const project = String(pid).split("/", 1)[0];
-      try { return await GET(`/mgmt/envs/${enc(env)}/rules?project=${enc(project)}`); }
-      catch (_) { /* even the scoped read failed — fall through to the empty shape */ }
+      try {
+        return { status: "available",
+                 ...(await GET(`/mgmt/envs/${enc(env)}/rules?project=${enc(project)}`)) };
+      } catch (e2) {
+        // Even the scoped read failed: a 403 here means no access (limited); anything
+        // else (network/5xx) means we simply don't KNOW the rules (unavailable).
+        return { status: e2 && e2.status === 403 ? "limited" : "unavailable",
+                 rules: [], kills: {}, defaults: {} };
+      }
     }
-    return { rules: [], kills: {}, defaults: {} };
+    // No prompt to scope to, or a non-403 first failure. Classify the same way.
+    return { status: e && e.status === 403 ? "limited" : "unavailable",
+             rules: [], kills: {}, defaults: {} };
   }
 }
+
+// Fetch an environment's targeting-change log for a screen scoped to ONE prompt. Mirrors
+// fetchEnvRules' 403 retry: the full env-wide log needs env-wide viewer, so a viewer scoped
+// only to `pid`'s project 403s on it; retry once scoped to the project (`&project=<proj>`),
+// which the server filters to that project's revisions. Any other failure degrades to an
+// empty log — the change-history table then renders empty, exactly as before.
+async function fetchEnvRevisions(env, pid, limit) {
+  const base = `/mgmt/envs/${enc(env)}/revisions?limit=${enc(limit || 100)}`;
+  try {
+    return await GET(base);
+  } catch (e) {
+    if (e && e.status === 403 && pid) {
+      const project = String(pid).split("/", 1)[0];
+      try { return await GET(`${base}&project=${enc(project)}`); }
+      catch (_) { /* scoped read failed too — fall through to an empty log */ }
+    }
+    return { revisions: [] };
+  }
+}
+
+// A small inline warning for screens that show testing/targeting info when the rule list
+// couldn't be loaded. Only the "unavailable" state (network/5xx) warrants it: testing status
+// is UNKNOWN, so we warn rather than silently imply "nothing is being tested". The "limited"
+// (403) state is access-gated and gets its own quieter treatment; "available" needs nothing.
+// Reuses the shared .banner.warn strip.
+function rulesUnavailableNote(status) {
+  if (status !== "unavailable") return "";
+  return `<div class="banner warn" role="status">
+    <span style="font-size:15px">⚠</span>
+    <span style="font-size:12.5px;font-weight:600">Couldn't load targeting — testing status is unknown right now.</span></div>`;
+}
+
+// Environment ids are URL-safe slugs, mirroring the server's _validate_env_id: 1–32
+// lowercase letters/digits, with '-' or '_' allowed only inside. Used to validate the
+// new-environment and rename inputs client-side with a friendly message.
+const ENV_ID_RE = /^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$/;
+const isValidEnvId = (s) => typeof s === "string" && s.length <= 32 && ENV_ID_RE.test(s);
 
 // ── util ─────────────────────────────────────────────────────────────
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>

@@ -27,14 +27,38 @@ from .helpers import _confirm_lock, _project_of, _references_segment, _require
 router = APIRouter()
 
 
+def _require_stored_scope(ident: Identity, existing: models.Rule, env: str) -> None:
+    """Rehoming defense: require authority over where a rule lives NOW.
+
+    Rule ids are globally unique, client-supplied strings that GET /rules surfaces, and
+    ``TargetingService.upsert_rule`` loads any existing rule by id then freely overwrites its
+    ``scope``/``prompt_id`` (it guards ONLY cross-ENVIRONMENT capture). So authorizing the
+    REQUEST scope alone is not enough: a project-A operator could POST a GLOBAL rule's id
+    re-scoped to A (neutering an env-wide rule with only project authority) or take a known
+    project-B rule id and rehome it into A. scope/prompt are legitimately editable — the
+    composer offers scope switching — so ownership is NOT immutable; the invariant is instead
+    DUAL authorization: authority over BOTH the stored scope and the requested scope. Creating
+    a rule (no existing row) needs only the requested-scope check; editing one needs both.
+    Callers apply this only when the rule already lives in THIS env — the cross-env case is
+    rejected by the service with its own clear message."""
+    if existing.prompt_id:
+        _require(ident, "operator", project=_project_of(existing.prompt_id), environment=env)
+    else:
+        _require(ident, "operator", environment=env)
+
+
 @router.get("/envs")
 def list_envs(
+    app: AppContext = Depends(app_context),
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
+    # `default` marks the serving/registry default env (settings.default_environment); the
+    # UI uses it to disable rename/delete on that env with an explanation.
+    default_env = app.settings.default_environment
     return {"environments": [
         {"id": e.id, "protected": e.protected, "track_tip": e.track_tip,
-         "rules_version": e.rules_version}
+         "rules_version": e.rules_version, "default": e.id == default_env}
         for e in session.execute(select(models.Environment)).scalars()
     ]}
 
@@ -102,12 +126,18 @@ def upsert_rule(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    # Prompt-scoped rules need operator on that project+env; a *global* rule
-    # governs every project, so it requires env-wide (or instance) operator.
+    # Requested-scope authority: prompt-scoped rules need operator on that project+env;
+    # a *global* rule governs every project, so it requires env-wide (or instance) operator.
     if req.prompt_id:
         _require(ident, "operator", project=_project_of(req.prompt_id), environment=env)
     else:
         _require(ident, "operator", environment=env)
+    # Stored-scope authority (rehoming defense — see _require_stored_scope). Editing an
+    # existing rule also requires authority over where it lives NOW, so its scope/prompt_id
+    # can't be overwritten by a caller who only holds authority over the requested target.
+    existing = session.get(models.Rule, req.id)
+    if existing is not None and existing.environment_id == env:
+        _require_stored_scope(ident, existing, env)
     tgt = app.targeting(session, ident.name)
     try:
         r = tgt.upsert_rule(env, req.model_dump())
@@ -144,10 +174,17 @@ def upsert_rules_batch(
     composer-save/reorder on a protected env.
     """
     for r in req.rules:
+        # Requested-scope authority.
         if r.prompt_id:
             _require(ident, "operator", project=_project_of(r.prompt_id), environment=env)
         else:
             _require(ident, "operator", environment=env)
+        # Stored-scope authority (rehoming defense) — same dual-authz invariant as the single
+        # upsert. Checked here in the up-front pass so a hijack attempt ANYWHERE in the batch
+        # 403s before any write lands, preserving atomicity (a 403 persists nothing).
+        existing = session.get(models.Rule, r.id)
+        if existing is not None and existing.environment_id == env:
+            _require_stored_scope(ident, existing, env)
     tgt = app.targeting(session, ident.name)
     ids: list[str] = []
     try:
@@ -185,18 +222,42 @@ def patch_rule(
 
 @router.get("/envs/{env}/revisions")
 def get_revisions(
-    env: str, limit: int = 100,
+    env: str, limit: int = 100, project: str | None = None,
     app: AppContext = Depends(app_context),
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "viewer", environment=env)
+    # Access model mirrors get_rules. The full env-wide change log needs env-WIDE viewer,
+    # but a project-scoped viewer reaching the targeting screen must not read a swallowed
+    # 403 as an empty history. With `project`, require viewer on THAT project (in this env)
+    # and filter the log to the revisions that touch the project's prompts.
+    #
+    # A revision is kept when its snapshot names a prompt in `project`. Every prompt-scoped
+    # revision carries a `prompt_id` in its snapshot: rule edits (_rule_snapshot), pointer
+    # moves, defaults, and kills all do. Revisions with NO prompt are env-wide facts —
+    # GLOBAL-rule edits (prompt_id is None), segment edits, and rollbacks — so they are
+    # EXCLUDED in project mode. This is narrower than get_rules on purpose: get_rules keeps
+    # global RULES because they still govern the project's prompts, but a global-rule
+    # *revision* is env-wide history a single project viewer has no scoped claim to. Best
+    # effort: the DB `limit` is applied before this filter, so project mode may return fewer
+    # than `limit` rows (same shape as get_rules' post-fetch filtering). Without the param,
+    # behaviour is unchanged: env-wide viewer, the full log.
+    if project is not None:
+        _require(ident, "viewer", project=project, environment=env)
+    else:
+        _require(ident, "viewer", environment=env)
     tgt = app.targeting(session, ident.name)
+
+    def _rev_project(r: models.RuleRevision) -> str | None:
+        pid = (r.snapshot or {}).get("prompt_id")
+        return _project_of(pid) if pid else None
+
     return {"environment": env, "revisions": [
         {"id": r.id, "rules_version": r.rules_version, "kind": r.kind,
          "rule_id": r.rule_id, "actor": r.actor, "comment": r.comment,
          "at": r.at.isoformat(), "snapshot": r.snapshot}
         for r in tgt.list_revisions(env, limit)
+        if project is None or _rev_project(r) == project
     ]}
 
 
@@ -261,7 +322,11 @@ def pointer_timeline(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    _require(ident, "viewer", environment=env)
+    # This history is per-(prompt, version), so its natural scope is the prompt's project in
+    # this env — requiring env-WIDE viewer was simply wrong (it 403'd a project-scoped viewer
+    # off their own prompt's publish history, a navigable dead end). Authorize on the prompt's
+    # project + env; an env-wide or instance viewer still satisfies it via role implication.
+    _require(ident, "viewer", project=_project_of(prompt_id), environment=env)
     tgt = app.targeting(session, ident.name)
     hist = tgt.pointer_history(env, prompt_id, version)
     current = hist[0].to_sha if hist else None

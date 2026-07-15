@@ -76,6 +76,10 @@ async function openPublishModal({ v, toSha, toShort, mode }) {
     tcs, tc: tcs[0]?.name || null,
     diffMode: tcs.length ? "rendered" : "source",
     tipRules, removeRule: Object.fromEntries(tipRules.map((r) => [r.id, true])),
+    // If we couldn't load the rule list (outage), tipRules is empty NOT because there are no
+    // test rules but because we're blind to them — surface that in the modal, since publishing
+    // without seeing which test rules become redundant is risky.
+    rulesStatus: rd.status,
     locked: !!(State.envs.find((e) => e.id === State.env) || {}).protected,
   };
   renderPublishModal();
@@ -147,7 +151,8 @@ function publishModalBodyHtml(p) {
         <span style="line-height:1.5"><b>${esc(r.comment || r.id)}</b> — <span class="faint">also remove this test rule after publishing (it becomes redundant)</span></span></label>`).join("")
     : "";
   const affected = `<div class="groupname" style="margin-top:16px">Who's affected</div>
-    <div style="font-size:12.5px;color:var(--mut)">Everyone currently on <b>Version ${p.v}</b> (the default).</div>${ruleRows}`;
+    <div style="font-size:12.5px;color:var(--mut)">Everyone currently on <b>Version ${p.v}</b> (the default).</div>
+    ${rulesUnavailableNote(p.rulesStatus)}${ruleRows}`;
   const subjects = isRevert ? [] : (p.history || []).slice(0, p.tipAhead).map((h) => h.subject).filter(Boolean);
   const edits = subjects.length
     ? `<div class="groupname" style="margin-top:16px">The edits going live</div>

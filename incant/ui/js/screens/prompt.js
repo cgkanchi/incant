@@ -11,6 +11,9 @@ async function screenOverview() {
     fetchEnvRules(State.env, pid),
   ]);
   const rules = rulesData.rules || [];
+  // When the rule list couldn't be loaded (outage), the testing hero rows can't be trusted —
+  // warn instead of silently rendering "no group is being tested".
+  const rulesWarn = rulesUnavailableNote(rulesData.status);
   const liveV = d.versions.find((v) => v.is_default) || d.versions.find((v) => v.live_sha) || null;
   const liveVersion = liveV ? liveV.version : null;
   const testing = testingFor(rules, pid, liveVersion);
@@ -105,6 +108,7 @@ async function screenOverview() {
       <div class="grow"></div>
       <button type="button" class="link mut btn-bare" data-act="projectSettings" data-project="${esc(pid.split("/")[0])}" data-prompt="${esc(pid)}" style="font-size:12px">⚙ Project settings</button>
       ${canRole("editor") ? `<button class="btn primary" data-act="go" data-hash="#/p/${enc(pid)}/draft">Edit this prompt</button>` : ""}</div>
+    ${rulesWarn}
     <div class="hero">${heroRows.join("")}</div>
     ${techDetails(techLines, "commit SHAs, rules version")}
     <div style="display:flex;align-items:center;margin-top:22px">

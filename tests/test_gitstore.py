@@ -50,6 +50,38 @@ def test_commit_and_read_version(tmp_path):
     assert "Incant-Version: v1" in body
 
 
+def test_latest_commits_memoized_on_unchanged_head(tmp_path):
+    # Head-keyed memo: a second call with an unchanged head does ZERO extra `git log`
+    # walks (only a cheap rev-parse to check the head), and a new commit refreshes it.
+    g = make_store(tmp_path)
+    g.commit_version("p/a", 1, "a1", author_name="A", author_email="a@x", message="c1")
+
+    log_walks: list = []
+    real_git = g._git
+
+    def counting(*args, **kwargs):
+        if args and args[0] == "log":            # rev-parse (head check) is allowed, log is the walk
+            log_walks.append(args)
+        return real_git(*args, **kwargs)
+
+    g._git = counting
+    try:
+        first = g.latest_commits()
+        assert len(log_walks) == 1               # cold: one full walk
+        second = g.latest_commits()
+        assert len(log_walks) == 1               # warm: NO additional walk
+        assert second is first                   # cached map object returned as-is
+
+        g._git = real_git                        # let commit_version use the real runner
+        g.commit_version("p/b", 1, "b1", author_name="B", author_email="b@x", message="c2")
+        g._git = counting
+        third = g.latest_commits()
+        assert len(log_walks) == 2               # new head → exactly one fresh walk
+        assert set(third) == {"p/a/v1.j2", "p/b/v1.j2"}
+    finally:
+        g._git = real_git
+
+
 def test_history_tracks_a_version_file(tmp_path):
     g = make_store(tmp_path)
     g.commit_version("p/a", 1, "one", author_name="A", author_email="a@x", message="c1")

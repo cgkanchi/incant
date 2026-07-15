@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..core import EnvSnapshot, VersionInfo
@@ -17,34 +17,86 @@ from ..core.model import Rule as CoreRule
 from ..core.model import Segment as CoreSegment
 from .. import models
 
+# Newest-K per (prompt, version) kept in the ordering lists these helpers build. Only the
+# HEAD of each list is ever read downstream — tip_sha (the newest validated) and the
+# `previous_live` §10 fallback, which never reaches past the most recent few moves — so
+# windowing to K bounds each snapshot rebuild to K rows per (prompt, version) instead of
+# the whole history. (SQLite ≥3.25 / Postgres window functions.)
+_VALIDATED_ORDER_CAP = 50     # tip_sha reads only [0]; K is defensive headroom
+_POINTER_HISTORY_CAP = 100    # previous_live scans distinct recent moves; nothing past ~K
 
-def _validated_shas(session: Session) -> tuple[set[str], dict[tuple[str, int], list[str]]]:
-    """Return (all valid SHAs, {(prompt,version) -> validated SHAs newest-first})."""
 
-    rows = session.execute(
-        select(models.CommitValidation)
+def _validated_shas(session: Session) -> tuple[set[tuple[str, str]], dict[tuple[str, int], list[str]]]:
+    """Return (all validated (prompt_id, sha) pairs, {(prompt,version) -> newest-K SHAs}).
+
+    Two DELIBERATELY different reads:
+
+    * The servable-pair set must stay COMPLETE — correctness over economy. ``servable``
+      legitimately answers True for ANY (prompt, sha) ever validated for that prompt: an
+      old pinned rule or a rolled-back live pointer can reference a SHA far down the
+      history, and warming/serving must still recognise it. So we fetch the full
+      (prompt_id, sha) pair set — one two-column indexed scan, deliberately NOT windowed.
+
+    * The per-(prompt,version) ordering list only feeds ``tip_sha`` (its head). Window it
+      to the newest ``_VALIDATED_ORDER_CAP`` per (prompt, version) so a version with a huge
+      validation history doesn't materialise in full on every snapshot rebuild."""
+
+    # Complete servable pairs — one indexed two-column scan, deliberately unwindowed.
+    pairs = session.execute(
+        select(models.CommitValidation.prompt_id, models.CommitValidation.sha)
         .where(models.CommitValidation.status == "valid")
-        .order_by(models.CommitValidation.validated_at.desc())
-    ).scalars().all()
-    valid: set[str] = set()
+    ).all()
+    servable_pairs: set[tuple[str, str]] = {(pid, sha) for pid, sha in pairs}
+
+    # Newest-K ordering lists — windowed; only the head (tip_sha) is ever consumed.
+    rn = func.row_number().over(
+        partition_by=(models.CommitValidation.prompt_id, models.CommitValidation.version_number),
+        order_by=(models.CommitValidation.validated_at.desc(), models.CommitValidation.id.desc()),
+    ).label("rn")
+    ranked = (
+        select(models.CommitValidation.prompt_id, models.CommitValidation.version_number,
+               models.CommitValidation.sha, rn)
+        .where(models.CommitValidation.status == "valid")
+        .subquery()
+    )
+    rows = session.execute(
+        select(ranked.c.prompt_id, ranked.c.version_number, ranked.c.sha)
+        .where(ranked.c.rn <= _VALIDATED_ORDER_CAP)
+        .order_by(ranked.c.prompt_id, ranked.c.version_number, ranked.c.rn)
+    ).all()
     by_version: dict[tuple[str, int], list[str]] = defaultdict(list)
-    for r in rows:
-        valid.add(r.sha)
-        by_version[(r.prompt_id, r.version_number)].append(r.sha)
-    return valid, by_version
+    for pid, ver, sha in rows:            # rn-ascending == newest-first within each key
+        by_version[(pid, ver)].append(sha)
+    return servable_pairs, by_version
 
 
 def _pointer_history(session: Session, env_id: str) -> dict[tuple[str, int], list[str]]:
-    """{(prompt,version) -> [to_sha ...]} newest move first."""
+    """{(prompt,version) -> [to_sha ...]} newest move first, capped at the newest
+    ``_POINTER_HISTORY_CAP`` moves per (prompt, version).
 
-    rows = session.execute(
-        select(models.PointerMove)
+    Only the head (current live) and the recent distinct SHAs behind it (the §10
+    ``previous_live`` fallback) are ever read, so windowing to K bounds the per-version
+    work without changing that behaviour for recent history. A window function keeps it one
+    query with at most K rows per key rather than every historical move."""
+
+    rn = func.row_number().over(
+        partition_by=(models.PointerMove.prompt_id, models.PointerMove.version_number),
+        order_by=(models.PointerMove.moved_at.desc(), models.PointerMove.id.desc()),
+    ).label("rn")
+    ranked = (
+        select(models.PointerMove.prompt_id, models.PointerMove.version_number,
+               models.PointerMove.to_sha, rn)
         .where(models.PointerMove.environment_id == env_id)
-        .order_by(models.PointerMove.moved_at.desc(), models.PointerMove.id.desc())
-    ).scalars().all()
+        .subquery()
+    )
+    rows = session.execute(
+        select(ranked.c.prompt_id, ranked.c.version_number, ranked.c.to_sha)
+        .where(ranked.c.rn <= _POINTER_HISTORY_CAP)
+        .order_by(ranked.c.prompt_id, ranked.c.version_number, ranked.c.rn)
+    ).all()
     hist: dict[tuple[str, int], list[str]] = defaultdict(list)
-    for r in rows:
-        hist[(r.prompt_id, r.version_number)].append(r.to_sha)
+    for pid, ver, to_sha in rows:         # rn-ascending == newest move first within each key
+        hist[(pid, ver)].append(to_sha)
     return hist
 
 
@@ -53,9 +105,10 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
     if env is None:
         raise KeyError(f"unknown environment {env_id!r}")
 
-    # The global valid-SHA set is no longer used for servability (see the
-    # prompt-aware `servable_pairs` below); only the per-(prompt,version) map is.
-    _valid_shas, validated_by_version = _validated_shas(session)
+    # `servable_pairs` is the COMPLETE (prompt, sha) validation set (see `_validated_shas`);
+    # `validated_by_version` is windowed and feeds only tip_sha. They are two reads on
+    # purpose — servability must stay complete while the ordering lists may be capped.
+    servable_pairs, validated_by_version = _validated_shas(session)
     pointer_hist = _pointer_history(session, env_id)
 
     # Defense-in-depth for the evaluator's servability check (§7). Full
@@ -68,11 +121,8 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
     # evaluator's callback signature is (prompt_id, sha) (see core/evaluate.py and
     # core/model.py), and version integrity is already owned by the write-time
     # checks — so we key on (prompt, sha) and let the evaluator supply the prompt.
-    servable_pairs: set[tuple[str, str]] = {
-        (prompt_id, sha)
-        for (prompt_id, _version), shas in validated_by_version.items()
-        for sha in shas
-    }
+    # The pair set is deliberately unwindowed: an old validated SHA (pinned rule /
+    # rolled-back pointer) must remain servable no matter how deep in history it sits.
 
     # Versions
     versions: dict[str, dict[int, VersionInfo]] = defaultdict(dict)

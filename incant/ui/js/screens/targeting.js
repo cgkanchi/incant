@@ -8,13 +8,16 @@ async function screenRules() {
   const main = el("main");   // capture before any await (Issue B)
   const env = State.env;
   const pid = State.route.pid;
-  // fetchEnvRules retries scoped to this prompt's project on a 403, so a project-scoped
-  // operator can still manage the rules that govern their own prompt.
+  // Both reads retry scoped to this prompt's project on a 403, so a project-scoped operator
+  // can still manage (and see the history of) the rules that govern their own prompt.
   const [d, rv] = await Promise.all([
     fetchEnvRules(env, pid),
-    GET(`/mgmt/envs/${enc(env)}/revisions?limit=25`),
+    fetchEnvRevisions(env, pid, 25),
   ]);
   _rulesData = d;   // stashed for the "turn targeting off" confirm modal
+  // If the rule list itself couldn't be loaded (outage), the rows below would read as
+  // "No rules yet" — warn instead so an empty screen isn't mistaken for empty targeting.
+  const rulesWarn = rulesUnavailableNote(d.status);
   // Kill semantics are per-prompt; the header toggle governs the route prompt or,
   // on the env-wide screen, the first prompt-scoped rule's prompt.
   const defaultPid = pid || (d.rules.find((r) => r.prompt_id)?.prompt_id) || null;
@@ -102,6 +105,7 @@ async function screenRules() {
       <div class="grow"></div>
       ${canTarget ? `<button class="btn primary sm" data-act="ruleNew">＋ New rule</button>
       <span class="faint" style="font-size:11px">·</span>` : ""}${rightControls}</div>
+    ${rulesWarn}
     ${killBanner}
     <div class="card">
       <div style="padding:11px 20px;font-size:12px;color:var(--mut);background:var(--panel2);border-bottom:1px solid var(--line2)">Rules are checked top to bottom. The first one that matches a request decides which version that person sees.</div>

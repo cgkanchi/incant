@@ -13,6 +13,7 @@ function parseRoute() {
   if (parts[0] === "play") return { name: "play", pid: null, q };
   if (parts[0] === "audit") return { name: "audit", pid: null, q };
   if (parts[0] === "access") return { name: "access", pid: null, q };
+  if (parts[0] === "envs") return { name: "envs", pid: null, q };
   if (parts[0] === "p") {
     const pid = decodeURIComponent(parts[1] || "");
     let screen = parts[2] || "overview";
@@ -28,8 +29,21 @@ function parseRoute() {
 const SCREENS = {
   prompts: screenPrompts, overview: screenOverview, draft: screenDraft, compare: screenCompare,
   rules: screenRules, pointers: screenPointers, segments: screenSegments,
-  play: screenPlay, audit: screenAudit, access: screenAccess,
+  play: screenPlay, audit: screenAudit, access: screenAccess, envs: screenEnvironments,
 };
+
+// Reload the environment list into State.envs after any env mutation, so the sidebar
+// select (and its badges) stay truthful. Mirrors the boot/sign-in loader; if the current
+// env vanished (e.g. it was deleted), fall back to the default env, else the first one.
+async function reloadEnvs() {
+  const e = await GET("/mgmt/envs");
+  State.envs = e.environments || [];
+  if (!State.envs.find((x) => x.id === State.env)) {
+    const def = State.envs.find((x) => x.default) || State.envs[0];
+    State.env = (def && def.id) || "prod";
+    localStorage.setItem("incant_env", State.env);
+  }
+}
 
 // ── account sessions (menu block) ────────────────────────────────────
 // Sign-out tail shared by "Sign out" and "Sign out everywhere": drop local state, dismiss the
@@ -822,6 +836,113 @@ const Actions = {
       const newReq = !(ds.req === "true");
       await PUT(`/mgmt/prompts/${enc(State.route.pid)}/variables?version=${ds.v}`, { name: ds.name, required: newReq });
       toast(`${ds.name} → ${newReq ? "required" : "optional"}`);
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+
+  // ── environments (admin) ─────────────────────────────────────────
+  newEnv() {
+    openModal(`
+      <h3>New environment</h3>
+      <p class="hint">An environment is a place prompts get published to — like <span class="mono">prod</span> or <span class="mono">staging</span>. Rules, defaults, and publish history are all kept separately per environment.</p>
+      <div class="field"><label>Name</label>
+        <input id="neId" placeholder="e.g. staging" spellcheck="false" style="font-family:'IBM Plex Mono',monospace"></div>
+      <label class="remember-row" style="align-items:flex-start"><input type="checkbox" id="neProtected">
+        <span>Lock this environment<span class="faint" style="display:block;font-size:11px">Publishing here will ask you to type the name to confirm.</span></span></label>
+      <label class="remember-row" style="align-items:flex-start"><input type="checkbox" id="neTrackTip">
+        <span>Follow latest edits<span class="faint" style="display:block;font-size:11px">Valid saves publish automatically — handy for a staging environment.</span></span></label>
+      <div class="err" id="neErr"></div>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn primary" data-act="createEnv">Create environment</button></div>`);
+  },
+  async createEnv() {
+    const id = (el("neId").value || "").trim();
+    const errEl = el("neErr");
+    if (!isValidEnvId(id)) {
+      errEl.textContent = "Use 1–32 lowercase letters, numbers, dashes or underscores (start and end with a letter or number).";
+      return;
+    }
+    errEl.textContent = "";
+    try {
+      await POST("/mgmt/envs", { id, protected: !!el("neProtected").checked, track_tip: !!el("neTrackTip").checked });
+      await reloadEnvs();
+      closeModal();
+      toast(`Created environment ${id}`);
+      render();
+    } catch (e) {
+      if (e.status === 409) errEl.textContent = "An environment with that name already exists.";
+      else if (e.status === 400) errEl.textContent = "That name isn't allowed — use lowercase letters, numbers, dashes or underscores.";
+      else errEl.textContent = errText(e);
+    }
+  },
+  async envLock(ds) {
+    try { await PATCH(`/mgmt/envs/${enc(ds.env)}`, { protected: true }); await reloadEnvs(); toast(`Locked ${ds.env} — publishing here now asks you to type the name`); render(); }
+    catch (e) { toast(errText(e), true); }
+  },
+  async envUnlock(ds) {
+    try { await PATCH(`/mgmt/envs/${enc(ds.env)}`, { protected: false }); await reloadEnvs(); toast(`Unlocked ${ds.env}`); render(); }
+    catch (e) { toast(errText(e), true); }
+  },
+  envRename(ds) {
+    const locked = ds.protected === "1";
+    const body = `Give <b>${esc(ds.env)}</b> a new name. Its targeting rules, defaults, publish history, and any roles scoped to this environment all move to the new name. Anything that referred to <span class="mono">${esc(ds.env)}</span> by name (API calls, keys) must be updated to match.`;
+    const confirmBlock = locked
+      ? `<div style="margin:6px 0 2px;font-size:11px;color:var(--faint)"><span class="mono" style="color:var(--mut)">${esc(ds.env)}</span> is locked — type <span class="mono" style="color:var(--mut)">${esc(ds.env)}</span> to confirm:</div>
+         <input id="renEnvConfirm" data-act="confirmInput" data-token="${esc(ds.env)}" data-btn="renEnvBtn"
+           spellcheck="false" autocomplete="off" placeholder="${esc(ds.env)}" style="width:100%;font-family:'IBM Plex Mono',monospace">`
+      : "";
+    openModal(`
+      <h3>Rename environment</h3>
+      <p class="hint">${body}</p>
+      <div class="field"><label>New name</label>
+        <input id="renEnvId" placeholder="e.g. staging" spellcheck="false" style="font-family:'IBM Plex Mono',monospace"></div>
+      ${confirmBlock}
+      <div class="err" id="renEnvErr"></div>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button id="renEnvBtn" class="btn primary" ${locked ? "disabled" : ""} data-act="envRenameConfirm" data-env="${esc(ds.env)}">Rename</button></div>`);
+  },
+  async envRenameConfirm(ds) {
+    const newId = (el("renEnvId").value || "").trim();
+    const errEl = el("renEnvErr");
+    if (!isValidEnvId(newId)) {
+      errEl.textContent = "Use 1–32 lowercase letters, numbers, dashes or underscores.";
+      return;
+    }
+    const body = { new_id: newId };
+    const confirmEl = el("renEnvConfirm");
+    if (confirmEl) body.confirm = confirmEl.value;
+    try {
+      await POST(`/mgmt/envs/${enc(ds.env)}/rename`, body);
+      // If the renamed env was the one selected, follow it before re-render.
+      if (State.env === ds.env) { State.env = newId; localStorage.setItem("incant_env", newId); }
+      await reloadEnvs();
+      closeModal();
+      toast(`Renamed ${ds.env} → ${newId}`);
+      render();
+    } catch (e) {
+      if (e.status === 409) errEl.textContent = "An environment with that name already exists.";
+      else if (e.status === 400) errEl.textContent = "That name isn't allowed — use lowercase letters, numbers, dashes or underscores.";
+      else errEl.textContent = errText(e);
+    }
+  },
+  envDelete(ds) {
+    const body = `This permanently removes <b>${esc(ds.env)}</b> and everything scoped to it: its targeting rules, publish history, defaults, kill switches, and any roles scoped to this environment. It can't be undone.`;
+    openModal(typeToConfirm({
+      title: "Remove environment", body, token: ds.env,
+      confirmLabel: "Remove environment", act: "envDeleteConfirm", data: { env: ds.env },
+    }));
+  },
+  async envDeleteConfirm(ds) {
+    try {
+      // The type-to-confirm button only enables on an exact match, so echo the env id.
+      await api("DELETE", `/mgmt/envs/${enc(ds.env)}?confirm=${enc(ds.env)}`);
+      // reloadEnvs drops the deleted env and, if it was the selected one, re-points
+      // State.env to the default (persisting it) so the sidebar select stays valid.
+      await reloadEnvs();
+      closeModal();
+      toast(`Removed environment ${ds.env}`);
       render();
     } catch (e) { toast(errText(e), true); }
   },
