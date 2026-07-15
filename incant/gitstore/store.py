@@ -150,6 +150,72 @@ class GitStore:
             rows.append(CommitInfo(sha, an, ae, ai, subj))
         return rows
 
+    def latest_commits(self, ref: str = "main", suffix: str = ".j2") -> dict[str, CommitInfo]:
+        """Map every content path under ``ref`` to the newest commit that produced its
+        current content — one ``git log`` walk in place of a ``history()`` subprocess
+        per file.
+
+        This exists for the library overview, whose per-prompt "updated {when, who}" is
+        exactly ``history(path)[0]``. Fanning that out into one ``git log -- path`` per
+        prompt is what made the landing screen degrade with library size; a single
+        newest-first pass over the whole branch answers all of them at once.
+
+        We walk newest-first and keep the *first* commit that touches each path — its most
+        recent change. ``--name-status -M`` gives us rename detection (``R### old new``) so
+        a rename is attributed to its NEW path, not the vanished old one. Record framing
+        mirrors ``history``: the same ``%an/%ae/%aI/%s`` fields, prefixed with a
+        record-separator byte (``%x1e``) so each commit's header is unambiguously separable
+        from the name-status block that follows it — and unit (``%x1f``) separators between
+        fields, as ``history`` already uses.
+
+        A ``decided`` set is the crux of getting deletes/renames right on a newest-first
+        walk: once a path's fate is settled — recorded as present, or tombstoned by a
+        delete / the old side of a rename — an *older* commit touching that same path must
+        NOT resurrect it. Without this, walking past a ``D old`` would find the original
+        ``A old`` and wrongly report a deleted (or renamed-away) file as live.
+        """
+        try:
+            out = self._git(
+                "log", ref, "-M", "--name-status",
+                "--format=%x1e%H%x1f%an%x1f%ae%x1f%aI%x1f%s",
+            )
+        except GitError:
+            return {}
+        latest: dict[str, CommitInfo] = {}
+        decided: set[str] = set()  # paths whose fate is settled (present or gone)
+
+        def present(path: str, info: CommitInfo) -> None:
+            if path.endswith(suffix) and path not in decided:
+                latest[path] = info
+                decided.add(path)
+
+        def gone(path: str) -> None:
+            if path.endswith(suffix):
+                decided.add(path)
+
+        for record in out.split("\x1e"):
+            record = record.strip("\n")
+            if not record:
+                continue
+            header, *changes = record.split("\n")
+            sha, an, ae, ai, subj = header.split("\x1f")
+            info = CommitInfo(sha, an, ae, ai, subj)
+            for line in changes:
+                if not line.strip():
+                    continue
+                fields = line.split("\t")
+                code = fields[0][:1]
+                if code == "R":                 # rename: [R###, old, new]
+                    present(fields[2], info)    # content lives at the new path now
+                    gone(fields[1])             # old path renamed away
+                elif code == "C":               # copy: [C###, old, new]; old survives
+                    present(fields[2], info)
+                elif code == "D":               # delete: [D, path]
+                    gone(fields[1])
+                else:                           # add/modify/type-change: [A|M|T, path]
+                    present(fields[1], info)
+        return latest
+
     def diff(self, path: str, sha_a: str, sha_b: str) -> str:
         try:
             return self._git("diff", "--unified=3", sha_a, sha_b, "--", path)

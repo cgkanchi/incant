@@ -2,6 +2,7 @@
 "use strict";
 
 async function screenSegments() {
+  const main = el("main");   // capture before any await (Issue B: stale screens write a detached node)
   const d = await GET(`/mgmt/envs/${enc(State.env)}/segments`);
   const segs = d.segments || [];
   const names = segs.map((s) => s.name);
@@ -15,7 +16,7 @@ async function screenSegments() {
   }
   se.raw = segs; se.allSegments = names;
   window._segEdit = se;
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Segments — <i>${esc(State.env)}</i></span>
       <span class="sub">named groups of users that rules can target</span></div>
     <div class="panelrow">
@@ -30,6 +31,7 @@ let _auditFilter = { actor: "", action: "", object: "" };
 let _auditRows = [];
 
 async function screenAudit() {
+  const main = el("main");   // capture before any await (Issue B)
   let q = "limit=200";
   if (_auditFilter.actor) q += `&actor=${enc(_auditFilter.actor)}`;
   if (_auditFilter.action) q += `&action=${enc(_auditFilter.action)}`;
@@ -47,7 +49,7 @@ async function screenAudit() {
       <td><b>${esc(a.actor)}</b></td>
       <td><span class="tag acc">${esc(a.action)}</span></td>
       <td class="mono" style="font-size:11.5px">${a.object_type ? `<span class="faint">${esc(a.object_type)}</span> ` : ""}${esc(a.object_id)}</td></tr>`).join("");
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Audit</span><span class="sub">every change — who made it and when</span></div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
       <select class="envsel" aria-label="Filter by actor" data-act="auditActor">${actorOpts}</select>
@@ -93,12 +95,13 @@ function _scopeLabel(b) {
 }
 
 async function screenAccess() {
+  const main = el("main");   // capture before any await (Issue B)
   await ensureWhoami();   // for the "you're signed in as" note
   let d;
   try {
     d = await GET(`/mgmt/principals`);
   } catch (e) {
-    el("main").innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Access</span></div>
+    main.innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Access</span></div>
       <div class="empty">${e.status === 403 ? "Admin access required to manage users." : esc(errText(e))}</div></div>`;
     return;
   }
@@ -122,15 +125,29 @@ async function screenAccess() {
         <span class="mono ${k.revoked ? "faint" : ""}">${esc(k.prefix)}…</span>
         ${k.revoked ? '<span class="pill warn">revoked</span>'
                     : '<span class="pill live">active</span>'}
-        <span class="faint">${k.last_used_at ? "used " + ago(k.last_used_at) : "never used"}</span>
+        <!-- last_used_at is deliberately never written on the serving path (auth.py), so a
+             null means "we don't track this", not "unused" — say so honestly. -->
+        <span class="faint">${k.last_used_at ? "used " + ago(k.last_used_at) : "usage not tracked"}</span>
         ${exp}${actions}</div>`;
     }).join("") ||
       '<span class="faint" style="font-size:11px">no keys</span>';
+    // Active-session count is optional in the contract — a pill only when the field is present
+    // and > 0, so the card degrades gracefully before/without the backend field. Admins get a
+    // revoke-sessions action next to it (the Access screen is admin-only, but gate it anyway).
+    const sessCount = typeof p.sessions === "number" && p.sessions > 0 ? p.sessions : 0;
+    const sessionUi = sessCount
+      ? `<span class="pill acc">${sessCount} ${plural(sessCount, "session")}</span>` +
+        (canRole("admin")
+          ? `<button type="button" class="link btn-bare" data-act="revokeSessions" data-pid="${esc(p.id)}" data-name="${esc(p.name || "")}"
+               style="color:var(--danger)">revoke sessions</button>`
+          : "")
+      : "";
     return `<div class="card pad">
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <span style="font-size:13.5px;font-weight:700">${esc(p.name || p.id)}</span>
         <span class="tag mut">${esc(p.kind)}</span>
         <span class="mono faint" style="font-size:11.5px">${esc(p.id)}</span>
+        ${sessionUi}
         <div class="grow"></div>
         <button class="btn" data-act="addBinding" data-pid="${esc(p.id)}">+ role</button>
         <button class="btn" data-act="issueKey" data-pid="${esc(p.id)}" data-name="${esc(p.name)}">+ key</button></div>
@@ -144,7 +161,7 @@ async function screenAccess() {
     <div style="font-size:12.5px">You're signed in as <b>${me ? esc(me.name) : "…"}</b>${myRole ? ` <span class="pill acc">${esc(myRole)}</span>` : ""}.</div>
     <div class="faint" style="font-size:11.5px;margin-top:4px">Keys are shown once at creation and can only be revoked — your current key isn't displayed anywhere. Switch keys from the account menu in the sidebar.</div></div>`;
 
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Access</span>
       <span class="sub">users, roles, and API keys</span>
       <div class="grow"></div>
@@ -212,6 +229,7 @@ function renderPlayResult(r, pinned) {
 }
 
 async function screenPlay() {
+  const main = el("main");   // capture before any await (Issue B)
   // Prompt picker: enumerate what exists instead of asking for a free-typed id.
   let pids = [];
   try {
@@ -229,7 +247,7 @@ async function screenPlay() {
     : '{"customer_name": "Acme", "history": []}';
   const pinned = !!window._playPin;
   const last = window._playLast;
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Playground — <i>${esc(State.env)}</i></span>
       <span class="sub">try a request as any user — see exactly what they'd get, and capture a pin to reproduce it</span></div>
     <div class="panelrow">

@@ -19,6 +19,7 @@ import os
 import secrets
 import threading
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -125,8 +126,49 @@ def needs_upgrade(stored: str, pepper: str | None = None) -> bool:
     return bool(_current_pepper(pepper)) and not stored.startswith(_V2_PREFIX)
 
 
+# Stored lookup prefix. Historically 16 chars (with the 10-char `incant_sk_` literal
+# that is only 24 random bits → ~50% birthday-collision odds near 5k keys). New keys
+# store 20 chars (40 random bits). Lookups must still match legacy 16-char rows, so we
+# key the cache by the *stored* prefix and, at auth time, probe both lengths.
+_PREFIX_LEN = 20
+_LEGACY_PREFIX_LEN = 16
+
+
 def key_prefix(raw: str) -> str:
-    return raw[:16]
+    """Store-time prefix for a NEW key (20 chars). Lookups tolerate the legacy 16."""
+    return raw[:_PREFIX_LEN]
+
+
+def _new_raw_key() -> str:
+    """A fresh opaque service key. Factored out so tests can force a prefix collision."""
+    return "incant_sk_" + uuid.uuid4().hex
+
+
+def issue_api_key(
+    session: Session, *, principal_id: str, name: str,
+    expires_at: "dt.datetime | None" = None, attempts: int = 3,
+) -> tuple[str, "models.ApiKey"]:
+    """Generate and persist a fresh API key, returning ``(raw_key, row)``.
+
+    The prefix is unique (``uq_apikey_prefix``). A collision is astronomically unlikely
+    (40 random bits), but on the off chance two issuances pick the same prefix, the
+    INSERT is done under a SAVEPOINT and simply regenerated — a duplicate never surfaces
+    as a 500. The caller owns the surrounding transaction (flush/commit)."""
+    from sqlalchemy.exc import IntegrityError
+
+    last: Exception | None = None
+    for _ in range(attempts):
+        raw = _new_raw_key()
+        row = models.ApiKey(principal_id=principal_id, prefix=key_prefix(raw),
+                            hash=hash_key(raw), name=name, expires_at=expires_at)
+        try:
+            with session.begin_nested():   # SAVEPOINT: a dup rolls back to here only
+                session.add(row)
+                session.flush()
+            return raw, row
+        except IntegrityError as exc:
+            last = exc
+    raise last or RuntimeError("issue_api_key: exhausted retries")  # pragma: no cover
 
 
 # ── browser sessions (server-side, HttpOnly cookie) ──────────────────────────
@@ -221,13 +263,19 @@ class AuthCache:
     """In-memory API-key table so the render hot path does no per-request DB read
     and keeps authenticating through a Postgres outage (§8, §10, §15).
 
-    The whole (small) key set is snapshotted from the DB, refreshed on a TTL and
-    on demand. On a miss we force one throttled reload to pick up a freshly issued
-    key; if the DB is unreachable we keep serving the last-known-good table.
+    The whole (small) key set is snapshotted from the DB. The periodic TTL reload runs
+    in the BACKGROUND — :meth:`refresh`, driven by the control-plane poll loop — so it
+    never lands on a request (§8 "No DB per request"). The request path (:meth:`identify`)
+    only ever reaches the DB to (a) cold-load an empty cache or (b) do one throttled
+    reload on a miss, so a key just issued on another replica still authenticates. If the
+    DB is unreachable we keep serving the last-known-good table.
     """
 
     def __init__(self, ttl: float = 5.0, min_refresh: float = 1.0) -> None:
-        self._entries: dict[str, _KeyEntry] = {}
+        # prefix -> LIST of candidate entries. A prefix collision (or a legacy 16-char
+        # prefix that is itself a prefix of a newer key) then costs one extra hash check
+        # instead of a wrong 401 — we verify the full hash against each candidate.
+        self._entries: dict[str, list[_KeyEntry]] = {}
         self._loaded = False
         self._last_refresh = 0.0
         self._ttl = ttl
@@ -244,26 +292,59 @@ class AuthCache:
         bindings: dict[str, list[Binding]] = defaultdict(list)
         for b in session.execute(select(models.RoleBinding)).scalars():
             bindings[b.principal_id].append(Binding(b.role, b.project_id, b.environment_id))
-        entries: dict[str, _KeyEntry] = {}
+        entries: dict[str, list[_KeyEntry]] = defaultdict(list)
         for k in session.execute(select(models.ApiKey)).scalars():
-            entries[k.prefix] = _KeyEntry(
+            entries[k.prefix].append(_KeyEntry(
                 prefix=k.prefix, hash=k.hash, revoked=bool(k.revoked),
                 expires_at=k.expires_at, principal_id=k.principal_id,
                 principal_name=principals.get(k.principal_id, k.principal_id),
                 bindings=tuple(bindings.get(k.principal_id, ())),
-            )
-        self._entries = entries
+            ))
+        self._entries = dict(entries)
         self._loaded = True
         self._last_refresh = time.monotonic()
 
-    def _maybe_refresh(self, session: Session, prefix: str) -> None:
+    def _candidates(self, raw: str) -> list[_KeyEntry]:
+        """Entries whose stored prefix could match `raw` — probing both the new 20-char
+        and legacy 16-char store lengths. The full-hash verify in identify() decides."""
+        out: list[_KeyEntry] = []
+        seen: set[int] = set()
+        for plen in (_PREFIX_LEN, _LEGACY_PREFIX_LEN):
+            for entry in self._entries.get(raw[:plen], ()):  # type: ignore[arg-type]
+                if id(entry) not in seen:
+                    seen.add(id(entry))
+                    out.append(entry)
+        return out
+
+    def refresh(self, session: Session) -> None:
+        """Background TTL-driven reload, called by the control-plane poll loop
+        (:meth:`incant.service.AppContext.refresh_control_plane`). The periodic
+        whole-table reload lives HERE now — moved off the per-request path so the render
+        hot path does no per-request DB read (§8). Reloads only when the cached table has
+        aged past the TTL (or was never loaded); a still-fresh table is left untouched.
+
+        Errors propagate to the caller, which flips the node's DB-health flag; the
+        last-known-good table stays intact regardless, because :meth:`_load` swaps
+        ``_entries`` only after a fully successful read (a mid-read failure leaves the old
+        table in place)."""
+        with self._lock:
+            if self._loaded and (time.monotonic() - self._last_refresh) <= self._ttl:
+                return
+            self._load(session)
+
+    def _maybe_refresh(self, session: Session, raw: str) -> None:
+        # Per-request refresh is deliberately minimal — the TTL-elapsed reload moved to
+        # the background :meth:`refresh` (§8). Only two conditions still touch the DB from
+        # a request: (a) a cold cache (nothing loaded yet — we cannot authenticate anyone
+        # until we have), and (b) a throttled reload on a MISS, so a key freshly issued on
+        # this or another replica is picked up promptly rather than waiting for the poll.
         def _need() -> bool:
+            if not self._loaded:
+                return True
+            present = (raw[:_PREFIX_LEN] in self._entries
+                       or raw[:_LEGACY_PREFIX_LEN] in self._entries)
             age = time.monotonic() - self._last_refresh
-            return (
-                not self._loaded
-                or age > self._ttl
-                or (prefix not in self._entries and age >= self._min_refresh)
-            )
+            return not present and age >= self._min_refresh
 
         if not _need():
             return
@@ -307,25 +388,32 @@ class AuthCache:
         except SQLAlchemyError:
             return  # best-effort; a failed upgrade just retries next auth
         with self._lock:
-            cur = self._entries.get(entry.prefix)
-            if cur is not None and cur.hash == entry.hash:
-                self._entries[entry.prefix] = replace(cur, hash=new_hash)
+            bucket = self._entries.get(entry.prefix)
+            if bucket:
+                for i, cur in enumerate(bucket):
+                    if cur.hash == entry.hash and cur.principal_id == entry.principal_id:
+                        bucket[i] = replace(cur, hash=new_hash)
+                        break
 
     def identify(self, session: Session, authorization: str | None) -> Identity:
         if not authorization or not authorization.lower().startswith("bearer "):
             raise AuthError(401, "missing bearer credential")
         raw = authorization[7:].strip()
-        prefix = key_prefix(raw)
-        self._maybe_refresh(session, prefix)
-        entry = self._entries.get(prefix)
-        if entry is None or entry.revoked or not verify_key(raw, entry.hash):
-            raise AuthError(401, "invalid credential")
-        if _expired(entry.expires_at, dt.datetime.now(dt.timezone.utc)):
-            raise AuthError(401, "credential expired")
-        if needs_upgrade(entry.hash):
-            self._upgrade_hash(entry, raw)
-        # No last_used_at write here — the serving path must not write (§8, §15).
-        return Identity(entry.principal_id, entry.principal_name, list(entry.bindings))
+        self._maybe_refresh(session, raw)
+        # Collision-tolerant: verify the full hash against every candidate sharing the
+        # prefix. At most one can match (distinct keys have distinct hashes), so a
+        # collision costs one extra constant-time compare, never a wrong 401.
+        now = dt.datetime.now(dt.timezone.utc)
+        for entry in self._candidates(raw):
+            if entry.revoked or not verify_key(raw, entry.hash):
+                continue
+            if _expired(entry.expires_at, now):
+                raise AuthError(401, "credential expired")
+            if needs_upgrade(entry.hash):
+                self._upgrade_hash(entry, raw)
+            # No last_used_at write here — the serving path must not write (§8, §15).
+            return Identity(entry.principal_id, entry.principal_name, list(entry.bindings))
+        raise AuthError(401, "invalid credential")
 
 
 DEV_ADMIN_KEY = "incant_sk_dev_admin"  # the well-known, unsafe development key

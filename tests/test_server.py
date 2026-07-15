@@ -1055,6 +1055,153 @@ def test_metrics_requires_auth(client):
     assert client.get("/metrics").status_code == 401
 
 
+def test_metrics_exposes_git_reads_counter(client):
+    # The memory-first fall-through counter is registered and scrapeable.
+    r = client.get("/metrics", headers=auth())
+    assert r.status_code == 200
+    assert "incant_content_git_reads_total" in r.text
+
+
+# ── key-prefix collision tolerance (Item 2) ──────────────────────────
+
+def test_auth_cache_prefix_collision_both_authenticate(client):
+    # Two distinct keys forced into the SAME lookup bucket (a prefix collision) must
+    # both authenticate: the cache verifies the full hash against every candidate.
+    import time as _time
+    from incant.server.auth import AuthCache, _KeyEntry, hash_key
+
+    shared = "incant_sk_" + "c" * 10          # exactly 20 chars -> identical [:20] prefix
+    raw1, raw2 = shared + "1111", shared + "2222"
+    cache = AuthCache()
+    cache._entries = {shared: [
+        _KeyEntry(prefix=shared, hash=hash_key(raw1, pepper=""), revoked=False,
+                  expires_at=None, principal_id="p1", principal_name="one", bindings=()),
+        _KeyEntry(prefix=shared, hash=hash_key(raw2, pepper=""), revoked=False,
+                  expires_at=None, principal_id="p2", principal_name="two", bindings=()),
+    ]}
+    cache._loaded = True
+    cache._last_refresh = _time.monotonic()   # suppress any DB refresh
+    assert cache.identify(None, f"Bearer {raw1}").principal_id == "p1"
+    assert cache.identify(None, f"Bearer {raw2}").principal_id == "p2"
+    # A key sharing the prefix but with no matching hash is still rejected.
+    from incant.server.auth import AuthError
+    with pytest.raises(AuthError):
+        cache.identify(None, f"Bearer {shared}9999")
+
+
+def test_legacy_16char_prefix_row_still_authenticates(client):
+    # A row stored with the OLD 16-char prefix must keep authenticating even though new
+    # keys store 20 chars (identify probes both lengths).
+    raw = "incant_sk_legacy00000000000000000000"
+    with session_scope() as s:
+        s.add(models.Principal(id="p_legacy", kind="service", subject="legacy", name="legacy"))
+        s.flush()
+        s.add(models.ApiKey(principal_id="p_legacy", prefix=raw[:16], hash=hash_key(raw),
+                            name="legacy"))
+        s.add(models.RoleBinding(principal_id="p_legacy", role="admin"))
+    get_app().invalidate_auth()
+    assert client.get("/mgmt/overview?environment=prod", headers=auth(raw)).status_code == 200
+
+
+def test_issuance_retries_on_prefix_collision(client, monkeypatch):
+    import incant.server.auth as authmod
+
+    first = client.post("/mgmt/keys", json={"principal_name": "first", "role": "viewer"},
+                        headers=auth()).json()["key"]
+    # Force the next issuance to first pick a raw that COLLIDES on prefix with `first`,
+    # then a unique one — the SAVEPOINT retry must recover and return the fresh key.
+    colliding = first[:20] + "000000000000"
+    fresh = "incant_sk_" + "a1b2c3d4" * 4
+    seq = iter([colliding, fresh])
+    monkeypatch.setattr(authmod, "_new_raw_key", lambda: next(seq))
+
+    r = client.post("/mgmt/keys", json={"principal_name": "second", "role": "viewer"},
+                    headers=auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["key"] == fresh                       # retried past the collision
+    assert client.get("/mgmt/whoami", headers=auth(fresh)).status_code == 200
+
+
+# ── session administration (Item 4) ──────────────────────────────────
+
+def _insert_session(principal_id, *, remember=False, ttl_hours=12):
+    now = dt.datetime.now(dt.timezone.utc)
+    with session_scope() as s:
+        s.add(models.Session(
+            id=new_session_id(), token_hash=hash_key(new_session_token()),
+            principal_id=principal_id, created_at=now,
+            expires_at=now + dt.timedelta(hours=ttl_hours), last_seen_at=now,
+            csrf_token="csrf-x", remember=remember))
+
+
+def test_list_sessions_marks_current_cookie_session(client):
+    body = login(client)                       # session A (cookie in the jar)
+    pid = body["principal_id"]
+    _insert_session(pid)                        # session B (same principal)
+    r = client.get("/auth/sessions")           # cookie-authenticated
+    assert r.status_code == 200, r.text
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 2
+    assert sum(1 for s in sessions if s["current"]) == 1   # exactly the cookie session
+    for s in sessions:
+        assert {"id", "created_at", "last_seen_at", "expires_at",
+                "remember", "current"} <= s.keys()
+
+
+def test_list_sessions_bearer_marks_none_current(client):
+    pid = client.get("/mgmt/whoami", headers=auth()).json()["principal_id"]
+    _insert_session(pid)
+    _insert_session(pid)
+    r = client.get("/auth/sessions", headers=auth())       # bearer — no current session
+    assert r.status_code == 200, r.text
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 2 and all(not s["current"] for s in sessions)
+
+
+def test_sign_out_everywhere_kills_all_sessions(client):
+    body = login(client)                       # session A (cookie)
+    pid = body["principal_id"]
+    _insert_session(pid)                        # a second session for the same principal
+    # CSRF is required in cookie mode.
+    assert client.delete("/auth/sessions").status_code == 403
+    r = client.delete("/auth/sessions", headers={"X-Incant-CSRF": body["csrf"]})
+    assert r.status_code == 204, r.text
+    assert r.headers["X-Incant-Sessions-Deleted"] == "2"
+    with session_scope() as s:
+        remaining = s.execute(
+            select(models.Session).where(models.Session.principal_id == pid)
+        ).scalars().all()
+    assert remaining == []
+    assert client.get("/auth/session").status_code == 401   # cookie cleared too
+
+
+def test_admin_revoke_principal_sessions(client):
+    pid = client.post("/mgmt/keys", json={"principal_name": "svc", "role": "viewer"},
+                      headers=auth()).json()["principal_id"]
+    _insert_session(pid)
+    _insert_session(pid)
+    r = client.delete(f"/mgmt/principals/{pid}/sessions", headers=auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["revoked"] == 2
+    with session_scope() as s:
+        assert s.execute(
+            select(models.Session).where(models.Session.principal_id == pid)
+        ).scalars().first() is None
+        actions = [a.action for a in s.execute(select(models.AuditLog)).scalars()]
+    assert "session.revoke_all" in actions
+    assert client.delete("/mgmt/principals/p_nope/sessions", headers=auth()).status_code == 404
+
+
+def test_principals_payload_includes_active_session_count(client):
+    body = login(client)                       # +1 active session on the admin principal
+    pid = body["principal_id"]
+    _insert_session(pid)                        # +1 more
+    _insert_session(pid, ttl_hours=-1)          # expired -> must NOT count
+    d = client.get("/mgmt/principals", headers=auth()).json()
+    me = next(p for p in d["principals"] if p["id"] == pid)
+    assert me["sessions"] == 2
+
+
 def test_metrics_ok_with_viewer_key(client):
     r = client.get("/metrics", headers=auth())  # admin implies viewer
     assert r.status_code == 200 and "incant_render_seconds" in r.text

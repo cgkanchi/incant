@@ -90,6 +90,13 @@ def reset_schema() -> None:
         )
 
     Base.metadata.drop_all(engine())
+    # `alembic_version` is created by Alembic, not Base.metadata, so drop_all leaves it
+    # behind. A stale stamp (< head) would make ctx.initialize()'s ensure_schema try to
+    # re-run migrations against the tables create_all just built (DuplicateTable). Drop it
+    # so ensure_schema instead stamps head over the create_all'd schema, as intended for
+    # test DBs (which are built by create_all, never by migrations).
+    with engine().begin() as conn:
+        conn.exec_driver_sql("DROP TABLE IF EXISTS alembic_version")
     Base.metadata.create_all(engine())
 
 

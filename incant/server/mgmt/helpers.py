@@ -3,8 +3,11 @@ read helpers, and payload shapers. No routes here."""
 
 from __future__ import annotations
 
+import datetime as dt
+from collections import defaultdict
+
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ... import models
@@ -69,6 +72,87 @@ def _current_live(session, env_id, prompt_id, version) -> models.PointerMove | N
             models.PointerMove.version_number == version,
         ).order_by(models.PointerMove.moved_at.desc(), models.PointerMove.id.desc())
     ).scalars().first()
+
+
+# ── bulk read helpers (overview) ─────────────────────────────────────
+#
+# The library overview needs the same three facts — validated tip distance, current
+# live pointer, open-draft count — for *every* prompt at once. Calling the per-prompt
+# helpers above in a loop is one SELECT per prompt per fact; these bulk variants load
+# each fact for the whole library in a single query, then the overview indexes into the
+# resulting maps. Signatures of the per-call helpers stay untouched — get_versions and
+# friends still use them for a single prompt's detail page.
+
+def _validated_by_version(session) -> dict[tuple[str, int], list[str]]:
+    """Every valid commit for every (prompt, version), newest-first — the bulk analogue
+    of ``_validated_newest_first``. Same ordering, so a slice keyed by (prompt, version)
+    is byte-for-byte the per-call helper's result and ``_tip_ahead_from_map`` yields the
+    identical index."""
+    rows = session.execute(
+        select(models.CommitValidation)
+        .where(models.CommitValidation.status == "valid")
+        .order_by(models.CommitValidation.validated_at.desc(), models.CommitValidation.id.desc())
+    ).scalars()
+    out: dict[tuple[str, int], list[str]] = defaultdict(list)
+    for r in rows:
+        out[(r.prompt_id, r.version_number)].append(r.sha)
+    return out
+
+
+def _tip_ahead_from_map(shas: list[str], live_sha: str) -> int:
+    """``_tip_ahead`` against a pre-fetched newest-first SHA list rather than a per-call
+    query. Replicates the per-call logic exactly: distance of the live SHA from the tip,
+    the full count if the live SHA isn't among the validated commits, 0 if none exist."""
+    if live_sha in shas:
+        return shas.index(live_sha)
+    return len(shas) if shas else 0
+
+
+def _current_live_bulk(session, env_id) -> dict[tuple[str, int], models.PointerMove]:
+    """The current (newest) live pointer for every (prompt, version) in one env, one
+    query — the bulk analogue of ``_current_live``. Rows arrive newest-first, so the
+    first row seen per key is the live one (``setdefault`` keeps it)."""
+    rows = session.execute(
+        select(models.PointerMove)
+        .where(models.PointerMove.environment_id == env_id)
+        .order_by(models.PointerMove.moved_at.desc(), models.PointerMove.id.desc())
+    ).scalars()
+    out: dict[tuple[str, int], models.PointerMove] = {}
+    for r in rows:
+        out.setdefault((r.prompt_id, r.version_number), r)
+    return out
+
+
+def _open_draft_counts(session) -> dict[str, int]:
+    """Open/approved draft count per prompt in one GROUP BY, replacing the per-prompt
+    COUNT the overview used to run inside its loop."""
+    rows = session.execute(
+        select(models.Draft.prompt_id, func.count())
+        .where(models.Draft.status.in_(["open", "approved"]))
+        .group_by(models.Draft.prompt_id)
+    ).all()
+    return {pid: n for pid, n in rows}
+
+
+def _drafts_needing_review(session) -> dict[str, int]:
+    """Per-prompt count of drafts that ACTUALLY need review, in one GROUP BY — the truthful
+    backing for the library's "Needs review" filter.
+
+    "Needs review" only means something under a review policy: a draft awaits review only
+    when its prompt's PROJECT requires approvals (Project.review_policy > 0; 0 = no review).
+    And only *open* drafts are outstanding — an 'approved' draft has already collected its
+    reviews, so it is deliberately excluded. Joining Draft → Prompt → Project lets us apply
+    both conditions in the DB; prompts under a no-review project (or with no open drafts)
+    simply never appear in the map, so ``.get(pid, 0)`` yields 0. This replaces the old UI
+    heuristic (any open-or-approved draft, policy ignored), which over-counted."""
+    rows = session.execute(
+        select(models.Draft.prompt_id, func.count())
+        .join(models.Prompt, models.Prompt.id == models.Draft.prompt_id)
+        .join(models.Project, models.Project.id == models.Prompt.project_id)
+        .where(models.Draft.status == "open", models.Project.review_policy > 0)
+        .group_by(models.Draft.prompt_id)
+    ).all()
+    return {pid: n for pid, n in rows}
 
 
 def _newest_version(session, prompt_id: str):
@@ -197,6 +281,14 @@ def _principal_payload(session: Session, p: models.Principal) -> dict:
         select(models.ApiKey).where(models.ApiKey.principal_id == p.id)
         .order_by(models.ApiKey.id)
     ).scalars().all()
+    # Active (unexpired) browser-session count — the admin UI shows it and offers
+    # "revoke all" (DELETE /mgmt/principals/{id}/sessions).
+    active_sessions = session.execute(
+        select(func.count()).select_from(models.Session).where(
+            models.Session.principal_id == p.id,
+            models.Session.expires_at > dt.datetime.now(dt.timezone.utc),
+        )
+    ).scalar() or 0
     return {
         "id": p.id, "name": p.name, "kind": p.kind, "created_at": p.created_at.isoformat(),
         "bindings": [{"id": b.id, "role": b.role, "project_id": b.project_id,
@@ -205,4 +297,5 @@ def _principal_payload(session: Session, p: models.Principal) -> dict:
                   "expires_at": k.expires_at.isoformat() if k.expires_at else None,
                   "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None}
                  for k in keys],
+        "sessions": active_sessions,
     }

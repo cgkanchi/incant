@@ -11,7 +11,8 @@ from __future__ import annotations
 import datetime as dt
 import hmac
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -22,6 +23,7 @@ from .auth import (
     SESSION_TTL_DEFAULT,
     SESSION_TTL_REMEMBER,
     Identity,
+    _expired,
     hash_key,
     identity_for_principal,
     lookup_session,
@@ -30,7 +32,7 @@ from .auth import (
     new_session_token,
     touch_last_seen,
 )
-from .deps import _authenticate, get_session
+from .deps import _authenticate, _presented_credential, get_session
 from .schemas import SessionLoginRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -115,6 +117,61 @@ def delete_session(
         raise HTTPException(status_code=403, detail="csrf_required")
     session.delete(row)
     resp = Response(status_code=204)
+    resp.delete_cookie(SESSION_COOKIE, path="/", samesite="strict",
+                       secure=_cookie_secure(request))
+    return resp
+
+
+def _session_row(row: "models.Session", *, current: bool) -> dict:
+    def _iso(x):
+        return x.isoformat() if x else None
+    return {"id": row.id, "created_at": _iso(row.created_at),
+            "last_seen_at": _iso(row.last_seen_at), "expires_at": _iso(row.expires_at),
+            "remember": row.remember, "current": current}
+
+
+@router.get("/sessions")
+def list_sessions(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+):
+    """The caller's own active sessions. Cookie OR bearer auth: a cookie caller sees its
+    sessions with ``current: true`` on the one making the request; a bearer caller sees
+    the principal's sessions with ``current`` always false (no session made the call)."""
+    ident = _authenticate(request, session, authorization, allow_cookie=True)
+    current_id = None
+    if not _presented_credential(authorization):  # cookie caller — mark the current one
+        row = lookup_session(session, request.cookies.get(SESSION_COOKIE) or "")
+        if row is not None:
+            current_id = row.id
+    now = dt.datetime.now(dt.timezone.utc)
+    rows = session.execute(
+        select(models.Session).where(models.Session.principal_id == ident.principal_id)
+        .order_by(models.Session.created_at.desc())
+    ).scalars().all()
+    return {"sessions": [
+        _session_row(r, current=(r.id == current_id))
+        for r in rows if not _expired(r.expires_at, now)
+    ]}
+
+
+@router.delete("/sessions", status_code=204)
+def delete_all_sessions(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+):
+    """Sign out everywhere: delete every session for the caller's principal, including
+    the current one. Cookie OR bearer auth; in cookie mode ``_authenticate`` enforces
+    CSRF (this is a non-GET). Returns 204 with an ``X-Incant-Sessions-Deleted`` count and
+    clears the caller's own cookie."""
+    ident = _authenticate(request, session, authorization, allow_cookie=True)
+    count = session.execute(
+        delete(models.Session).where(models.Session.principal_id == ident.principal_id)
+    ).rowcount or 0
+    resp = Response(status_code=204)
+    resp.headers["X-Incant-Sessions-Deleted"] = str(count)
     resp.delete_cookie(SESSION_COOKIE, path="/", samesite="strict",
                        secure=_cookie_secure(request))
     return resp

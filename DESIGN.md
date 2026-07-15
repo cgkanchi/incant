@@ -16,7 +16,8 @@ Three planes:
   pointers**, review state, variable metadata, RBAC, audit. Operational state at ops
   tempo — and no content, ever: the DB stores SHAs, never template text.
 - **Memory is the serving plane.** Compiled templates and rule snapshots; the render
-  path touches no git, no disk, no DB.
+  path is **memory-first** — the warm common case touches no git, no disk, no DB, and
+  falls through to a single git read only on a content-cache miss (see §8).
 
 The core loop: authors commit changes to version files (cheap, gated by review); rules
 and live pointers decide which version — at which exact commit — serves to whom (gated,
@@ -63,7 +64,7 @@ serving; pointer moves do.
   who never touch git. Incant owns review.
 - **Minimal metadata.** The repo contains `.j2` files, nothing else. Variables are
   extracted from the Jinja AST; refinements live in the DB.
-- **Fast.** p50 ~1 ms, **p99 single-digit ms**; memory-only hot path.
+- **Fast.** p50 ~1 ms, **p99 single-digit ms**; memory-first hot path.
 - **Production-grade RBAC** over rendering, authoring, targeting, pointer moves, admin.
 
 ### Non-goals (v1)
@@ -390,9 +391,12 @@ including "make live" — serves everywhere in **< 2 s**.
   naming it; DB-held defaults applied pre-render), autoescape off (plain text for
   LLMs). The loader serves only registered content at pinned blobs — never a
   filesystem.
-- **Memory-only hot path**: key check (in-memory) → rule eval (pure function over the
+- **Memory-first hot path**: key check (in-memory) → rule eval (pure function over the
   snapshot, µs) → compiled-template render (sub-ms typical). **p50 ~1 ms, p99
-  single-digit ms.** No git, disk, or DB per request.
+  single-digit ms.** No DB per request; no git/disk either on the warm common path — the
+  one exception is a content-cache miss (cold or LRU-evicted blob, or an old validated
+  pin), which does a single git read, caches it, then serves from memory thereafter.
+  `incant_content_git_reads_total` counts those fall-throughs (≈0 on a warm node).
 - **Content cache**: blobs are extracted from git into a content-addressed cache when a
   SHA becomes referenceable (validation time), compiled templates cached by blob hash —
   immutable, LRU-evicted, never invalidated.

@@ -53,8 +53,26 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
     if env is None:
         raise KeyError(f"unknown environment {env_id!r}")
 
-    valid_shas, validated_by_version = _validated_shas(session)
+    # The global valid-SHA set is no longer used for servability (see the
+    # prompt-aware `servable_pairs` below); only the per-(prompt,version) map is.
+    _valid_shas, validated_by_version = _validated_shas(session)
     pointer_hist = _pointer_history(session, env_id)
+
+    # Defense-in-depth for the evaluator's servability check (§7). Full
+    # (prompt, version, SHA) tuple integrity is enforced at *write* time — by
+    # `TargetingService.make_live` and by rule pins in `_validate_rule_targets` —
+    # so a live pointer or pinned SHA can never reach a prompt it wasn't validated
+    # for. This snapshot check is the read-side backstop: it upgrades the old
+    # `sha in valid_shas` (valid for *any* prompt) to `(prompt, sha) validated for
+    # *this* prompt`. Version is intentionally absent from the closure: the core
+    # evaluator's callback signature is (prompt_id, sha) (see core/evaluate.py and
+    # core/model.py), and version integrity is already owned by the write-time
+    # checks — so we key on (prompt, sha) and let the evaluator supply the prompt.
+    servable_pairs: set[tuple[str, str]] = {
+        (prompt_id, sha)
+        for (prompt_id, _version), shas in validated_by_version.items()
+        for sha in shas
+    }
 
     # Versions
     versions: dict[str, dict[int, VersionInfo]] = defaultdict(dict)
@@ -137,5 +155,5 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
         track_tip=env.track_tip,
         stale=stale,
         killed=killed,
-        servable=lambda _p, sha: sha in valid_shas,
+        servable=lambda prompt_id, sha: (prompt_id, sha) in servable_pairs,
     )

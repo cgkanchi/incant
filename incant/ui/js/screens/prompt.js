@@ -2,10 +2,13 @@
 "use strict";
 
 async function screenOverview() {
+  const main = el("main");   // capture before any await (Issue B)
   const pid = State.route.pid;
+  // fetchEnvRules retries scoped to this prompt's project on a 403, so a project-scoped
+  // viewer still sees the rules governing THIS prompt (testing hero rows below).
   const [d, rulesData] = await Promise.all([
     GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`),
-    GET(`/mgmt/envs/${enc(State.env)}/rules`).catch(() => ({ rules: [] })),
+    fetchEnvRules(State.env, pid),
   ]);
   const rules = rulesData.rules || [];
   const liveV = d.versions.find((v) => v.is_default) || d.versions.find((v) => v.live_sha) || null;
@@ -94,7 +97,7 @@ async function screenOverview() {
     ? d.includes.map((i) => `<div style="display:flex;gap:8px;align-items:center"><span style="color:var(--acc-ink)">↳</span><span class="mono" style="font-size:11px">${esc(i)}</span></div>`).join("")
     : '<div class="faint">No includes.</div>';
 
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div class="crumb"><a href="#/prompts" data-act="go" data-hash="#/prompts">Prompts</a> / ${esc(pid.split("/")[0])} /</div>
     <div class="h1row">
       <div><div class="page-h1 mono">${esc(pid)}</div>

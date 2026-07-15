@@ -2,6 +2,7 @@
 "use strict";
 
 async function screenPointers() {
+  const main = el("main");   // capture before any await (Issue B)
   const pid = State.route.pid;
   const dv = await GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`);
   const version = State.route.q.v ? parseInt(State.route.q.v)
@@ -38,7 +39,7 @@ async function screenPointers() {
          <span class="faint" style="font-size:11px">preview the impact before it goes live${locked ? ` — ${esc(State.env)} is locked, type the prompt id to confirm` : ""}</span>`
       : `<span style="font-size:12px;color:var(--live);font-weight:600">✓ The latest edits are already live — nothing to publish.</span>`;
 
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Publish history — <i>v${version} · ${esc(State.env)}</i></span></div>
     <div style="font-size:12px;color:var(--mut);margin-bottom:18px">Every publish, newest first. The top entry is what people see now. Any earlier state is one click from being live again.</div>
     <div class="card">${moves}</div>
@@ -58,7 +59,7 @@ async function openPublishModal({ v, toSha, toShort, mode }) {
   try {
     [dv, rd] = await Promise.all([
       GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(env)}`),
-      GET(`/mgmt/envs/${enc(env)}/rules`).catch(() => ({ rules: [] })),
+      fetchEnvRules(env, pid),   // retries scoped to the prompt's project on a 403
     ]);
   } catch (e) { const b = el("publishModalBody"); if (b) b.innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`; return; }
   let tcs = [];

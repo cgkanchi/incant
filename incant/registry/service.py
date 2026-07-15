@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -246,22 +247,41 @@ class RegistryService:
             .order_by(models.Review.id)
         ).scalars())
 
+    def _find_review(self, draft_id: str, reviewer: str) -> models.Review | None:
+        # scalar_one_or_none is safe: uq_review makes (draft_id, reviewer) unique, so
+        # there is never more than one row to pick (no MultipleResultsFound window).
+        return self.s.execute(
+            select(models.Review).where(
+                models.Review.draft_id == draft_id, models.Review.reviewer == reviewer
+            )
+        ).scalar_one_or_none()
+
     def add_review(self, draft_id: str, reviewer: str, state: str = "approved") -> models.Review:
         d = self.get_draft(draft_id)
         # A principal holds a single, current review state: a later verdict replaces
         # the earlier one. So "changes_requested" clears a prior "approved" (and vice
         # versa) — only "approved" rows count toward the review policy (see approvals()).
-        r = self.s.execute(
-            select(models.Review).where(
-                models.Review.draft_id == draft_id, models.Review.reviewer == reviewer
-            )
-        ).scalar_one_or_none()
         # Bind the verdict to the exact revision it reviewed (Finding 1): it counts only
         # while draft.draft_sha is unchanged. A re-review of edited content re-stamps it.
+        r = self._find_review(draft_id, reviewer)
         if r is None:
-            r = models.Review(draft_id=draft_id, reviewer=reviewer, state=state,
-                              reviewed_sha=d.draft_sha)
-            self.s.add(r)
+            try:
+                # Insert under a SAVEPOINT (add + flush both inside, so the rollback
+                # cleanly discards the pending row and leaves the outer transaction
+                # usable on both Postgres and SQLite).
+                with self.s.begin_nested():
+                    r = models.Review(draft_id=draft_id, reviewer=reviewer, state=state,
+                                      reviewed_sha=d.draft_sha)
+                    self.s.add(r)
+                    self.s.flush()
+            except IntegrityError:
+                # A concurrent double-submit inserted the (draft, reviewer) row first —
+                # re-read the winner and update it instead of duplicating.
+                r = self._find_review(draft_id, reviewer)
+                if r is None:  # pragma: no cover - the constraint fired, so it exists
+                    raise
+                r.state = state
+                r.reviewed_sha = d.draft_sha
         else:
             r.state = state
             r.reviewed_sha = d.draft_sha
@@ -391,10 +411,17 @@ class RegistryService:
 
         d.status = "committed"
         self.s.flush()
-        # Delete the draft ref only after the DB rows are staged, so a flush failure
-        # leaves the draft intact (nothing to compensate). If the *outer* transaction
-        # still fails after this point, the startup sweep reconciles the now-refless
-        # open draft. The committed content already lives on `main` as a validated SHA.
+        # Delete the draft ref only after the DB rows are staged, so a *flush* failure
+        # here leaves the draft fully intact — nothing to compensate. Note the asymmetry
+        # once we pass this line, though: commit_version has already advanced `main`, but
+        # the CommitValidation row above is only *staged*, not yet committed. If the
+        # *outer* transaction still fails after this point, that validation row — and the
+        # version-row/status flip — roll back WITH it, leaving an UNVALIDATED commit on
+        # `main` that no CommitValidation row describes (serving keeps using the last
+        # validated SHA; the new tip is NOT "already a validated SHA"). That drift is not
+        # silently repaired: `reconcile_main_commits` detects the row-less tip at next boot
+        # (LOUD log — a human re-validates/re-publishes or rolls back the git commit), and
+        # the now-refless open draft is discarded by the draft sweep (reconcile_drafts).
         self.git.delete_draft(draft_id)
 
         # Warm the content cache for the freshly-validated SHA.

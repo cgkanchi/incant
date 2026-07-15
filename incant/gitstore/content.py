@@ -13,6 +13,17 @@ from ..core import ContentBlob
 from .store import GitStore
 
 
+def _record_git_read() -> None:
+    """Bump the git-fallthrough counter. Imported lazily (and defensively) so the
+    gitstore package never hard-depends on the server package — avoids an import cycle
+    and keeps the store usable in isolation (unit tests, `incant init`)."""
+    try:
+        from ..server.metrics import content_git_reads_total
+        content_git_reads_total.inc()
+    except Exception:  # pragma: no cover - metrics are best-effort telemetry
+        pass
+
+
 class ContentStore:
     def __init__(self, git: GitStore, cache_max: int = 4096) -> None:
         self.git = git
@@ -33,6 +44,7 @@ class ContentStore:
             self._cache.move_to_end(key)
             return hit
         self.misses += 1
+        _record_git_read()  # serving fell through to git (cold/evicted blob or old pin)
         source = self.git.read(path, ref=commit_sha)
         if source is None:
             raise KeyError(f"{path} not present at {commit_sha}")

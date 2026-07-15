@@ -16,3 +16,10 @@ content_fallbacks_total = Counter(
 rule_skips_total = Counter("incant_rule_skips_total", "Rules skipped as unservable")
 commits_total = Counter("incant_commits_total", "Commits", ["project"])
 validation_failures_total = Counter("incant_validation_failures_total", "Validation failures")
+# Serving is memory-FIRST, not memory-only: on a content-cache miss (cold/evicted blob,
+# or an old validated pin) the ContentStore falls through to a git read. This counter
+# makes that fall-through observable — it should sit at ~0 on a warm node; sustained
+# growth means the working set outgrew the cache or warming is incomplete.
+content_git_reads_total = Counter(
+    "incant_content_git_reads_total", "Serving-path content reads that fell through to git",
+)

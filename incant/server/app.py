@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..db import engine, session_scope
-from ..registry import reconcile_drafts, sweep_expired_sessions
+from ..registry import reconcile_drafts, reconcile_main_commits, sweep_expired_sessions
 from ..service import get_app
 from .auth import AuthError, _IMPLIES, ensure_bootstrap_admin
 from .deps import get_session
@@ -39,6 +39,7 @@ log = logging.getLogger("incant.server")
 
 _UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 _WARM_RETRY_SECONDS = 5.0
+_SESSION_SWEEP_SECONDS = 3600.0  # hourly expired-session sweep (full mode)
 
 # Self-hosted UI CSP. The app serves its own fonts and assets, so everything is
 # 'self'. Two deliberate loosenings: `img-src` allows `data:` (inline SVG/data URIs
@@ -100,6 +101,39 @@ async def _warm_retry_loop(app: FastAPI, ctx) -> None:
             log.exception("background warm retry errored")
 
 
+async def _session_sweep_loop() -> None:
+    """Full mode: sweep expired browser sessions hourly so a long-running node doesn't
+    accumulate dead rows (the boot sweep only runs once). Logs only when it deletes."""
+    while True:
+        await asyncio.sleep(_SESSION_SWEEP_SECONDS)
+        try:
+            with session_scope() as s:
+                sweep_expired_sessions(s)
+        except Exception:  # pragma: no cover - defensive; keep the loop alive
+            log.exception("periodic session sweep errored")
+
+
+async def _control_poll_loop(ctx) -> None:
+    """Background control-plane poll — the piece that keeps the serving hot path DB-free.
+
+    Every INCANT_CONTROL_POLL_SECONDS it opens a session and calls
+    ``ctx.refresh_control_plane(s)``, pulling targeting bumps and the TTL-driven auth
+    reload into memory so requests never read the DB (§8 "No DB per request"; §10 "the DB
+    is never on the per-request path") and cross-replica changes land within the interval
+    — the poll fallback for §7's Postgres LISTEN/NOTIFY. Runs in BOTH full and serve modes
+    because it feeds the serving hot path itself. Never raises out: refresh_control_plane
+    absorbs a DB outage (flipping the stale flag), and anything else is logged so the loop
+    stays alive."""
+    interval = get_settings().control_poll_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            with session_scope() as s:
+                ctx.refresh_control_plane(s)
+        except Exception:  # pragma: no cover - defensive; keep the loop alive
+            log.exception("control-plane poll errored")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -111,11 +145,12 @@ async def lifespan(app: FastAPI):
         ctx.initialize()  # git init + schema (create_all on SQLite, Alembic on Postgres)
         with session_scope() as s:
             ensure_bootstrap_admin(s, settings.bootstrap_admin_key)
-        # Reconcile git draft refs against DB draft rows before serving warms, and
-        # sweep any expired browser sessions in the same pass.
+        # Reconcile git draft refs against DB draft rows before serving warms, sweep any
+        # expired browser sessions, and detect (log, never repair) main-commit orphans.
         with session_scope() as s:
             reconcile_drafts(s, ctx.git)
             sweep_expired_sessions(s)
+            reconcile_main_commits(s, ctx.git)
 
     # Warming is required in both modes: any environment's warm failure leaves the node
     # not ready. In full mode a background loop keeps retrying; in serve mode the same
@@ -126,11 +161,21 @@ async def lifespan(app: FastAPI):
         log.warning("warm incomplete at boot — node not ready; retrying in background")
         retry_task = asyncio.create_task(_warm_retry_loop(app, ctx))
 
+    # Hourly expired-session sweep (full mode only — serve replicas have no sessions).
+    sweep_task = None
+    if settings.mode == "full":
+        sweep_task = asyncio.create_task(_session_sweep_loop())
+
+    # Control-plane poll (BOTH modes): the serving hot path never reads the DB itself;
+    # this loop pulls targeting bumps + auth changes into memory (§7 poll fallback, §8/§10).
+    poll_task = asyncio.create_task(_control_poll_loop(ctx))
+
     try:
         yield
     finally:
-        if retry_task is not None:
-            retry_task.cancel()
+        for task in (retry_task, sweep_task, poll_task):
+            if task is not None:
+                task.cancel()
 
 
 def _has_viewer_anywhere(ident) -> bool:

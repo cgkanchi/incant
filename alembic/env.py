@@ -19,7 +19,12 @@ from incant.db import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False: applying the migration logging config must NOT
+    # silence the application's already-created loggers (incant.service, incant.reconcile,
+    # …). The default (True) disables them, which both hides app logs during a migration
+    # and, under pytest, breaks caplog capture of those loggers after ensure_schema runs
+    # Alembic on Postgres.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Prefer an explicitly-injected URL; otherwise read incant's Settings.
 if not config.get_main_option("sqlalchemy.url"):

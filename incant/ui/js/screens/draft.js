@@ -121,11 +121,12 @@ function applyDraftUpdate(r) {
 }
 
 async function screenDraft() {
+  const main = el("main");   // capture before any await (Issue B); renderDraftStart writes through it too
   await flushAutosave();               // never lose a pending edit when re-entering
   const pid = State.route.pid, q = State.route.q;
   const vq = q.v ? parseInt(q.v) : null;
   const tab = q.tab || "write";
-  el("main").innerHTML = `<div class="empty">Opening draft…</div>`;
+  main.innerHTML = `<div class="empty">Opening draft…</div>`;
 
   if (!State.me) State.me = await GET(`/mgmt/whoami`);
   const [list, dv] = await Promise.all([
@@ -145,7 +146,7 @@ async function screenDraft() {
     // No deep-link and no open draft of the viewer's on the target version → a read-only
     // "start" state, not a silent auto-create. "Start editing vN" creates the draft.
     const targetV = vq || dv.versions.find((x) => x.is_default)?.version || dv.versions[0]?.version || 1;
-    renderDraftStart(pid, targetV, dv.versions);
+    renderDraftStart(main, pid, targetV, dv.versions);
     return;
   }
 
@@ -153,8 +154,9 @@ async function screenDraft() {
     GET(`/mgmt/drafts/${enc(draftId)}`),
     GET(`/mgmt/prompts/${enc(pid)}/test-contexts`),
     // Targeting data feeds the ad-hoc context form: the flags rules actually
-    // check for this prompt (and its includes), with their candidate values.
-    GET(`/mgmt/envs/${enc(State.env)}/rules`).catch(() => ({ rules: [] })),
+    // check for this prompt (and its includes), with their candidate values. Retries
+    // scoped to this prompt's project on a 403 so a project-scoped editor still gets them.
+    fetchEnvRules(State.env, pid),
     GET(`/mgmt/envs/${enc(State.env)}/segments`).catch(() => ({ segments: [] })),
   ]);
 
@@ -198,7 +200,7 @@ async function screenDraft() {
              : tab === "review" ? draftReviewTab(window._dp)
              : draftWriteTab(window._dp);
 
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div class="crumb"><a href="#/prompts" data-act="go" data-hash="#/prompts">Prompts</a> /
       <a href="#/p/${enc(pid)}/overview" data-act="go" data-hash="#/p/${enc(pid)}/overview">${esc(pid)}</a> /</div>
     <div class="h1row"><span class="h1 sm serif">Edit — <i>v${draft.version_number}</i></span>
@@ -219,10 +221,12 @@ async function screenDraft() {
 // The read-only "start" state — shown when there's no draft to open (no ?draft, no open
 // draft of the viewer's on the target version). It shows the version's current text with
 // a primary "Start editing vN"; creating the draft is an explicit choice, not a side effect.
-function renderDraftStart(pid, v, versions) {
+function renderDraftStart(main, pid, v, versions) {
   const vrow = (versions || []).find((x) => x.version === v) || {};
   Auto.draftId = null; Auto.baseSha = null; Auto.conflict = null;   // no live editor here
-  el("main").innerHTML = `<div class="screen">
+  // `main` is the node screenDraft captured at entry, so a superseded draft screen writes
+  // its read-only start state into a detached node rather than over the current route.
+  main.innerHTML = `<div class="screen">
     <div class="crumb"><a href="#/prompts" data-act="go" data-hash="#/prompts">Prompts</a> /
       <a href="#/p/${enc(pid)}/overview" data-act="go" data-hash="#/p/${enc(pid)}/overview">${esc(pid)}</a> /</div>
     <div class="h1row"><span class="h1 sm serif">Edit — <i>v${v}</i></span>

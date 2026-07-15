@@ -6,11 +6,11 @@ import datetime as dt
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ... import models
-from ..auth import _IMPLIES, hash_key, key_prefix, Identity
+from ..auth import _IMPLIES, Identity, issue_api_key
 from ..deps import app_context, get_session, identity
 from ...service import AppContext
 from ..schemas import (
@@ -119,14 +119,13 @@ def create_key(
     _require(ident, "admin")
     if req.role not in _IMPLIES:
         raise HTTPException(400, f"unknown role {req.role!r}")
-    raw = "incant_sk_" + uuid.uuid4().hex
     pid = "p_" + uuid.uuid4().hex[:8]
     expires_at = _expiry(req.expires_in_days)
     session.add(models.Principal(id=pid, kind="service", subject=req.principal_name,
                                  name=req.principal_name))
     session.flush()  # parent row before FK-bearing children
-    session.add(models.ApiKey(principal_id=pid, prefix=key_prefix(raw), hash=hash_key(raw),
-                              name=req.principal_name, expires_at=expires_at))
+    raw, _ = issue_api_key(session, principal_id=pid, name=req.principal_name,
+                           expires_at=expires_at)
     session.add(models.RoleBinding(principal_id=pid, role=req.role,
                                    project_id=req.project_id, environment_id=req.environment_id))
     record_audit(session, ident.name, "principal.create", "principal", pid,
@@ -194,6 +193,25 @@ def remove_binding(
     return {"ok": True}
 
 
+@router.delete("/principals/{pid}/sessions")
+def revoke_principal_sessions(
+    pid: str,
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    """Admin: revoke every browser session for a principal (sign them out everywhere).
+    Audited as ``session.revoke_all``. Returns the number of sessions deleted."""
+    _require(ident, "admin")
+    if session.get(models.Principal, pid) is None:
+        raise HTTPException(404, f"unknown principal {pid}")
+    count = session.execute(
+        delete(models.Session).where(models.Session.principal_id == pid)
+    ).rowcount or 0
+    record_audit(session, ident.name, "session.revoke_all", "principal", pid,
+                 after={"revoked": count})
+    return {"ok": True, "revoked": count}
+
+
 @router.post("/principals/{pid}/keys")
 def issue_key(
     pid: str,
@@ -206,10 +224,8 @@ def issue_key(
     p = session.get(models.Principal, pid)
     if p is None:
         raise HTTPException(404, f"unknown principal {pid}")
-    raw = "incant_sk_" + uuid.uuid4().hex
     expires_at = _expiry(req.expires_in_days)
-    session.add(models.ApiKey(principal_id=pid, prefix=key_prefix(raw), hash=hash_key(raw),
-                              name=p.name, expires_at=expires_at))
+    raw, _ = issue_api_key(session, principal_id=pid, name=p.name, expires_at=expires_at)
     record_audit(session, ident.name, "key.issue", "principal", pid)
     app.invalidate_auth()
     return _issued(raw, pid, expires_at)
@@ -230,11 +246,9 @@ def rotate_key(
     old = session.get(models.ApiKey, key_id)
     if old is None:
         raise HTTPException(404, f"unknown key {key_id}")
-    raw = "incant_sk_" + uuid.uuid4().hex
     expires_at = _expiry(req.expires_in_days)
-    new_key = models.ApiKey(principal_id=old.principal_id, prefix=key_prefix(raw),
-                            hash=hash_key(raw), name=old.name, expires_at=expires_at)
-    session.add(new_key)
+    raw, new_key = issue_api_key(session, principal_id=old.principal_id, name=old.name,
+                                 expires_at=expires_at)
     old.revoked = True
     session.flush()  # materialize the new key's id for the response/audit
     record_audit(session, ident.name, "key.rotate", "principal", old.principal_id,

@@ -47,3 +47,10 @@ curl -s -H "Authorization: Bearer incant_sk_dev_admin" "http://127.0.0.1:8765/mg
 ```
 
 Tests (`uv run pytest`, ~1 min, SQLite) are CI's job — verification is driving the running app.
+
+The proven flows here are now a committed, repeatable suite: `tests/browser/` (opt-in,
+Playwright over system Chrome). Run it with
+`INCANT_BROWSER_TESTS=1 uv run --group browser pytest tests/browser -q` — it boots its
+own seeded SQLite server, so it's a fast way to re-confirm the big UI flows (sign-in,
+CSRF, drafts/autosave conflict, review invalidation, targeting, publish, sign-out,
+mobile/reduced-motion) after a change.

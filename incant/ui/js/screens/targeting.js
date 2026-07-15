@@ -5,13 +5,16 @@
 let _rulesData = null;
 
 async function screenRules() {
+  const main = el("main");   // capture before any await (Issue B)
   const env = State.env;
+  const pid = State.route.pid;
+  // fetchEnvRules retries scoped to this prompt's project on a 403, so a project-scoped
+  // operator can still manage the rules that govern their own prompt.
   const [d, rv] = await Promise.all([
-    GET(`/mgmt/envs/${enc(env)}/rules`),
+    fetchEnvRules(env, pid),
     GET(`/mgmt/envs/${enc(env)}/revisions?limit=25`),
   ]);
   _rulesData = d;   // stashed for the "turn targeting off" confirm modal
-  const pid = State.route.pid;
   // Kill semantics are per-prompt; the header toggle governs the route prompt or,
   // on the env-wide screen, the first prompt-scoped rule's prompt.
   const defaultPid = pid || (d.rules.find((r) => r.prompt_id)?.prompt_id) || null;
@@ -92,7 +95,7 @@ async function screenRules() {
   const testerPid = pid || defaultPid;
   if (window._audience && window._audience.pid !== testerPid) window._audience = null;
 
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
       <span class="page-h1">Who sees what</span>
       ${d.protected ? pill("warn", `${esc(env)} · protected`) : ""}
@@ -393,7 +396,9 @@ async function openComposer({ rule, duplicate, pid }) {
   openModal(`<div id="composerBody"><div class="empty">Loading…</div></div>`, "wide");
   let rulesData, segsData, versions = [];
   try {
-    rulesData = _rulesData || await GET(`/mgmt/envs/${enc(env)}/rules`);
+    // Reuse the screen's stashed rules if present; otherwise fetch, retrying scoped to the
+    // target prompt's project on a 403 (a project-scoped operator composing their own rule).
+    rulesData = _rulesData || await fetchEnvRules(env, targetPid);
     segsData = await GET(`/mgmt/envs/${enc(env)}/segments`);
   } catch (e) { const b = el("composerBody"); if (b) b.innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`; return; }
   const scope = rule ? rule.scope : (targetPid ? "prompt" : "global");

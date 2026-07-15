@@ -24,6 +24,14 @@ dev = [
     "pytest>=8.3",
     "httpx>=0.27",
 ]
+# Opt-in browser end-to-end suite (tests/browser). Not installed by default: run with
+# `uv run --group browser ...`. Drives the real UI with Playwright's sync API (no
+# pytest-playwright — the fixtures call sync_playwright() directly). pytest is repeated
+# so the group is self-contained when installed on its own.
+browser = [
+    "playwright>=1.40",
+    "pytest>=8.3",
+]
 
 [project.scripts]
 incant = "incant.cli:main"
@@ -38,3 +46,11 @@ packages = ["incant"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+filterwarnings = [
+    # Starlette's TestClient still rides on httpx and warns it will prefer a future
+    # `httpx2`. That package is not yet a real, pinnable dependency, and replacing the
+    # whole test transport is disproportionate to a deprecation notice — so silence just
+    # this one message (matched narrowly, not the whole StarletteDeprecationWarning /
+    # UserWarning category) until an upgrade path actually exists.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:UserWarning",
+]

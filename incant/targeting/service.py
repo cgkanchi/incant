@@ -60,14 +60,6 @@ class TargetingService:
         self.s.flush()
         return env.rules_version
 
-    def is_validated(self, sha: str) -> bool:
-        return self.s.execute(
-            select(models.CommitValidation).where(
-                models.CommitValidation.sha == sha,
-                models.CommitValidation.status == "valid",
-            )
-        ).first() is not None
-
     def _version_exists(self, prompt_id: str, version_number: int) -> bool:
         return self.s.execute(
             select(models.Version).where(
@@ -219,8 +211,20 @@ class TargetingService:
         """Advance the live pointer directly. Pointer moves are unilateral — the
         route gates them to releaser; there is no propose→approve ceremony."""
         env = self._env(env_id)
-        if not self.is_validated(to_sha):
-            raise TargetingError(f"SHA {to_sha} is not a validated commit; cannot make live")
+        # Integrity (§7): the pointer may only serve a version that exists for the
+        # prompt, pinned to a SHA validated *for that exact (prompt, version)* — not
+        # merely validated for some other prompt/version that happens to share the
+        # SHA set. This mirrors the write-time checks a rule pin gets in
+        # `_validate_rule_targets`; before the fix `is_validated` waved through any
+        # commit with any valid CommitValidation row, letting (prompt A, v2) point at
+        # a commit validated only for prompt B or a different version of A.
+        if not self._version_exists(prompt_id, version_number):
+            raise TargetingError(
+                f"version {version_number} does not exist for prompt {prompt_id!r}")
+        if not self._is_validated_for(prompt_id, version_number, to_sha):
+            raise TargetingError(
+                f"SHA {to_sha} is not a validated commit for {prompt_id!r} "
+                f"v{version_number}; cannot make live")
         from_sha = self.current_live(env_id, prompt_id, version_number)
         move_id, rv = self._apply_make_live(env, prompt_id, version_number, to_sha,
                                             from_sha, comment)

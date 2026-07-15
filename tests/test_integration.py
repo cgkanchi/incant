@@ -81,21 +81,35 @@ def test_stale_flag_clears_after_db_recovery(app):
     assert primed.stale is False
 
     class BoomSession:
+        # The render hot path is DB-free (§8), so it never touches this session; the
+        # OUTAGE is observed by the background POLLER, which does read the DB.
+        def execute(self, *a, **k):
+            raise SQLAlchemyError("db down")
+
         def get(self, *a, **k):
             raise SQLAlchemyError("db down")
 
+        def rollback(self, *a, **k):
+            pass
+
+    # A single failed poll flips the node into the frozen (stale) posture (§10). The
+    # request itself never sees the DB — get_snapshot serves the last-known-good copy.
+    app.refresh_control_plane(BoomSession())
     frozen = app.get_snapshot(BoomSession(), "prod")
     assert frozen.stale is True  # serving continues on a stale-flagged copy
 
+    # A healthy poll clears the freeze; the cached snapshot was never mutated, so the
+    # flag drops automatically (no sticky mutation to unwind).
     with session_scope() as s:
+        app.refresh_control_plane(s)
         recovered = app.get_snapshot(s, "prod")
-    assert recovered.stale is False  # flag clears once the DB is back (no sticky mutation)
+    assert recovered.stale is False
 
 
 def test_serve_continues_during_db_outage(app):
     # §10: a Postgres outage must not take down serving. After a warm render the
-    # snapshot is cached; the render path does no per-request DB read, so a broken
-    # session still serves — flagged stale_rules.
+    # snapshot is cached; the render path does no per-request DB read, so serving
+    # continues once the POLLER has observed the outage — flagged stale_rules.
     _author_version(app, "support/system", 1, "Hi {{ name }}")
     app.invalidate("prod")
     with session_scope() as s:
@@ -105,12 +119,17 @@ def test_serve_continues_during_db_outage(app):
     from sqlalchemy.exc import SQLAlchemyError
 
     class BoomSession:
-        def get(self, *a, **k):
-            raise SQLAlchemyError("db down")
-
         def execute(self, *a, **k):
             raise SQLAlchemyError("db down")
 
+        def get(self, *a, **k):
+            raise SQLAlchemyError("db down")
+
+        def rollback(self, *a, **k):
+            pass
+
+    # The outage is observed by the background poller, not the request.
+    app.refresh_control_plane(BoomSession())
     out = app.serve(BoomSession(), "prod", "support/system", {}, {"name": "Zed"})
     assert out["prompt"] == "Hi Zed"       # still rendered from the frozen snapshot
     assert out["stale_rules"] is True

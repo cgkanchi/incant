@@ -31,6 +31,50 @@ const SCREENS = {
   play: screenPlay, audit: screenAudit, access: screenAccess,
 };
 
+// ── account sessions (menu block) ────────────────────────────────────
+// Sign-out tail shared by "Sign out" and "Sign out everywhere": drop local state, dismiss the
+// modal, land on the sign-in card (render() sees no session), and toast honestly. `reached` is
+// false when the DELETE failed (offline / non-2xx) — we still clear locally, but the HttpOnly
+// cookie may outlive us, so we say so rather than the reassuring "Signed out".
+function finishSignOut(reached) {
+  clearSession();
+  closeModal();
+  if (reached) toast("Signed out");
+  else toast("Couldn't reach the server — your session may still be active elsewhere. It expires on its own.", true);
+  render();
+}
+// One session row: a "this device" pill when current, else when-signed-in / last-seen, with a
+// muted expiry (keyExpiryHtml formats the optional expires_at exactly as the Access screen does).
+function sessionRowHtml(s) {
+  const label = s.current
+    ? `<span class="pill live">this device</span>`
+    : `<span>signed in ${esc(ago(s.created_at))} · last seen ${esc(ago(s.last_seen_at))}</span>`;
+  return `<div style="display:flex;gap:8px;align-items:center;font-size:12px;padding:3px 0">
+    ${label}<div class="grow"></div>${keyExpiryHtml({ expires_at: s.expires_at })}</div>`;
+}
+// The account-menu "Sessions" block. `sessions`: array = loaded, null = load failed,
+// "loading" = in flight. The destructive "Sign out everywhere" appears once past loading.
+function acctSessionsInner(sessions) {
+  const title = `<div class="groupname" style="margin-bottom:8px">Signed-in sessions</div>`;
+  let body;
+  if (sessions === "loading") body = `<div class="faint" style="font-size:12px">Loading…</div>`;
+  else if (sessions == null) body = `<div class="faint" style="font-size:12px">Couldn't load your other sessions.</div>`;
+  else if (!sessions.length) body = `<div class="faint" style="font-size:12px">No active sessions.</div>`;
+  else body = sessions.map(sessionRowHtml).join("");
+  const everywhere = `<button type="button" class="link btn-bare" data-act="signOutEverywhere"
+    style="color:var(--danger);margin-top:10px">Sign out everywhere</button>`;
+  return title + body + (sessions === "loading" ? "" : everywhere);
+}
+// Fill the account menu's sessions container once GET /auth/sessions resolves. A fetch failure
+// degrades to a muted note (the everywhere action still shows); a closed menu is a no-op.
+async function loadAcctSessions() {
+  let sessions = null;
+  try { const r = await GET("/auth/sessions"); sessions = (r && r.sessions) || []; }
+  catch (_) { sessions = null; }
+  const host = el("acctSessions");
+  if (host) host.innerHTML = acctSessionsInner(sessions);
+}
+
 // ── actions ──────────────────────────────────────────────────────────
 const Actions = {
   go(ds) { closeModal(); Actions.navClose(); go(ds.hash); },   // navigating dismisses any modal + the drawer
@@ -113,21 +157,37 @@ const Actions = {
       <h3>${esc(me.name)}</h3>
       <p class="hint">You're signed in. Your roles and where each one applies:</p>
       <div style="margin-bottom:14px">${roles}</div>
+      <div id="acctSessions" style="border-top:1px solid var(--line2);padding-top:12px;margin-bottom:14px">${acctSessionsInner("loading")}</div>
       <div style="display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line2);padding-top:12px;align-items:flex-start">
         <button type="button" class="link btn-bare" data-act="switchKey">Sign in with a different key…</button>
         <button type="button" class="link btn-bare" data-act="signOut" style="color:var(--danger)">Sign out</button>
         <a href="#/access" data-act="go" data-hash="#/access" style="font-weight:600">Manage access →</a></div>
       <div class="modal-actions"><button class="btn" data-act="closeModal">Close</button></div>`);
+    loadAcctSessions();   // async fill-in — GET /auth/sessions after the menu is on screen
   },
   switchKey() { openSwitchKeyModal(); },
   // "Sign out" — ends the server-side session (DELETE carries the CSRF header via api.js),
-  // then drops the cached identity so the 401 sign-in card takes over.
+  // then drops the cached identity so the 401 sign-in card takes over. A failed DELETE still
+  // clears locally, but the toast stays honest (finishSignOut): the cookie may outlive us.
   async signOut() {
-    try { await api("DELETE", "/auth/session"); } catch (_) { /* already gone / offline — clear locally regardless */ }
-    clearSession();
-    closeModal();
-    toast("Signed out");
-    render();
+    let reached = true;
+    try { await api("DELETE", "/auth/session"); } catch (_) { reached = false; }
+    finishSignOut(reached);
+  },
+  // "Sign out everywhere" (account menu Sessions block) — kills every session for the caller,
+  // this one included. Routes through a confirm modal; the DELETE then clears local state.
+  signOutEverywhere() {
+    openModal(`
+      <h3>Sign out everywhere</h3>
+      <p class="hint">Ends every signed-in session for your account, including this one.</p>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn danger" data-act="signOutEverywhereConfirm">Sign out everywhere</button></div>`);
+  },
+  async signOutEverywhereConfirm() {
+    let reached = true;
+    try { await api("DELETE", "/auth/sessions"); } catch (_) { reached = false; }
+    finishSignOut(reached);   // honest-failure toast, same as single sign-out
   },
   toggleTweak() {
     State.tweakOpen = !State.tweakOpen;
@@ -549,16 +609,17 @@ const Actions = {
   },
   async publishConfirm() {
     const p = window._publish; if (!p) return;
-    const toRemove = p.tipRules.filter((r) => p.removeRule[r.id]);
+    // One atomic act: move the pointer AND archive the checked test rules server-side. The
+    // pointer can no longer move while an archive fails; the response reports how many landed.
+    const archive_rule_ids = p.tipRules.filter((r) => p.removeRule[r.id]).map((r) => r.id);
     try {
-      await POST(`/mgmt/envs/${enc(p.env)}/pointers`, {
+      const res = await POST(`/mgmt/envs/${enc(p.env)}/publish`, {
         prompt_id: p.pid, version_number: parseInt(p.v), to_sha: p.toSha,
         comment: p.mode === "revert" ? "Reverted to an earlier state via the UI" : "Published via the UI",
-        confirm: p.pid,
+        confirm: p.pid, archive_rule_ids,
       });
-      let removed = 0;
-      for (const r of toRemove) { await PATCH(`/mgmt/envs/${enc(p.env)}/rules/${r.id}`, { status: "archived" }); removed++; }
       closeModal();
+      const removed = res.archived || 0;
       const base = p.mode === "revert" ? `Done — an earlier state of v${p.v} is live again` : `Published — v${p.v} live for everyone`;
       toast(base + (removed ? ` · ${removed} test ${plural(removed, "rule")} removed` : ""));
       render();
@@ -678,6 +739,25 @@ const Actions = {
     try {
       await api("DELETE", `/mgmt/principals/${enc(ds.pid)}/bindings/${ds.bid}`);
       toast("Role removed");
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  // Admin revoke of every session a principal holds (the "revoke sessions" action next to the
+  // session-count pill on the Access screen). Confirm → DELETE → toast + re-render (fresh count).
+  revokeSessions(ds) {
+    openModal(`
+      <h3>Revoke sessions</h3>
+      <p class="hint">Signs <b>${esc(ds.name || ds.pid)}</b> out of every device immediately — all of their active sessions end. They'll need to sign in again with a valid key. This can't be undone.</p>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn danger" data-act="revokeSessionsConfirm" data-pid="${esc(ds.pid)}" data-name="${esc(ds.name || "")}">Revoke sessions</button>
+      </div>`);
+  },
+  async revokeSessionsConfirm(ds) {
+    try {
+      await api("DELETE", `/mgmt/principals/${enc(ds.pid)}/sessions`);
+      closeModal();
+      toast("Sessions revoked");
       render();
     } catch (e) { toast(errText(e), true); }
   },
@@ -821,9 +901,11 @@ const Actions = {
     const { priority, plan } = placePriority(active, Math.min(co.slot, active.length));
     const base = { id, scope: co.scope, priority, when, serve, status: co.status || "active", comment };
     if (co.scope === "prompt") base.prompt_id = co.prompt_id || co.routePid;
+    // One atomic batch: the priority-shift plan first, then the new/edited rule. A failure
+    // no longer half-applies the renumber (server rolls the whole request back).
+    const rules = plan.map((p) => ruleUpsertBody(p.rule, p.priority)).concat([base]);
     try {
-      for (const p of plan) await POST(`/mgmt/envs/${enc(State.env)}/rules`, ruleUpsertBody(p.rule, p.priority));
-      await POST(`/mgmt/envs/${enc(State.env)}/rules`, base);
+      await POST(`/mgmt/envs/${enc(State.env)}/rules/batch`, { rules });
       closeModal();
       toast(co.editing ? "Rule saved" : "Rule created");
       render();
@@ -835,8 +917,9 @@ const Actions = {
     const payloads = swapPriorityPayloads((_rulesData && _rulesData.rules) || [], ds.id, ds.dir);
     if (!payloads) return;
     try {
-      await POST(`/mgmt/envs/${enc(State.env)}/rules`, payloads[0]);
-      await POST(`/mgmt/envs/${enc(State.env)}/rules`, payloads[1]);
+      // Both swapped priorities in one atomic batch — a failure after the first no longer
+      // leaves the two rules at colliding priorities.
+      await POST(`/mgmt/envs/${enc(State.env)}/rules/batch`, { rules: payloads });
       toast("Reordered");
       render();
     } catch (e) { toast(errText(e), true); }
@@ -872,11 +955,12 @@ const Actions = {
   },
   async stopTestConfirm(ds) {
     try {
-      await POST(`/mgmt/envs/${enc(State.env)}/pointers`, {
+      // Pointer move + archive of the redundant test rule in one atomic request.
+      await POST(`/mgmt/envs/${enc(State.env)}/publish`, {
         prompt_id: ds.pid, version_number: parseInt(ds.v), to_sha: ds.sha,
         comment: "Published via stop-test-and-publish", confirm: ds.pid,
+        archive_rule_ids: [ds.id],
       });
-      await PATCH(`/mgmt/envs/${enc(State.env)}/rules/${ds.id}`, { status: "archived" });
       closeModal();
       toast("Published — test rule removed");
       render();
@@ -940,11 +1024,16 @@ function render() {
   if (document.body && document.body.classList) document.body.classList.toggle("nav-open", State.navOpen);
   State.route = parseRoute();
   el("app").innerHTML = shell(`<div class="empty">Loading…</div>`);
+  // Invariant: screens write through the #main node captured at entry; render() replaces
+  // #main's parent shell (a fresh #main) on every navigation, so a superseded async screen
+  // — or this catch — holds a now-detached node and its late write lands harmlessly. We
+  // capture #main here, BEFORE fn() runs, so the catch writes through the same node.
+  const main = el("main");
   // No session and no bearer → straight to the sign-in card. Firing authenticated fetches
   // unauthenticated would just 401 (and, repeated, look like a brute-force attempt to the
   // server's auth throttle).
   if (!State.token && !State.session) {
-    el("main").innerHTML = signInCard();
+    main.innerHTML = signInCard();
     return;
   }
   ensureWhoami();   // lazy whoami → fills the account chip in place
@@ -954,9 +1043,9 @@ function render() {
       // Session expired mid-use → drop it so the guard above holds next render, and swap the
       // dedicated sign-in card into the screen body; the sidebar stays.
       State.session = null; State.csrf = "";
-      el("main").innerHTML = signInCard();
+      main.innerHTML = signInCard();
     } else {
-      el("main").innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`;
+      main.innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`;
     }
   });
 }

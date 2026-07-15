@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     # one node propagates to the others within this TTL.
     auth_ttl: float = 5.0
 
+    # Control-plane poll interval (seconds). The serving hot path never reads the DB
+    # itself (§8 "No DB per request"; §10 "the DB is never on the per-request path"); a
+    # background loop polls every this-many seconds and pulls targeting bumps + the
+    # TTL-driven auth reload into memory. This is the poll fallback for the design's
+    # Postgres LISTEN/NOTIFY (§7), which names a 2s poll — so a targeting change
+    # (including "make live") propagates to every replica in < 2 s.
+    control_poll_seconds: float = 2.0
+
     # Failed-auth throttling: per-client-IP sliding window over FAILED bearer auths.
     # After `limit` failures within `window` seconds, that IP gets 429 (Retry-After)
     # until the window drains. Successful auth is never throttled. limit=0 disables.

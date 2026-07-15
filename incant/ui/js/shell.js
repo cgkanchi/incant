@@ -194,7 +194,7 @@ async function loadTweakData(pid) {
     const [dv, dl, rd] = await Promise.all([
       GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(env)}`),
       GET(`/mgmt/prompts/${enc(pid)}/drafts`).catch(() => ({ drafts: [] })),
-      GET(`/mgmt/envs/${enc(env)}/rules`).catch(() => ({ rules: [] })),
+      fetchEnvRules(env, pid),   // retries scoped to the prompt's project on a 403
     ]);
     _tweak.data = { versions: dv.versions || [], drafts: dl.drafts || [], rules: rd.rules || [] };
   } catch (e) {

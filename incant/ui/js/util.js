@@ -55,6 +55,26 @@ function bestRole(me) {
 // Does the current principal's best role meet `min`? Gates show/hide of mutating chrome.
 function canRole(min) { return roleRank(bestRole()) >= roleRank(min); }
 
+// Fetch an environment's rule list for a screen scoped to ONE prompt. The full list needs
+// env-wide viewer, but chrome is gated by the best role in ANY scope (roleRank) — so a
+// viewer scoped only to `pid`'s project would 403 on the env-wide read. On that 403 retry
+// once scoped to the prompt's project (`?project=<proj>`): the server then returns the rules
+// governing that project's prompts (plus global rules), so a project-scoped viewer still
+// sees their own prompt's testing state. Any other failure (or a 403 with no prompt to scope
+// to) degrades to an empty rule set — the same graceful fallback the inline `.catch` had.
+async function fetchEnvRules(env, pid) {
+  try {
+    return await GET(`/mgmt/envs/${enc(env)}/rules`);
+  } catch (e) {
+    if (e && e.status === 403 && pid) {
+      const project = String(pid).split("/", 1)[0];
+      try { return await GET(`/mgmt/envs/${enc(env)}/rules?project=${enc(project)}`); }
+      catch (_) { /* even the scoped read failed — fall through to the empty shape */ }
+    }
+    return { rules: [], kills: {}, defaults: {} };
+  }
+}
+
 // ── util ─────────────────────────────────────────────────────────────
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));

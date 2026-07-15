@@ -120,6 +120,10 @@ class Draft(Base):
 
 class Review(Base):
     __tablename__ = "reviews"
+    # One current verdict per (draft, reviewer): add_review upserts, and the unique
+    # constraint stops a concurrent double-submit from creating duplicate rows (which
+    # would make every later scalar_one_or_none read raise MultipleResultsFound).
+    __table_args__ = (UniqueConstraint("draft_id", "reviewer", name="uq_review"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     draft_id: Mapped[str] = mapped_column(ForeignKey("drafts.id"), index=True)
     reviewer: Mapped[str] = mapped_column(String)
@@ -244,9 +248,13 @@ class Principal(Base):
 
 class ApiKey(Base):
     __tablename__ = "api_keys"
+    # The lookup prefix is UNIQUE: 24 random bits (raw[:16]) collided near ~5k keys, so
+    # new keys widen it (raw[:20] = 40 bits) and issuance regenerates on any collision.
+    # The unique constraint is the backstop that makes that regeneration observable.
+    __table_args__ = (UniqueConstraint("prefix", name="uq_apikey_prefix"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id"), index=True)
-    prefix: Mapped[str] = mapped_column(String, index=True)             # incant_sk_xxxx lookup prefix
+    prefix: Mapped[str] = mapped_column(String)                         # incant_sk_xxxx lookup prefix (unique)
     # Hash of the full key. Legacy rows are plain SHA-256(key); with INCANT_KEY_PEPPER
     # set, rows are `v2$` + HMAC-SHA256(pepper, key) and legacy rows upgrade in place on
     # next successful auth. Keys are high-entropy, so both formats resist brute force.

@@ -13,7 +13,17 @@ See [DESIGN.md](./DESIGN.md) for the full design. This repository implements it.
 - **Postgres/SQLite is the control plane.** Targeting rules, segments, live pointers,
   review state, RBAC, audit — SHAs only, never template text.
 - **Memory is the serving plane.** Compiled templates + rule snapshots; the render
-  path touches no git, no disk, no DB.
+  path is **memory-first** — the common case touches no git, no disk, no DB.
+
+Serving is memory-*first*, not memory-*only*: the hot path reads from an in-memory,
+content-addressed cache that is eagerly warmed at boot and on every commit/targeting
+change, so a warm node answers renders entirely from memory. It falls through to a
+**single git read** only in the uncommon cases — a cache miss on cold or LRU-evicted
+content, or an old validated `pin` for a SHA no longer in the working set — after which
+that blob is cached and subsequent renders are back in memory. Postgres is never on the
+per-request path (targeting is served from the snapshot). The
+`incant_content_git_reads_total` metric counts those fall-throughs; on a healthy node it
+sits at ~0.
 
 ## Quick start (Docker + Postgres)
 
@@ -88,14 +98,38 @@ bumps under parallel writes:
 
 ```bash
 uv run pytest                                    # quick local pass (SQLite)
+
+# Full suite against Postgres — bring up just the bundled db, point the tests at it:
+docker compose up -d db
 INCANT_TEST_DATABASE_URL=postgresql+psycopg://incant:incant@localhost:5432/incant \
-  uv run pytest                                  # full suite incl. concurrency (67 tests)
+  uv run pytest                                  # full suite incl. the concurrency tests
 ```
+
+The two concurrency tests (`tests/test_concurrency.py` — no lost `rules_version` bumps,
+every pointer move recorded under parallel writes) **only run against Postgres**; they
+are skipped on SQLite, whose serialized writer can't exercise the race. Everything else
+runs on both.
 
 Tests drop and recreate all tables, so they are **isolated to a dedicated
 `<db>_test` database**: the URL above is redirected to `incant_test` (created on
 demand) and the app's `incant` database is never touched. A safety rail refuses to
 reset any Postgres database whose name doesn't end in `_test`.
+
+### Browser end-to-end tests (opt-in)
+
+`tests/browser/` drives the real UI with Playwright over your **system Chrome**
+(headless) against a throwaway SQLite server it spins up itself. It's opt-in — the
+`browser` dependency group and the `INCANT_BROWSER_TESTS=1` flag are both required, so
+the default `uv run pytest` above is untouched (the suite is skipped, or not collected
+at all when Playwright is absent):
+
+```bash
+uv sync --group browser                                   # once: install Playwright
+INCANT_BROWSER_TESTS=1 uv run --group browser pytest tests/browser -q
+```
+
+It uses `/usr/bin/google-chrome`; point `INCANT_BROWSER_CHROME` at another
+Chrome/Chromium binary if yours lives elsewhere.
 
 ## Config (`INCANT_*` env vars)
 
@@ -136,7 +170,7 @@ Incant authenticates every request; there is no side door. A few operational not
   mismatch/absent ⇒ `403`. Bearer (header) auth is CSRF-immune and needs no such header.
   `DELETE /auth/session` (CSRF-guarded) signs out — it deletes the row and clears the
   cookie. Sessions are control-plane only: the serving hot path is bearer-only and stays
-  memory-only. Expired sessions are swept at startup.
+  memory-first. Expired sessions are swept at startup and then hourly.
 - **Keys are opaque, high-entropy bearer tokens** (`incant_sk_…`) for service-to-service
   use. They are stored hashed, never in the clear. Set `INCANT_KEY_PEPPER` to a secret
   (kept outside the DB) for defense-in-depth: new and rotated keys are stored as

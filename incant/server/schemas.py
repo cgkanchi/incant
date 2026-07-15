@@ -118,6 +118,14 @@ class RuleRequest(BaseModel):
     comment: str = ""
 
 
+class RuleBatchRequest(BaseModel):
+    # A set of rule upserts applied as ONE atomic act (composer priority-shift plan, or a
+    # two-rule reorder swap). Each element is the exact shape the single upsert takes; the
+    # whole batch lands in one request/transaction so a mid-sequence failure can't leave
+    # rules at colliding/half-applied priorities (DESIGN.md §7).
+    rules: list[RuleRequest]
+
+
 class RuleStatusRequest(BaseModel):
     status: str
 
@@ -138,6 +146,19 @@ class PointerRequest(BaseModel):
     to_sha: str
     comment: str = ""
     confirm: Optional[str] = None  # locked env: must echo the prompt id
+
+
+class PublishRequest(BaseModel):
+    # "Publish latest edits" / "Stop test & publish": advance the live pointer AND archive
+    # the now-redundant test rules in ONE atomic act, so the pointer can't move while the
+    # archives fail (DESIGN.md §7). `confirm` echoes the prompt id on a locked env, exactly
+    # as the pointer endpoint requires; `archive_rule_ids` may be empty (a plain publish).
+    prompt_id: str
+    version_number: int
+    to_sha: str
+    comment: str = ""
+    confirm: Optional[str] = None  # locked env: must echo the prompt id
+    archive_rule_ids: list[str] = Field(default_factory=list)
 
 
 class DefaultRequest(BaseModel):

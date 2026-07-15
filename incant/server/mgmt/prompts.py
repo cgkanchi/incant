@@ -5,7 +5,7 @@ from __future__ import annotations
 import difflib
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ... import models
@@ -21,11 +21,16 @@ from ..schemas import (
 )
 from .helpers import (
     _current_live,
+    _current_live_bulk,
+    _drafts_needing_review,
     _effective_variables,
     _includes_of,
+    _open_draft_counts,
     _project_of,
     _require,
     _tip_ahead,
+    _tip_ahead_from_map,
+    _validated_by_version,
 )
 
 router = APIRouter()
@@ -55,6 +60,19 @@ def overview(
     ident: Identity = Depends(identity),
 ):
     snap = build_snapshot(session, environment)
+    # Bulk-load everything the per-prompt loop needs BEFORE the loop, so the landing
+    # screen stays flat as the library grows. It used to fan out — per prompt — into a
+    # validation SELECT (_tip_ahead), a pointer SELECT (_current_live), a draft-count
+    # SELECT, and a `git log` subprocess (app.git.history) — the queries degrading
+    # linearly and the subprocess painfully. Each of these loads the same fact for the
+    # whole library in one shot: three constant-count queries + one git-log walk.
+    validated_by_version = _validated_by_version(session)
+    live_by_version = _current_live_bulk(session, environment)
+    open_draft_counts = _open_draft_counts(session)
+    # Drafts genuinely awaiting review (open drafts under a review-policy project) — the
+    # honest count behind the "Needs review" filter, one GROUP BY, same bulk pattern.
+    review_needed_counts = _drafts_needing_review(session)
+    latest = app.git.latest_commits()  # {path -> newest CommitInfo}, one git log walk
     projects: dict[str, list] = {}
     for prompt in session.execute(select(models.Prompt).order_by(models.Prompt.id)).scalars():
         pid = prompt.id
@@ -65,27 +83,26 @@ def overview(
         vinfo = vers.get(default_v) if default_v else None
         tip_ahead = 0
         if vinfo and vinfo.live_sha:
-            tip_ahead = _tip_ahead(session, environment, pid, default_v, vinfo.live_sha)
+            tip_ahead = _tip_ahead_from_map(validated_by_version.get((pid, default_v), []), vinfo.live_sha)
         # Who/when published the default version's current live pointer.
-        live = _current_live(session, environment, pid, default_v) if default_v else None
+        live = live_by_version.get((pid, default_v)) if default_v else None
         # Newest minted version and whether it has ever been published in this env —
         # drives the "vN draft, not live" badge when a new version exists but is unpublished.
         newest_version = max(vers) if vers else None
         newest_vinfo = vers.get(newest_version) if newest_version is not None else None
-        hist = app.git.history(f"{pid}/v{default_v}.j2") if default_v else []
-        updated = hist[0] if hist else None
+        # `updated` = newest commit touching the default version's file; the bulk map's
+        # entry is exactly what `app.git.history(...)[0]` returned per prompt before.
+        updated = latest.get(f"{pid}/v{default_v}.j2") if default_v else None
         # Drafts still in flight (not committed/discarded) — drives the library's
         # "N open drafts" affordance and filter.
-        open_drafts = session.execute(
-            select(func.count()).select_from(models.Draft).where(
-                models.Draft.prompt_id == pid,
-                models.Draft.status.in_(["open", "approved"]),
-            )
-        ).scalar_one()
+        open_drafts = open_draft_counts.get(pid, 0)
         projects.setdefault(prompt.project_id, []).append({
             "prompt_id": pid,
             "description": prompt.description or "",
             "open_drafts": open_drafts,
+            # Open drafts that need a review under this project's policy (0 if no policy) —
+            # distinct from open_drafts, which counts drafts-in-flight regardless of policy.
+            "drafts_needing_review": review_needed_counts.get(pid, 0),
             "versions": len(vers),
             "live_version": default_v,
             "live": bool(vinfo and vinfo.live_sha),

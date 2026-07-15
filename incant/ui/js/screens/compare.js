@@ -4,6 +4,7 @@
 // Compare — the history tool: any two committed states, A → B (renamed from the old
 // Diff screen). Human labels; rendered mode stays unified (this endpoint has no left/right).
 async function screenCompare() {
+  const main = el("main");   // capture before any await (Issue B)
   const pid = State.route.pid;
   const d = await GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`);
   const mode = State.route.q.mode || "source";
@@ -22,7 +23,7 @@ async function screenCompare() {
                   short: v.live_sha, label: `v${v.version} · what ${State.env} serves now · ${v.live_sha}` });
   }
   if (revs.length < 2) {
-    el("main").innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Compare</span></div><div class="empty">Nothing to compare yet — need two committed states.</div></div>`;
+    main.innerHTML = `<div class="screen"><div class="h1row"><span class="h1 sm serif">Compare</span></div><div class="empty">Nothing to compare yet — need two committed states.</div></div>`;
     return;
   }
 
@@ -63,7 +64,7 @@ async function screenCompare() {
   }
 
   const qs = `a=${enc(aTok)}&b=${enc(bTok)}`;
-  el("main").innerHTML = `<div class="screen">
+  main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Compare — <i>${esc(pid)}</i></span>
       ${res.context ? `<span class="pill acc">${esc(res.context)}</span>` : ""}
       ${identical ? '<span class="pill neutral">these two are identical — showing the text</span>' : ""}</div>
