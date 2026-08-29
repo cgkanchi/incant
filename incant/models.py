@@ -221,7 +221,12 @@ class RuleRevision(Base):
     rule_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
     kind: Mapped[str] = mapped_column(String)                           # rule | segment | pointer | default | kill
     rules_version: Mapped[int] = mapped_column(Integer, default=0, index=True)  # env rules_version after this change
-    snapshot: Mapped[Any] = mapped_column(JSON)
+    snapshot: Mapped[Any] = mapped_column(JSON)                         # the changed object (revision-list display)
+    # COMPLETE environment targeting state after this change (rules, segments,
+    # defaults, kills, live pointers, tips, labels) — what makes rollback total and
+    # pin.rules_version replay possible. Nullable: rows from before the upgrade have
+    # only the per-object snapshot; state-based features fall back gracefully there.
+    state: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
     actor: Mapped[str] = mapped_column(String, default="")
     at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     comment: Mapped[str] = mapped_column(Text, default="")

@@ -23,7 +23,14 @@ from ..schemas import (
     ReviewRequest,
 )
 from .. import metrics
-from .helpers import _comment_payload, _draft_payload, _project_of, _require
+from .helpers import (
+    _closure_variables,
+    _comment_payload,
+    _draft_payload,
+    _newest_version,
+    _project_of,
+    _require,
+)
 
 router = APIRouter()
 
@@ -300,9 +307,29 @@ def commit_draft(
         # §7 track_tip: environments that follow tips auto-advance their live pointer.
         app.auto_advance_tips(session, ident.name, d.prompt_id, d.version_number, outcome.sha)
     app.invalidate()
+    # §4's drift lint at the moment it happens: this commit changed the variable set
+    # out from under existing refinements. The refinements survive (never deleted
+    # behind the author's back) — the warning names them so the author decides.
+    # Closure names, not just the top-level template: a refinement may legitimately
+    # describe a variable an included fragment contributes to the effective schema.
+    # The top level comes from the VALIDATION result (main hasn't promoted yet at
+    # this point in the transaction — staged publish); fragments read from main.
+    ev = outcome.validation.get("variables", {})
+    closure_names = set(ev.get("names", []))
+    for inc in ev.get("includes", []):
+        inc_names, _ = _closure_variables(app, session, inc, _newest_version(session, inc))
+        closure_names |= inc_names
+    orphaned = sorted(
+        r.name for r in reg.get_refinements(d.prompt_id, outcome.version_number)
+        if r.name not in closure_names
+    )
     return {
         "sha": outcome.sha[:7], "full_sha": outcome.sha,
         "version_number": outcome.version_number, "validation": outcome.validation,
+        "refinement_warnings": (
+            [f"refinement for {name!r} no longer matches any template variable"
+             for name in orphaned] if orphaned else []
+        ),
     }
 
 

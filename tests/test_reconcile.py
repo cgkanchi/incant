@@ -164,20 +164,22 @@ def test_main_reconcile_validated_tip_is_clean(app):
     assert result.scanned_files >= 1
 
 
-# ── deferred draft-ref deletion: a failed publish must not strand user work ───
+# ── staged publishes: a failed outer transaction must leave NO residue on main ─
 
-def test_commit_ref_survives_failed_outer_commit(app):
+def test_failed_publish_leaves_main_untouched(app):
     # Publish v1 cleanly so a Version row + a validated tip both already exist on main.
     with session_scope() as s:
         reg = app.registry(s, "sam")
         d0 = reg.create_draft("support/system", version_number=1, author="sam",
                               content="hi {{ x }}")
         reg.commit_draft(d0.id, author="sam")
-    # Happy path (Issue 2a): a SUCCESSFUL publish fired the deferred after_commit hook, so
-    # the ref is gone and the draft is committed — normal publish is still green.
+    # Happy path: a SUCCESSFUL publish promoted the staged commit and dropped both the
+    # pending and draft refs.
     assert not app.git.draft_ref_exists(d0.id)
+    assert app.git.list_pending_refs() == []
     with session_scope() as s:
         assert app.registry(s, "sam").get_draft(d0.id).status == "committed"
+    head_before = app.git.head()
 
     # Open a NEW draft editing that SAME live version.
     with session_scope() as s:
@@ -185,39 +187,137 @@ def test_commit_ref_survives_failed_outer_commit(app):
             "support/system", version_number=1, author="sam",
             content="hi {{ x }} (edit)").id
 
-    # commit_draft inside a session we then ROLL BACK — the outer DB transaction "fails"
-    # after commit_version already advanced main. The deferred ref-delete must NOT fire and
-    # the staged rows (CommitValidation + status→committed) must roll back with it.
+    # commit_draft inside a session we then ROLL BACK — the outer DB transaction
+    # "fails". The publish was STAGED on a pending ref, never on main.
     s = session_factory()()
     try:
         app.registry(s, "sam").commit_draft(draft_id, author="sam", force=True)
+        assert app.git.head() == head_before        # staged, not promoted
+        assert len(app.git.list_pending_refs()) == 1
         s.flush()
         s.rollback()
     finally:
         s.close()
 
-    # User work is fully recoverable: the draft ref survives AND the row is still open
-    # (editable), exactly the property the old mid-transaction delete destroyed.
+    # User work is fully recoverable: the draft ref survives AND the row is still open.
     assert app.git.draft_ref_exists(draft_id)
     with session_scope() as s:
         assert app.registry(s, "sam").get_draft(draft_id).status == "open"
 
-    # The only residue is exactly one UNVALIDATED main tip — the Version row survived the
-    # earlier publish, so it is NOT an orphan — and it is DETECTED, not silently swallowed.
+    # And — the staged-publish upgrade — there is NO residue at all: main never moved,
+    # the pending ref was cleaned up on rollback, and the drift sweep finds nothing.
+    assert app.git.head() == head_before
+    assert app.git.list_pending_refs() == []
     with session_scope() as s:
         result = reconcile_main_commits(s, app.git)
-    assert result.unvalidated_tips == 1
+    assert result.unvalidated_tips == 0
     assert result.git_orphans == 0 and result.missing_files == 0
 
-    # Re-commit cleanly (fresh transaction, force=True to bypass the intervening-tip check).
-    # The ref must persist WHILE the transaction is open (delete is deferred) and vanish
-    # ONLY once the commit fires the after_commit hook.
+    # Re-commit cleanly. Main advances only when the transaction commits; the draft
+    # ref persists while the transaction is open and vanishes with the promotion.
     with session_scope() as s:
         app.registry(s, "sam").commit_draft(draft_id, author="sam", force=True)
         assert app.git.draft_ref_exists(draft_id)   # inside the txn → not yet dropped
-    assert not app.git.draft_ref_exists(draft_id)    # committed → after_commit fired
+        assert app.git.head() == head_before        # inside the txn → not yet promoted
+    assert not app.git.draft_ref_exists(draft_id)    # committed → promoted + cleaned
+    assert app.git.head() != head_before
+    assert app.git.list_pending_refs() == []
     with session_scope() as s:
         assert app.registry(s, "sam").get_draft(draft_id).status == "committed"
+
+
+# ── pending-promotion recovery (crash between DB commit and promotion) ────────
+
+def _stranded_publish(app, content="hi {{ x }} (stranded)"):
+    """Simulate a crash after the DB transaction committed but before promotion:
+    publish normally, then reset main to the pre-publish tip and restore the
+    pending ref — exactly the state a killed process leaves behind."""
+    head_before = app.git.head()
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        d = reg.create_draft("support/system", version_number=1, author="sam",
+                             content=content, )
+        draft_id = d.id
+        outcome = reg.commit_draft(draft_id, author="sam", force=True)
+    sha = outcome.sha
+    app.git._git("update-ref", "refs/heads/main", head_before)     # undo the promotion
+    app.git._git("update-ref", app.git.pending_ref(draft_id), sha)  # re-strand the ref
+    return draft_id, sha, head_before
+
+
+def test_recovery_promotes_committed_stranded_publish(app, caplog):
+    from incant.registry import recover_pending_promotions
+
+    # Baseline publish so the version exists.
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        d0 = reg.create_draft("support/system", version_number=1, author="sam",
+                              content="hi {{ x }}")
+        reg.commit_draft(d0.id, author="sam")
+
+    draft_id, sha, _ = _stranded_publish(app)
+    with caplog.at_level("WARNING", logger="incant.reconcile"):
+        with session_scope() as s:
+            result = recover_pending_promotions(s, app.git)
+    assert result.promoted == 1 and result.discarded == 0 and result.rebased == 0
+    assert app.git.head() == sha                     # the owed promotion landed
+    assert app.git.list_pending_refs() == []
+    assert "promoted staged publish" in caplog.text
+
+
+def test_recovery_discards_uncommitted_staging_residue(app):
+    from incant.registry import recover_pending_promotions
+
+    # Baseline publish, then a stranded pending ref WITHOUT its DB rows — the
+    # transaction never committed (crash mid-transaction).
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        d0 = reg.create_draft("support/system", version_number=1, author="sam",
+                              content="hi {{ x }}")
+        reg.commit_draft(d0.id, author="sam")
+    head = app.git.head()
+    sha, _parent = app.git.commit_version_pending(
+        "support/system", 1, "never committed {{ x }}",
+        author_name="sam", author_email="sam@x", message="stranded", draft_id="d_crash")
+    with session_scope() as s:
+        result = recover_pending_promotions(s, app.git)
+    assert result.discarded == 1 and result.promoted == 0
+    assert app.git.head() == head                    # main untouched
+    assert app.git.list_pending_refs() == []
+
+
+def test_recovery_rebases_when_main_diverged(app):
+    from incant.registry import recover_pending_promotions
+
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        d0 = reg.create_draft("support/system", version_number=1, author="sam",
+                              content="hi {{ x }}")
+        reg.commit_draft(d0.id, author="sam")
+
+    draft_id, sha, _ = _stranded_publish(app, content="hi {{ x }} (stranded edit)")
+    # Main moves on independently before recovery runs.
+    other = app.git.commit_version("support/system", 1, "hi {{ x }} (newer)",
+                                   author_name="sam", author_email="sam@x", message="newer")
+    with session_scope() as s:
+        s.add(models.CommitValidation(
+            sha=other, blob_sha="", path="support/system/v1.j2",
+            prompt_id="support/system", version_number=1, status="valid",
+            extracted_variables={},
+        ))
+    with session_scope() as s:
+        result = recover_pending_promotions(s, app.git)
+    assert result.rebased == 1
+    assert app.git.list_pending_refs() == []
+    # The stranded content was replayed atop the diverged main with a fresh,
+    # equally-validated commit.
+    assert app.git.read("support/system/v1.j2") == "hi {{ x }} (stranded edit)"
+    tip = app.git.head()
+    with session_scope() as s:
+        rows = s.execute(
+            select(models.CommitValidation).where(models.CommitValidation.sha == tip)
+        ).scalars().all()
+        assert len(rows) == 1 and rows[0].status == "valid"
 
 
 # ── reconcile-result exposure seam (ctx holder + metrics gauges) ──────────────

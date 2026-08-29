@@ -399,69 +399,120 @@ class RegistryService:
 
         result = self.validate(d.prompt_id, source)
 
-        sha = self.git.commit_version(
-            d.prompt_id, d.version_number, source,
-            author_name=author, author_email=email or f"{author}@incant",
-            message=message or d.title or f"update v{d.version_number}",
-            draft_id=draft_id,
-        )
-        blob_sha = self.git.blob_sha(f"{d.prompt_id}/v{d.version_number}.j2", ref=sha) or ""
+        # STAGED PUBLISH: `main` must only ever hold commits the DB fully describes,
+        # so the git commit is staged on refs/incant/pending/<draft> FIRST, the
+        # control-plane rows land in the outer transaction, and main advances (a pure
+        # CAS ref move to the already-recorded SHA) only in ``after_commit``. The
+        # publish lock is held from staging through promotion/abandonment so
+        # in-process publishes serialize — two staged commits can't share a parent —
+        # and the promote CAS is the cross-process backstop. Consequences:
+        #   * Outer commit SUCCEEDS → main moves to the staged SHA, pending + draft
+        #     refs are dropped. Same caller-visible result as before.
+        #   * Outer commit FAILS → ``after_rollback`` deletes the pending ref; main
+        #     NEVER moved, and the draft ref + still-"open" row survive: the user's
+        #     work is fully recoverable and there is NO unvalidated-tip residue (the
+        #     drift `reconcile_main_commits` exists to catch can no longer be
+        #     *produced* by this path — the sweep remains as an invariant check).
+        #   * Crash between the two phases → the pending ref survives;
+        #     ``recover_pending_promotions`` (boot + reconcile loop) promotes it when
+        #     the DB shows the transaction committed, discards it otherwise.
+        # We never ``event.remove`` from inside a listener (SQLAlchemy dispatches
+        # while iterating the deque); ``once=True`` is the safe one-shot. Both
+        # listeners share an idempotent lock release — whichever fires, fires once.
+        lock = self.git.publish_lock
+        if not lock.acquire(timeout=30):
+            raise RegistryError("publish serialization timeout; try again")
+        released = False
 
-        self._ensure_version_row(d.prompt_id, d.version_number, author)
+        def _release_lock() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                lock.release()
 
-        cv = models.CommitValidation(
-            sha=sha, blob_sha=blob_sha, path=f"{d.prompt_id}/v{d.version_number}.j2",
-            prompt_id=d.prompt_id, version_number=d.version_number,
-            status=result.status, error=result.error,
-            extracted_variables=result.extracted_variables,
-        )
-        self.s.add(cv)
+        # One DB transaction may stage several publishes (seed, batch flows): each
+        # chains onto the previous staged SHA — not main, which hasn't moved yet — so
+        # the promotions (dispatched FIFO at commit) fast-forward one after another.
+        chain: list[str] = self.s.info.setdefault("incant_pending_chain", [])
+        sha = None
+        try:
+            sha, parent = self.git.commit_version_pending(
+                d.prompt_id, d.version_number, source,
+                author_name=author, author_email=email or f"{author}@incant",
+                message=message or d.title or f"update v{d.version_number}",
+                draft_id=draft_id,
+                parent=chain[-1] if chain else None,
+            )
+            chain.append(sha)
+            blob_sha = self.git.blob_sha(f"{d.prompt_id}/v{d.version_number}.j2", ref=sha) or ""
 
-        d.status = "committed"
-        self.s.flush()
-        # DEFER the draft-ref deletion until AFTER the OUTER DB transaction commits.
-        #
-        # The DB rows above (CommitValidation + version-row + the status→committed flip)
-        # are only *staged* here, not yet durable — the request-scoped dependency
-        # (server/deps.get_session, db.session_scope) commits later. Deleting the ref
-        # inline, mid-transaction, was the hazard: if that outer commit then FAILED, the
-        # rows rolled back (draft goes back to "open") but the ref was already gone, so at
-        # the next boot the reconcile sweep saw an open draft with no ref and discarded it
-        # — silently stranding recoverable user work.
-        #
-        # Instead we register a one-shot ``after_commit`` listener bound to this session.
-        # It fires only once the outer transaction has actually committed, so the ordering
-        # is now: DB durable → THEN drop the ref. Consequences:
-        #   * Outer commit SUCCEEDS → ref deleted, draft is "committed": the normal happy
-        #     path, unchanged from the caller's view.
-        #   * Outer commit FAILS → the listener never fires, so the draft ref AND the
-        #     still-"open" draft row both survive the rollback: the user's work is fully
-        #     recoverable and the draft stays editable. The only residue is an UNVALIDATED
-        #     commit on `main` (commit_version already advanced it) that no CommitValidation
-        #     row describes — serving keeps using the last validated SHA, and
-        #     `reconcile_main_commits` surfaces the row-less tip (metrics + /healthz + LOUD
-        #     log; a human re-publishes or rolls back the git commit).
-        #   * Deletion itself fails after a good commit → we only log; the draft row is now
-        #     "committed", so the leftover ref is an orphan that the boot sweep's direction 1
-        #     (`reconcile_drafts`: ref with no live row → delete) cleans up. This is the
-        #     deliberate contract — NOT a full outbox/saga (see reconcile.py's docstring).
-        #
-        # We do NOT call ``event.remove`` from inside the listener: SQLAlchemy dispatches
-        # ``after_commit`` while iterating the listener deque, and removing mid-iteration
-        # raises "deque mutated during iteration". ``once=True`` is the safe one-shot.
-        draft_ref_id = draft_id
+            self._ensure_version_row(d.prompt_id, d.version_number, author)
 
-        def _drop_draft_ref(session: Session) -> None:
+            cv = models.CommitValidation(
+                sha=sha, blob_sha=blob_sha, path=f"{d.prompt_id}/v{d.version_number}.j2",
+                prompt_id=d.prompt_id, version_number=d.version_number,
+                status=result.status, error=result.error,
+                extracted_variables=result.extracted_variables,
+            )
+            self.s.add(cv)
+
+            d.status = "committed"
+            self.s.flush()
+        except BaseException:
+            # Staging failed before the listeners took ownership: clean up + unlock.
             try:
-                self.git.delete_draft(draft_ref_id)
+                if sha is not None and chain and chain[-1] == sha:
+                    chain.pop()
+                self.git.delete_pending(draft_id)
+            finally:
+                _release_lock()
+            raise
+
+        git, draft_ref_id = self.git, draft_id
+
+        def _promote(session: Session) -> None:
+            try:
+                try:
+                    git.promote_pending(sha, parent)
+                except ConcurrentUpdate:
+                    # Cross-process race (unsupported multi-full-node deployment) or a
+                    # recovery double-run. If main already contains the SHA, promotion
+                    # happened elsewhere; otherwise leave the pending ref for
+                    # recover_pending_promotions and say so LOUDLY.
+                    if not git.is_ancestor(sha):
+                        log.critical(
+                            "commit_draft: could not promote %s for draft %s — main "
+                            "diverged from the staged parent. The publish is recorded in "
+                            "the DB and the pending ref is kept; recovery will rebase it.",
+                            sha, draft_ref_id,
+                        )
+                        return
+                git.delete_pending(draft_ref_id)
+                git.delete_draft(draft_ref_id)
             except Exception:  # pragma: no cover - best-effort post-commit cleanup
                 log.warning(
-                    "commit_draft: deferred draft-ref delete for %s failed after commit; "
-                    "the draft row is 'committed', so the leftover ref is an orphan that "
-                    "the boot sweep (reconcile_drafts) removes.", draft_ref_id,
+                    "commit_draft: post-commit promotion/cleanup for %s hit an error; "
+                    "recovery (boot + reconcile loop) converges it.", draft_ref_id,
+                    exc_info=True,
                 )
+            finally:
+                if sha in chain:
+                    chain.remove(sha)
+                _release_lock()
 
-        event.listen(self.s, "after_commit", _drop_draft_ref, once=True)
+        def _abandon(session: Session) -> None:
+            try:
+                git.delete_pending(draft_ref_id)
+            except Exception:  # pragma: no cover - best-effort rollback cleanup
+                log.warning("commit_draft: pending-ref cleanup for %s failed on rollback",
+                            draft_ref_id, exc_info=True)
+            finally:
+                if sha in chain:
+                    chain.remove(sha)
+                _release_lock()
+
+        event.listen(self.s, "after_commit", _promote, once=True)
+        event.listen(self.s, "after_rollback", _abandon, once=True)
 
         # Warm the content cache for the freshly-validated SHA.
         if result.ok:

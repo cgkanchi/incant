@@ -9,6 +9,8 @@ is unreachable, serving continues on the last-known-good snapshot with
 from __future__ import annotations
 
 import logging
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -30,9 +32,9 @@ from .core import (
     resolve,
 )
 from .db import init_db, session_scope
-from .gitstore import ContentStore, GitStore
+from .gitstore import BackupPusher, ContentStore, GitStore
 from .registry import MainReconcileResult, RegistryService
-from .targeting import TargetingService, build_snapshot
+from .targeting import TargetingService, build_snapshot, snapshot_from_state
 
 log = logging.getLogger("incant.service")
 
@@ -67,12 +69,24 @@ class WarmError(Exception):
 class _CachedSnapshot:
     rules_version: int
     snapshot: EnvSnapshot
+    # Monotonic time of the last successful freshness check against the DB (build,
+    # or a healthy poll confirming rules_version unchanged). Feeds the §14
+    # incant_rules_snapshot_age_seconds gauge: a rising age means the poll can't
+    # reach Postgres and targeting changes are not propagating to this node.
+    confirmed_at: float = field(default_factory=time.monotonic)
+
+
+_HISTORICAL_CACHE_MAX = 64  # replayed (env, rules_version) snapshots kept in memory
 
 
 @dataclass
 class AppContext:
     settings: Settings = field(default_factory=get_settings)
     _snapshots: dict[str, _CachedSnapshot] = field(default_factory=dict)
+    # §9 pin.rules_version replay: reconstructed historical snapshots, LRU-bounded.
+    # Immutable once built (a revision's state never changes), so never invalidated.
+    _historical: "OrderedDict[tuple[str, int], EnvSnapshot]" = field(
+        default_factory=OrderedDict)
     # DB health as last observed by the background poll (refresh_control_plane), NOT by
     # any request — the serving hot path never touches the DB to learn this. False means
     # the poller last saw an outage, so warm snapshots are served frozen (§10 "rules
@@ -87,6 +101,11 @@ class AppContext:
     def __post_init__(self) -> None:
         self.git = GitStore(self.settings.repo_dir())
         self.content = ContentStore(self.git)
+        self.backup = BackupPusher(
+            self.git,
+            known_hosts_path=self.settings.known_hosts_path or None,
+            timeout=self.settings.backup_timeout_seconds,
+        )
         # Lazy import avoids an import cycle (server.auth -> ... -> service).
         from .server.auth import AuthCache
         from .server.throttle import AuthThrottler
@@ -184,9 +203,13 @@ class AppContext:
             ).all()
             for env_id, rules_version in rows:
                 cached = self._snapshots.get(env_id)
-                if cached is not None and cached.rules_version != rules_version:
+                if cached is None:
+                    continue
+                if cached.rules_version != rules_version:
                     snap = build_snapshot(session, env_id)              # build fully…
                     self._snapshots[env_id] = _CachedSnapshot(rules_version, snap)  # …then swap
+                else:
+                    cached.confirmed_at = time.monotonic()  # unchanged, freshly confirmed
             # The TTL-driven whole-table auth reload lives here now — off the hot path (§8).
             self.auth.refresh(session)
             self._db_healthy = True
@@ -196,6 +219,63 @@ class AppContext:
                 session.rollback()
             except SQLAlchemyError:
                 pass
+        self._publish_snapshot_ages()
+
+    def _publish_snapshot_ages(self) -> None:
+        """§14 incant_rules_snapshot_age_seconds — refreshed by every poll pass, on
+        success AND failure, so an outage shows up as ages climbing in lockstep.
+        Lazy import mirrors record_reconcile (server → service cycle)."""
+        try:
+            from .server.metrics import rules_snapshot_age_seconds
+            now = time.monotonic()
+            for env_id, cached in self._snapshots.items():
+                rules_snapshot_age_seconds.labels(env_id).set(now - cached.confirmed_at)
+        except Exception:  # pragma: no cover - metrics are best-effort telemetry
+            pass
+
+    def snapshot_at(self, session: Session, env_id: str, rules_version: int) -> EnvSnapshot:
+        """A historical targeting snapshot for §9 ``pin.rules_version`` replay.
+
+        A response's ``rules_version`` always names an exact revision, so replay
+        requires an EXACT state-carrying revision — anything else is a caller error,
+        answered honestly (422 with the ``pin.versions`` alternative) rather than
+        approximated. The one DB read sits off the common path (replays only) and
+        the result is memoized — a revision's state never changes."""
+        current = self.get_snapshot(session, env_id)
+        if rules_version == current.rules_version:
+            return current
+        key = (env_id, rules_version)
+        hit = self._historical.get(key)
+        if hit is not None:
+            self._historical.move_to_end(key)
+            return hit
+        try:
+            rev = session.execute(
+                select(models.RuleRevision).where(
+                    models.RuleRevision.environment_id == env_id,
+                    models.RuleRevision.rules_version == rules_version,
+                    models.RuleRevision.state.isnot(None),
+                ).order_by(models.RuleRevision.id.desc())
+            ).scalars().first()
+        except SQLAlchemyError:
+            raise ServingError(503, "targeting replay unavailable: control plane "
+                                    "unreachable (pin.versions replay stays memory-only)")
+        if rev is None:
+            raise ServingError(
+                422,
+                f"rules_version {rules_version} has no recorded targeting state for "
+                f"{env_id!r} (it may predate state-tracked revisions); replay with "
+                "pin.versions instead — the response's versions map is SHA-exact",
+            )
+        snap = snapshot_from_state(rev.state, env_id, rules_version, current.servable)
+        # Variable defaults ride along from the live snapshot: refinements are
+        # authoring metadata, not targeting state (documented replay semantics).
+        snap.refinement_defaults = current.refinement_defaults
+        self._historical[key] = snap
+        self._historical.move_to_end(key)
+        if len(self._historical) > _HISTORICAL_CACHE_MAX:
+            self._historical.popitem(last=False)
+        return snap
 
     def auto_advance_tips(self, session: Session, actor: str, prompt_id: str,
                           version: int, sha: str) -> list[str]:
@@ -337,8 +417,30 @@ class AppContext:
     def serve(
         self, session: Session, env_id: str, prompt_id: str,
         flags: dict, variables: dict, pin: dict | None = None,
+        pin_rules_version: int | None = None,
     ) -> dict:
-        snap = self.get_snapshot(session, env_id)
+        # §9 pin.rules_version: evaluate against the recorded historical targeting
+        # state instead of the live snapshot. pin.versions entries (if also given)
+        # still override per prompt — they are SHA-exact and always win.
+        if pin_rules_version is not None:
+            snap = self.snapshot_at(session, env_id, pin_rules_version)
+        else:
+            snap = self.get_snapshot(session, env_id)
+
+        # §5's invariant — "only validated SHAs can ever serve" — applies to pins too.
+        # Every other door is already guarded at write time (make_live, rule pins) or
+        # eval time (the snapshot's `servable` backstop); without this check a pin
+        # could resolve a validation-FAILED commit (those land on main by design) or a
+        # draft-ref commit (same object store), serving broken or unreviewed content.
+        # The check is memory-only: `servable` closes over the snapshot's validated
+        # (prompt, sha) pair set, so the hot path stays DB-free (§8).
+        for pid, (_pin_version, pin_sha) in (pin or {}).items():
+            if not snap.servable(pid, pin_sha):
+                raise ServingError(
+                    409,
+                    f"pinned commit {pin_sha} is not a validated commit for {pid!r}; "
+                    "only validated content can serve (§5)",
+                )
 
         # Determine the root version — for defaults lookup — honouring a pin (§9).
         pinned = (pin or {}).get(prompt_id)
@@ -389,6 +491,16 @@ class AppContext:
             "rules_version": snap.rules_version,
             "stale_rules": snap.stale,
             "content_fallback": result.content_fallback,
+            # §7 eval-time backstop: rules that MATCHED but could not serve, skipped
+            # and reported (the route also counts them — incant_rule_skips_total).
+            "skipped_rules": [
+                {"rule_id": sk.rule_id, "prompt_id": sk.prompt_id, "reason": sk.reason}
+                for sk in result.skips
+            ],
+            # True iff at least one active rule was in play for this prompt — feeds
+            # incant_flag_eval_fallthrough_total (matched_rule == "default" despite
+            # rules existing: dead-rule telemetry, §14). Stripped by the route.
+            "_rules_considered": bool(snap.global_rules() or snap.prompt_rules(prompt_id)),
         }
 
 
@@ -405,3 +517,7 @@ def get_app() -> AppContext:
 def reset_app() -> None:
     global _app
     _app = None
+    # The servability fallback memo is module-global; commit SHAs are deterministic
+    # in tests (INCANT_FIXED_GIT_DATE), so entries must not survive an app reset.
+    from .targeting import clear_servable_memo
+    clear_servable_memo()

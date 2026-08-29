@@ -90,6 +90,12 @@ async function screenOverview() {
 
   // ── side cards (kept) ──
   const vars = d.variables.map((vr) => {
+    if (vr.orphaned) {
+      // A saved refinement whose variable no longer exists in the template — an
+      // edit changed the variable set out from under it. Shown, never hidden.
+      return `<div class="kv"><span class="varname" style="text-decoration:line-through;opacity:.6">${esc(vr.name)}</span>
+        <span class="pill warn" title="This setting describes a variable the template no longer uses.">⚠ no longer in template</span></div>`;
+    }
     const cls = vr.required ? "req" : "opt";
     const over = vr.overridden ? " over" : "";
     return `<div class="kv"><span class="varname">${esc(vr.name)}</span><span class="muted">${esc(vr.type)}</span>

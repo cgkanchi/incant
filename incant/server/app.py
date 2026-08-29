@@ -27,7 +27,12 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..db import engine, session_scope
-from ..registry import reconcile_drafts, reconcile_main_commits, sweep_expired_sessions
+from ..registry import (
+    reconcile_drafts,
+    reconcile_main_commits,
+    recover_pending_promotions,
+    sweep_expired_sessions,
+)
 from ..service import get_app
 from .auth import AuthError, _IMPLIES, ensure_bootstrap_admin
 from .deps import get_session
@@ -54,22 +59,28 @@ _CSP = (
 
 
 def _verify_serve_prerequisites(ctx) -> None:
-    """Serve replicas never create state — fail fast if the repo or schema is absent."""
-    if not ctx.git.exists():
-        raise RuntimeError(
-            f"serve mode: content repo not found at {ctx.settings.repo_dir()}. "
-            "A serve replica does not create it — start the `full` node (or hydrate the "
-            "repo from a backup remote) first."
-        )
+    """Serve replicas never create control-plane state — fail fast if the schema is
+    absent. A missing content repo is recoverable: hydrate it as a mirror clone of an
+    enabled backup remote (§13/§15 — the remotes the full node pushes to double as the
+    content-distribution channel), and only fail if no remote can supply it."""
     if "environments" not in set(inspect(engine()).get_table_names()):
         raise RuntimeError(
             "serve mode: database schema is not initialized. A serve replica does not "
             "create it — run the `full` node (or `incant init`) against this database first."
         )
+    if not ctx.git.exists():
+        with session_scope() as s:
+            hydrated = ctx.backup.hydrate(s)
+        if not hydrated:
+            raise RuntimeError(
+                f"serve mode: content repo not found at {ctx.settings.repo_dir()} and no "
+                "enabled backup remote could hydrate it. Start the `full` node with a "
+                "shared volume, or register a reachable remote (POST /mgmt/remotes) first."
+            )
 
 
-def _warm_all(ctx) -> bool:
-    """Warm every environment's content cache. Returns True iff all succeeded.
+def _warm_all(ctx) -> dict[str, bool]:
+    """Warm every environment's content cache. Returns per-environment success.
 
     Each environment is warmed on its own short-lived session so one failure can't
     poison the others. Failures are logged (never swallowed silently) so readiness
@@ -78,15 +89,16 @@ def _warm_all(ctx) -> bool:
     with session_scope() as s:
         from .. import models
         env_ids = [e.id for e in s.execute(select(models.Environment)).scalars()]
-    ok = True
+    results: dict[str, bool] = {}
     for env_id in env_ids:
         try:
             with session_scope() as s:
                 ctx.warm(s, env_id)
+            results[env_id] = True
         except Exception:
             log.exception("warm failed for environment %s", env_id)
-            ok = False
-    return ok
+            results[env_id] = False
+    return results
 
 
 def _prime_auth(ctx) -> bool:
@@ -106,24 +118,37 @@ def _prime_auth(ctx) -> bool:
         return False
 
 
-def _boot_prime(ctx) -> bool:
-    """Everything readiness requires: every environment warmed (content + snapshot) AND
-    the auth cache primed. Both are evaluated every pass (no short-circuit) so a single
-    failure is always logged and the retry loop drives BOTH to green; readiness is their
-    AND. Per-concern isolation is preserved — `_warm_all` already isolates each env on its
-    own session so one failure can't poison the others, and auth priming has its own."""
-    warmed = _warm_all(ctx)
+def _boot_prime(ctx) -> tuple[bool, dict[str, bool]]:
+    """Everything readiness requires, evaluated every pass (no short-circuit) so every
+    failure is logged and the retry loop drives it all toward green. Returns
+    ``(ready, per_env_warm)``.
+
+    Readiness is PER-ENVIRONMENT in spirit: the gate is the auth cache plus the
+    DEFAULT environment (the one requests that name no env get). A broken scratch env
+    must not hold new/restarted capacity out of rotation for a healthy prod — §10's
+    per-request honesty already answers for a degraded env (fallback or 409), the
+    retry loop keeps re-warming it, and /healthz names it (``degraded_environments``)
+    so the operator sees exactly what a green node is NOT vouching for."""
+    env_warm = _warm_all(ctx)
     primed = _prime_auth(ctx)
-    return warmed and primed
+    default_env = ctx.settings.default_environment
+    ready = primed and env_warm.get(default_env, True)
+    return ready, env_warm
 
 
 async def _warm_retry_loop(app: FastAPI, ctx) -> None:
-    """Re-prime in the background until warming AND auth priming both succeed, then flip
-    readiness green. Retries the whole readiness gate, not just warming."""
-    while not getattr(app.state, "ready", False):
+    """Re-prime in the background until the readiness gate passes AND every
+    environment is warm — a green node may still carry degraded environments, and
+    this loop keeps driving them toward warm (surfaced via /healthz meanwhile)."""
+    while True:
+        env_warm = getattr(app.state, "env_warm", {})
+        if getattr(app.state, "ready", False) and all(env_warm.values()):
+            return
         await asyncio.sleep(_WARM_RETRY_SECONDS)
         try:
-            if _boot_prime(ctx):
+            ready, env_warm = _boot_prime(ctx)
+            app.state.env_warm = env_warm
+            if ready and not getattr(app.state, "ready", False):
                 app.state.ready = True
                 log.info("warm + auth priming complete; node is ready")
         except Exception:  # pragma: no cover - defensive; keep the loop alive
@@ -154,9 +179,59 @@ async def _reconcile_loop(ctx) -> None:
         await asyncio.sleep(interval)
         try:
             with session_scope() as s:
+                recover_pending_promotions(s, ctx.git)
                 ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("periodic main reconcile errored")
+
+
+def _backup_pass(ctx) -> None:
+    """One synchronous pusher pass on its own session (run via to_thread — a remote
+    push blocks on the network and must not stall the event loop)."""
+    with session_scope() as s:
+        ctx.backup.push_pending(s)
+
+
+async def _backup_push_loop(ctx) -> None:
+    """Full mode: drain the backup queue to every enabled remote every
+    INCANT_BACKUP_POLL_SECONDS (§6). The interval bounds the content-durability
+    exposure window; per-remote failures are logged inside the pusher and never
+    raise, so a dead remote just leaves its queue growing (and its lag gauge
+    rising) until it recovers."""
+    interval = get_settings().backup_poll_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(_backup_pass, ctx)
+        except Exception:  # pragma: no cover - defensive; keep the loop alive
+            log.exception("backup push pass errored")
+
+
+def _fetch_pass(ctx) -> bool:
+    with session_scope() as s:
+        return ctx.backup.fetch_once(s)
+
+
+async def _content_fetch_loop(app: FastAPI, ctx) -> None:
+    """Serve mode: follow an enabled backup remote by mirror-fetch every
+    INCANT_CONTENT_FETCH_SECONDS (§13/§15). Rules reach replicas via the DB poll;
+    THIS is how content does — without it a make-live can reference a commit the
+    replica's repo copy has never seen. After a successful fetch, a not-yet-ready
+    replica gets an immediate readiness retry (the missing SHAs may just have
+    arrived) instead of waiting out the warm-retry backoff."""
+    interval = get_settings().content_fetch_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            fetched = await asyncio.to_thread(_fetch_pass, ctx)
+            if fetched and not getattr(app.state, "ready", False):
+                ready, env_warm = _boot_prime(ctx)
+                app.state.env_warm = env_warm
+                if ready:
+                    app.state.ready = True
+                    log.info("content fetch completed warm; node is ready")
+        except Exception:  # pragma: no cover - defensive; keep the loop alive
+            log.exception("content fetch pass errored")
 
 
 async def _control_poll_loop(ctx) -> None:
@@ -196,6 +271,10 @@ async def lifespan(app: FastAPI):
         # main-reconcile result is recorded on the ctx so /healthz + the incant_reconcile_*
         # gauges reflect drift from the very first boot, not just after the first interval.
         with session_scope() as s:
+            # Pending recovery FIRST: a staged publish whose DB transaction committed
+            # must reach main before the draft sweep would clean up its (now orphan)
+            # draft ref, and before the main sweep takes its drift census.
+            recover_pending_promotions(s, ctx.git)
             reconcile_drafts(s, ctx.git)
             sweep_expired_sessions(s)
             ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
@@ -205,19 +284,25 @@ async def lifespan(app: FastAPI):
     # zero DB reads" (§8/§10). Any failure leaves the node not ready; in full mode a
     # background loop keeps retrying both, and in serve mode the same loop lets a replica
     # become ready once the full node has published its content.
-    app.state.ready = _boot_prime(ctx)
+    app.state.ready, app.state.env_warm = _boot_prime(ctx)
     retry_task = None
-    if not app.state.ready:
-        log.warning("warm/auth priming incomplete at boot — node not ready; retrying in "
-                    "background")
+    if not app.state.ready or not all(app.state.env_warm.values()):
+        if not app.state.ready:
+            log.warning("warm/auth priming incomplete at boot — node not ready; "
+                        "retrying in background")
         retry_task = asyncio.create_task(_warm_retry_loop(app, ctx))
 
-    # Hourly expired-session sweep + periodic main-commit drift check (full mode only —
-    # serve replicas have no sessions and never own the canonical main to reconcile).
-    sweep_task = reconcile_task = None
+    # Hourly expired-session sweep + periodic main-commit drift check + backup pushes
+    # (full mode only — serve replicas have no sessions, never own the canonical main,
+    # and never push). Serve replicas instead FOLLOW a backup remote for content.
+    sweep_task = reconcile_task = backup_task = fetch_task = None
     if settings.mode == "full":
         sweep_task = asyncio.create_task(_session_sweep_loop())
         reconcile_task = asyncio.create_task(_reconcile_loop(ctx))
+        if settings.backup_poll_seconds > 0:
+            backup_task = asyncio.create_task(_backup_push_loop(ctx))
+    elif settings.content_fetch_seconds > 0:
+        fetch_task = asyncio.create_task(_content_fetch_loop(app, ctx))
 
     # Control-plane poll (BOTH modes): the serving hot path never reads the DB itself;
     # this loop pulls targeting bumps + auth changes into memory (§7 poll fallback, §8/§10).
@@ -226,7 +311,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task in (retry_task, sweep_task, reconcile_task, poll_task):
+        for task in (retry_task, sweep_task, reconcile_task, backup_task, fetch_task,
+                     poll_task):
             if task is not None:
                 task.cancel()
 
@@ -276,15 +362,22 @@ def create_app() -> FastAPI:
         # the incant_reconcile_* gauges; this body just makes drift glanceable. A clean (or
         # not-yet-reconciled, e.g. serve replica) node stays the literal "ok".
         res = get_app().last_reconcile
+        body: dict = {}
         if res is not None and (res.git_orphans or res.unvalidated_tips or res.missing_files):
-            return JSONResponse({
-                "status": "ok",  # still serving correctly — drift is NOT unhealthy
-                "drift": {
-                    "git_orphans": res.git_orphans,
-                    "unvalidated_tips": res.unvalidated_tips,
-                    "missing_files": res.missing_files,
-                },
-            })
+            body["drift"] = {
+                "git_orphans": res.git_orphans,
+                "unvalidated_tips": res.unvalidated_tips,
+                "missing_files": res.missing_files,
+            }
+        # Environments that failed their last warm pass. The node stays green — §10's
+        # per-request honesty (fallback or 409) answers for them, and the retry loop
+        # keeps re-warming — but a green node must SAY what it is not vouching for.
+        degraded = sorted(e for e, ok in getattr(app.state, "env_warm", {}).items()
+                          if not ok)
+        if degraded:
+            body["degraded_environments"] = degraded
+        if body:
+            return JSONResponse({"status": "ok", **body})
         return PlainTextResponse("ok")
 
     @app.get("/readyz", response_class=PlainTextResponse)

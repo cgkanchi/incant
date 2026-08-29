@@ -28,10 +28,16 @@ from incant.db import _adoption_revision, _has_unique_columns
 
 
 class FakeInspector:
-    def __init__(self, tables, unique_constraints=None, indexes=None):
+    def __init__(self, tables, unique_constraints=None, indexes=None, columns=None):
         self._tables = list(tables)
         self._unique_constraints = unique_constraints or {}
         self._indexes = indexes or {}
+        # table -> list of column-reflection dicts. Defaults to the CURRENT models'
+        # columns for the tables the probes inspect, so "everything present" states
+        # don't have to spell them out; pass explicitly to model an older schema.
+        self._columns = columns if columns is not None else {
+            "rule_revisions": [{"name": "state"}],
+        }
 
     def get_table_names(self):
         return list(self._tables)
@@ -41,6 +47,9 @@ class FakeInspector:
 
     def get_indexes(self, table):
         return list(self._indexes.get(table, []))
+
+    def get_columns(self, table):
+        return list(self._columns.get(table, []))
 
 
 # The set of tables a baseline-or-later schema always carries (abbreviated — only the
@@ -92,6 +101,18 @@ def test_prefix_unique_but_review_not_unique_adopts_at_a3f1():
         unique_constraints=_prefix_unique_via_constraint(),
     )
     assert _adoption_revision(insp) == "a3f1c8e29b41"
+
+
+def test_review_unique_but_state_column_missing_adopts_at_b7d2():
+    """Both uniqueness objects present but rule_revisions.state is absent →
+    c4e8a17d5b23 hasn't run; adopt at b7d2e6f4a1c9 so the column migration applies."""
+    ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
+    insp = FakeInspector(
+        tables=_CORE_TABLES + ["sessions"],
+        unique_constraints=ucs,
+        columns={"rule_revisions": [{"name": "snapshot"}]},  # pre-c4e8 columns
+    )
+    assert _adoption_revision(insp) == "b7d2e6f4a1c9"
 
 
 def test_everything_present_returns_head():
@@ -194,14 +215,15 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
 
         db.ensure_schema()
 
-        # Landed at head, with the two post-67fb uniqueness objects now present.
+        # Landed at head, with every post-67fb object now present.
         db.reset_engine()
         insp = inspect(db.engine())
         with db.engine().connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "b7d2e6f4a1c9"
+        assert version == "c4e8a17d5b23"
         assert _has_unique_columns(insp, "api_keys", ["prefix"])
         assert _has_unique_columns(insp, "reviews", ["draft_id", "reviewer"])
+        assert "state" in {c["name"] for c in insp.get_columns("rule_revisions")}
     finally:
         set_settings(saved)
         db.reset_engine()

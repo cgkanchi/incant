@@ -95,9 +95,47 @@ def get_rules(
         # (the same split _project_of uses) is that project. None never matches.
         return bool(prompt_id) and _project_of(prompt_id) == project
 
+    # §7 "skipped, counted, surfaced in the UI": the eval-time skip only shows up in
+    # metrics when a request actually hits the rule, so the console does the static
+    # half — flag any ACTIVE rule whose serve target cannot currently resolve.
+    snap = app.get_snapshot(session, env)
+
+    def _unservable_reason(r: models.Rule) -> str | None:
+        if r.status != "active":
+            return None
+        serve = r.serve if isinstance(r.serve, dict) else {}
+        if r.scope == "global":
+            label = serve.get("label") or (serve.get("rollout") or {}).get("label")
+            if label and not any(
+                snap.version_for_label(pid, label) is not None for pid in snap.versions):
+                return f"label {label!r} has no participating prompts"
+            return None
+        pid = r.prompt_id
+        targets: list[tuple[int, str | None, str | None]] = []
+        if "version" in serve:
+            targets.append((int(serve["version"]), serve.get("at"), serve.get("sha")))
+        for band in (serve.get("rollout") or {}).get("weights", []):
+            if band.get("version") is not None and not band.get("default"):
+                targets.append((int(band["version"]), None, None))
+        for version, at, sha in targets:
+            vinfo = snap.version_info(pid, version)
+            if vinfo is None:
+                return f"v{version} does not exist"
+            if at == "tip":
+                if vinfo.tip_sha is None:
+                    return f"v{version} has no validated tip"
+            elif at == "sha":
+                if not sha or not snap.servable(pid, sha):
+                    return f"pinned SHA for v{version} is not servable"
+            elif vinfo.live_sha is None or not snap.servable(pid, vinfo.live_sha):
+                if not any(snap.servable(pid, s) for s in vinfo.previous_live):
+                    return f"v{version} has no servable live content"
+        return None
+
     rules = [
         {"id": r.id, "scope": r.scope, "prompt_id": r.prompt_id, "priority": r.priority,
-         "when": r.clauses, "serve": r.serve, "status": r.status, "comment": r.comment}
+         "when": r.clauses, "serve": r.serve, "status": r.status, "comment": r.comment,
+         "unservable_reason": _unservable_reason(r)}
         for r in tgt.list_rules(env)
         # Scoped read keeps global rules (they govern this project's prompts too) plus the
         # project's own prompt-scoped rules; other projects' rules stay hidden.

@@ -6,7 +6,8 @@ plain-data snapshot the render hot path can evaluate against with no further I/O
 
 from __future__ import annotations
 
-from collections import defaultdict
+import time
+from collections import OrderedDict, defaultdict
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -26,29 +27,11 @@ _VALIDATED_ORDER_CAP = 50     # tip_sha reads only [0]; K is defensive headroom
 _POINTER_HISTORY_CAP = 100    # previous_live scans distinct recent moves; nothing past ~K
 
 
-def _validated_shas(session: Session) -> tuple[set[tuple[str, str]], dict[tuple[str, int], list[str]]]:
-    """Return (all validated (prompt_id, sha) pairs, {(prompt,version) -> newest-K SHAs}).
-
-    Two DELIBERATELY different reads:
-
-    * The servable-pair set must stay COMPLETE — correctness over economy. ``servable``
-      legitimately answers True for ANY (prompt, sha) ever validated for that prompt: an
-      old pinned rule or a rolled-back live pointer can reference a SHA far down the
-      history, and warming/serving must still recognise it. So we fetch the full
-      (prompt_id, sha) pair set — one two-column indexed scan, deliberately NOT windowed.
-
-    * The per-(prompt,version) ordering list only feeds ``tip_sha`` (its head). Window it
-      to the newest ``_VALIDATED_ORDER_CAP`` per (prompt, version) so a version with a huge
-      validation history doesn't materialise in full on every snapshot rebuild."""
-
-    # Complete servable pairs — one indexed two-column scan, deliberately unwindowed.
-    pairs = session.execute(
-        select(models.CommitValidation.prompt_id, models.CommitValidation.sha)
-        .where(models.CommitValidation.status == "valid")
-    ).all()
-    servable_pairs: set[tuple[str, str]] = {(pid, sha) for pid, sha in pairs}
-
-    # Newest-K ordering lists — windowed; only the head (tip_sha) is ever consumed.
+def _validated_order(session: Session) -> dict[tuple[str, int], list[str]]:
+    """{(prompt,version) -> newest-K validated SHAs}, newest-first — feeds ``tip_sha``
+    and the referenced-pair set. Windowed to ``_VALIDATED_ORDER_CAP`` per key so a
+    version with a huge validation history doesn't materialise in full on every
+    snapshot rebuild."""
     rn = func.row_number().over(
         partition_by=(models.CommitValidation.prompt_id, models.CommitValidation.version_number),
         order_by=(models.CommitValidation.validated_at.desc(), models.CommitValidation.id.desc()),
@@ -67,7 +50,56 @@ def _validated_shas(session: Session) -> tuple[set[tuple[str, str]], dict[tuple[
     by_version: dict[tuple[str, int], list[str]] = defaultdict(list)
     for pid, ver, sha in rows:            # rn-ascending == newest-first within each key
         by_version[(pid, ver)].append(sha)
-    return servable_pairs, by_version
+    return by_version
+
+
+# Servability fallback memo for (prompt, sha) pairs OUTSIDE the referenced set — an
+# exotic old rule pin or request pin reaching past the windowed history. Positive
+# answers are immutable facts (validation rows are never deleted) and cache forever;
+# negatives expire after a short TTL (the SHA may simply not be validated YET).
+# Bounded LRU; a DB outage during a lookup returns False (fail closed: §5's "only
+# validated SHAs serve" beats availability for a pin no warm state can vouch for)
+# and is never cached.
+_FALLBACK_MEMO: "OrderedDict[tuple[str, str], tuple[bool, float]]" = OrderedDict()
+_FALLBACK_MEMO_MAX = 8192
+_FALLBACK_NEG_TTL = 30.0
+
+
+def clear_servable_memo() -> None:
+    """Reset the fallback memo (tests / service reset — commit SHAs are
+    deterministic under INCANT_FIXED_GIT_DATE, so entries could leak across
+    freshly-reset databases)."""
+    _FALLBACK_MEMO.clear()
+
+
+def _validated_in_db(prompt_id: str, sha: str) -> bool:
+    key = (prompt_id, sha)
+    hit = _FALLBACK_MEMO.get(key)
+    if hit is not None:
+        ok, at = hit
+        if ok or (time.time() - at) < _FALLBACK_NEG_TTL:
+            _FALLBACK_MEMO.move_to_end(key)
+            return ok
+    from ..db import session_factory  # lazy: keep module import-light for pure tests
+    try:
+        s = session_factory()()
+        try:
+            ok = s.execute(
+                select(models.CommitValidation.id).where(
+                    models.CommitValidation.prompt_id == prompt_id,
+                    models.CommitValidation.sha == sha,
+                    models.CommitValidation.status == "valid",
+                ).limit(1)
+            ).first() is not None
+        finally:
+            s.close()
+    except Exception:
+        return False  # outage: fail closed, cache nothing
+    _FALLBACK_MEMO[key] = (ok, time.time())
+    _FALLBACK_MEMO.move_to_end(key)
+    if len(_FALLBACK_MEMO) > _FALLBACK_MEMO_MAX:
+        _FALLBACK_MEMO.popitem(last=False)
+    return ok
 
 
 def _pointer_history(session: Session, env_id: str) -> dict[tuple[str, int], list[str]]:
@@ -100,29 +132,80 @@ def _pointer_history(session: Session, env_id: str) -> dict[tuple[str, int], lis
     return hist
 
 
+def snapshot_from_state(
+    state: dict, env_id: str, rules_version: int, servable,
+) -> EnvSnapshot:
+    """Rebuild an evaluable :class:`EnvSnapshot` from a revision's captured state
+    (``TargetingService.capture_state``) — the §9 ``pin.rules_version`` replay.
+
+    Two deliberate departures from a live snapshot:
+
+    * ``previous_live`` is empty — a replay never degrades to a §10 fallback; if
+      the recorded SHA's content is gone, the render 409s rather than lies;
+    * ``servable`` is the CURRENT validated set (validation history only grows,
+      so anything servable then is servable now).
+
+    Tips are the tips AS OF THE TARGETING CHANGE that produced the revision — a
+    later commit that moved a tip under an unchanged ``rules_version`` is not
+    recoverable from targeting state alone. Exact content replay is what
+    ``pin.versions`` is for; this replays *targeting*.
+    """
+    rules = [parse_rule(r) for r in state.get("rules", [])]
+    segments = {
+        s["name"]: CoreSegment(name=s["name"], condition=parse_condition(s["clauses"]),
+                               version=s.get("version", 1))
+        for s in state.get("segments", [])
+    }
+    versions: dict[str, dict[int, VersionInfo]] = defaultdict(dict)
+    for key, vinfo in state.get("versions", {}).items():
+        prompt_id, _, vpart = key.rpartition("@v")
+        number = int(vpart)
+        versions[prompt_id][number] = VersionInfo(
+            version=number,
+            live_sha=vinfo.get("live"),
+            tip_sha=vinfo.get("tip"),
+            label=vinfo.get("label"),
+            status=vinfo.get("status", "active"),
+            previous_live=(),
+        )
+    return EnvSnapshot(
+        environment=env_id,
+        rules_version=rules_version,
+        rules=rules,
+        segments=segments,
+        defaults=dict(state.get("defaults", {})),
+        refinement_defaults={},   # supplied by the caller from the live snapshot
+        versions={k: dict(v) for k, v in versions.items()},
+        stale=False,
+        killed=set(state.get("kills", [])),
+        servable=servable,
+    )
+
+
 def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> EnvSnapshot:
     env = session.get(models.Environment, env_id)
     if env is None:
         raise KeyError(f"unknown environment {env_id!r}")
 
-    # `servable_pairs` is the COMPLETE (prompt, sha) validation set (see `_validated_shas`);
-    # `validated_by_version` is windowed and feeds only tip_sha. They are two reads on
-    # purpose — servability must stay complete while the ordering lists may be capped.
-    servable_pairs, validated_by_version = _validated_shas(session)
+    validated_by_version = _validated_order(session)
     pointer_hist = _pointer_history(session, env_id)
 
-    # Defense-in-depth for the evaluator's servability check (§7). Full
-    # (prompt, version, SHA) tuple integrity is enforced at *write* time — by
-    # `TargetingService.make_live` and by rule pins in `_validate_rule_targets` —
-    # so a live pointer or pinned SHA can never reach a prompt it wasn't validated
-    # for. This snapshot check is the read-side backstop: it upgrades the old
-    # `sha in valid_shas` (valid for *any* prompt) to `(prompt, sha) validated for
-    # *this* prompt`. Version is intentionally absent from the closure: the core
-    # evaluator's callback signature is (prompt_id, sha) (see core/evaluate.py and
-    # core/model.py), and version integrity is already owned by the write-time
-    # checks — so we key on (prompt, sha) and let the evaluator supply the prompt.
-    # The pair set is deliberately unwindowed: an old validated SHA (pinned rule /
-    # rolled-back pointer) must remain servable no matter how deep in history it sits.
+    # Servability (§7 defense-in-depth, read-side backstop to the write-time
+    # (prompt, version, SHA) integrity checks in make_live/_validate_rule_targets).
+    # The closure answers from the REFERENCED pair set — every (prompt, sha) this
+    # snapshot itself enumerates: recent validated history (tips), the live-pointer
+    # history (§10 fallbacks), and explicit rule SHA pins. That bounds the per-
+    # rebuild work to what targeting references, O(referenced) instead of O(every
+    # commit ever). A (prompt, sha) OUTSIDE the set — an exotic pin deeper than the
+    # windowed history — falls through to a memoized one-row DB check
+    # (`_validated_in_db`), mirroring §8's content-cache-miss exception; during a DB
+    # outage that fallback fails CLOSED (the §10 rules-freeze posture protects
+    # everything warm; a pin nothing warm can vouch for gets a 409, not a guess).
+    referenced: set[tuple[str, str]] = set()
+    for (pid, _ver), shas in validated_by_version.items():
+        referenced.update((pid, sha) for sha in shas)
+    for (pid, _ver), shas in pointer_hist.items():
+        referenced.update((pid, sha) for sha in shas)
 
     # Versions
     versions: dict[str, dict[int, VersionInfo]] = defaultdict(dict)
@@ -163,11 +246,15 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
     ).scalars().all():
         refinement_defaults[(r.prompt_id, r.version_number)][r.name] = r.default
 
-    # Rules
+    # Rules — explicit SHA pins join the referenced servable set (they may reach
+    # past the windowed history above and must not depend on the DB fallback).
     rules: list[CoreRule] = []
     for r in session.execute(
         select(models.Rule).where(models.Rule.environment_id == env_id)
     ).scalars().all():
+        serve = r.serve if isinstance(r.serve, dict) else {}
+        if r.prompt_id and serve.get("at") == "sha" and serve.get("sha"):
+            referenced.add((r.prompt_id, serve["sha"]))
         rules.append(parse_rule({
             "id": r.id, "scope": r.scope, "prompt_id": r.prompt_id,
             "priority": r.priority, "when": r.clauses, "serve": r.serve,
@@ -205,5 +292,7 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
         track_tip=env.track_tip,
         stale=stale,
         killed=killed,
-        servable=lambda prompt_id, sha: (prompt_id, sha) in servable_pairs,
+        servable=lambda prompt_id, sha: (
+            (prompt_id, sha) in referenced or _validated_in_db(prompt_id, sha)
+        ),
     )

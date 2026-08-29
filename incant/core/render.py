@@ -193,6 +193,13 @@ def _compile(env: SandboxedEnvironment, blob_sha: str, source: str, name: str) -
     if cached is not None:
         return cached
     compile_misses += 1
+    # Lazy + defensive (the gitstore/content.py idiom): core stays a pure library
+    # with no hard server dependency; the counter is best-effort telemetry (§14).
+    try:
+        from ..server.metrics import template_cache_misses_total
+        template_cache_misses_total.inc()
+    except Exception:  # pragma: no cover - metrics are best-effort
+        pass
     try:
         code = env.compile(source, name=name, filename=name)
         tmpl = Template.from_code(env, code, env.make_globals(None), None)

@@ -36,16 +36,35 @@ def _env(app: AppContext, req_env: str | None) -> str:
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
-def _parse_pin(pin: dict | None) -> dict | None:
-    """Turn a request pin ({"versions": {pid: {version, commit}}}) into the render
-    engine's shape (pid -> (version, commit)).
+def _parse_pin(pin: dict | None) -> tuple[dict | None, int | None]:
+    """Parse a §9 pin into ``(versions_map, rules_version)`` for the render engine.
+
+    Accepted shapes: ``{"versions": {...}}``, ``{"rules_version": N}``, both
+    together (``versions`` entries override per prompt), or — back-compat — a bare
+    versions map. Anything else is a 422: a pin field the server would ignore is a
+    caller believing they replayed something they didn't.
 
     Pins must carry FULL 40-char SHAs (the serving `versions[].commit` a caller feeds
     back). Abbreviated SHAs are rejected with 422 — an ambiguous prefix must never
     silently resolve to the wrong content (§4, §9)."""
     if not pin:
-        return None
-    versions = pin.get("versions", pin)  # accept the bare versions map too
+        return None, None
+    rules_version: int | None = None
+    if "versions" in pin or "rules_version" in pin:
+        unknown = set(pin) - {"versions", "rules_version"}
+        if unknown:
+            raise HTTPException(
+                422, f"unknown pin field(s) {sorted(unknown)!r}; a pin carries "
+                     "\"versions\" and/or \"rules_version\"")
+        versions = pin.get("versions") or {}
+        if "rules_version" in pin:
+            rv = pin["rules_version"]
+            if isinstance(rv, bool) or not isinstance(rv, int) or rv < 1:
+                raise HTTPException(
+                    422, f"pin.rules_version must be a positive integer, got {rv!r}")
+            rules_version = rv
+    else:
+        versions = pin  # bare versions map (back-compat)
     out: dict[str, tuple[int, str]] = {}
     for pid, entry in (versions or {}).items():
         try:
@@ -60,7 +79,7 @@ def _parse_pin(pin: dict | None) -> dict | None:
                 f"got {commit!r}",
             )
         out[pid] = (version, commit)
-    return out or None
+    return out or None, rules_version
 
 
 @router.post("/prompt/{prompt_id:path}/evaluate")
@@ -94,10 +113,11 @@ def render_prompt(
 ):
     env = _env(app, req.environment)
     _require_render(ident, prompt_id, env)
-    pin = _parse_pin(req.pin)
+    pin, pin_rules_version = _parse_pin(req.pin)
     start = time.perf_counter()
     try:
-        resp = app.serve(session, env, prompt_id, req.flags, req.variables, pin=pin)
+        resp = app.serve(session, env, prompt_id, req.flags, req.variables, pin=pin,
+                         pin_rules_version=pin_rules_version)
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail={"detail": exc.detail, **exc.extra})
     metrics.render_seconds.observe(time.perf_counter() - start)
@@ -105,6 +125,13 @@ def render_prompt(
     if resp["content_fallback"]:
         metrics.content_fallbacks_total.labels(prompt_id, env).inc()
         response.headers["X-Incant-Content-Fallback"] = "true"
+    # §7 "skipped, counted": rules that matched but could not serve on this render.
+    if resp["skipped_rules"]:
+        metrics.rule_skips_total.inc(len(resp["skipped_rules"]))
+    # §14 dead-rule telemetry: the render fell through EVERY in-play rule to the
+    # environment default. Sustained growth = rules that never match anything.
+    if resp.pop("_rules_considered", False) and resp["matched_rule"] == "default":
+        metrics.flag_eval_fallthrough_total.inc()
     return resp
 
 

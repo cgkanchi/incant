@@ -288,10 +288,12 @@ def test_get_versions_history_capped_at_constant(client):
 
 def test_snapshot_servable_complete_despite_validation_window(client):
     """The snapshot's per-(prompt,version) validation ordering is windowed to K (drives
-    tip_sha), but the servable set is the DELIBERATELY complete (prompt, sha) pair read: a
-    validated SHA far outside the newest-K window is still servable — an old pinned rule or
-    rolled-back pointer must never lose servability just because newer edits pushed it down."""
+    tip_sha), and the servable set is bounded to what targeting references — but the
+    OBSERVABLE contract stays complete: a validated SHA far outside the newest-K window
+    is still servable via the memoized DB fallback. An old pinned rule or rolled-back
+    pointer must never lose servability just because newer edits pushed it down."""
     env, pid, ver = "prod", "scale/snap", 1
+    client.post("/mgmt/prompts", json={"prompt_id": pid}, headers=auth())  # FK parents
     with session_scope() as s:
         s.add(models.Version(prompt_id=pid, number=ver))
     newest_first = _seed_validations(pid, ver, _VALIDATED_ORDER_CAP + 5)
@@ -312,6 +314,7 @@ def test_snapshot_previous_live_recent_distinct(client):
     distinct previous-live SHAs, newest-first, excluding the current live."""
     env, pid, ver = "prod", "scale/prev", 1
     base = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
+    client.post("/mgmt/prompts", json={"prompt_id": pid}, headers=auth())  # FK parents
     with session_scope() as s:
         s.add(models.Version(prompt_id=pid, number=ver))
         for i, sha in enumerate(["sA", "sB", "sA", "sC"]):   # sC is newest (live)

@@ -86,7 +86,27 @@ governed**. Tweak a live version → review → commit (validated, lands as a ne
 the append-only pointer) → drop the rule. The tip↔live gap is the testing window.
 
 Every render reports the resolved version **and SHA** of the prompt and every included
-fragment — `versions` map + `rules_version` is the reproducibility tuple.
+fragment — `versions` map + `rules_version` is the reproducibility tuple. Feed it back
+as `pin` to replay: `pin.versions` replays exact content (only validated SHAs — a pin
+can never surface draft or validation-failed content), `pin.rules_version` replays the
+recorded targeting state of that moment (DESIGN.md §9 for the precise semantics).
+
+## Backups and replicas
+
+The canonical repo's off-site durability is **backup remotes** (DESIGN.md §6): register
+any `git push`-able URL at `POST /mgmt/remotes` (admin; an optional `auth_ref` names a
+push-only ssh deploy key, and https URLs may embed a token — redacted in every
+response). A background pass force-pushes the complete ref set to every enabled remote
+that is behind `main`, every `INCANT_BACKUP_POLL_SECONDS`; `GET /mgmt/remotes` shows
+each remote's pending-commit queue and lag, and `POST /mgmt/remotes/{id}/push` pushes
+one immediately. `incant_backup_queue_depth` and `incant_backup_lag_seconds{remote}`
+bound the exposure window on a dashboard.
+
+The same remotes distribute content to **serve replicas** (`INCANT_MODE=serve`): a
+replica with an empty volume hydrates itself by mirror-cloning an enabled remote, then
+follows it with a mirror-fetch every `INCANT_CONTENT_FETCH_SECONDS` — so a "make live"
+that references a fresh commit finds its content on every replica within one interval.
+Sharing the full node's volume works too (set the interval to 0).
 
 ## Testing
 
@@ -144,6 +164,10 @@ Chrome/Chromium binary if yours lives elsewhere.
 | `INCANT_KEY_PEPPER` | *(empty)* | secret pepper for key hashing; set ⇒ new/rotated keys stored as `v2$` HMAC-SHA256, legacy keys upgraded on next auth |
 | `INCANT_METRICS_TOKEN` | *(empty)* | shared bearer token that lets a principal-less Prometheus scraper read `/metrics` |
 | `INCANT_ENFORCE_TLS` | `false` | emit `Strict-Transport-Security` (HSTS) — enable only when TLS terminates at a proxy in front of Incant |
+| `INCANT_BACKUP_POLL_SECONDS` | `15.0` | backup-push interval to enabled remotes (full mode); `0` disables the loop |
+| `INCANT_CONTENT_FETCH_SECONDS` | `30.0` | serve-replica content mirror-fetch interval; `0` disables (shared-volume deployments) |
+| `INCANT_BACKUP_TIMEOUT_SECONDS` | `60.0` | timeout for one remote git operation (push/fetch/clone) |
+| `INCANT_KNOWN_HOSTS_PATH` | *(empty)* | pinned known_hosts file for ssh remotes; empty ⇒ ssh defaults |
 | `INCANT_AUTH_TTL` | `5.0` | in-memory key-cache TTL (s); bounds revocation propagation across replicas |
 | `INCANT_AUTH_THROTTLE_LIMIT` | `20` | failed bearer auths per IP per window before `429`; `0` disables |
 | `INCANT_AUTH_THROTTLE_WINDOW` | `60.0` | sliding window (s) for the failed-auth throttle |

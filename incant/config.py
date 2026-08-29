@@ -60,6 +60,25 @@ class Settings(BaseSettings):
     # node still serves correct content from the last VALIDATED SHAs).
     reconcile_interval_seconds: float = 3600.0
 
+    # Backup pushes (§6, full mode): every this-many seconds, push the full ref set to
+    # any enabled remote that is behind main. The interval bounds the content-durability
+    # exposure window between a commit landing and its off-site copy. 0 disables the loop
+    # (remotes can still be pushed manually via POST /mgmt/remotes/{id}/push).
+    backup_poll_seconds: float = 15.0
+
+    # Serve replicas (§13/§15): every this-many seconds, mirror-fetch content from the
+    # first enabled remote that answers, so SHAs referenced by fresh targeting become
+    # fetchable without a shared volume. 0 disables (shared-volume deployments).
+    content_fetch_seconds: float = 30.0
+
+    # Timeout (seconds) for one remote git operation (push/fetch/clone) — a hung ssh
+    # must not wedge the backup or fetch loop.
+    backup_timeout_seconds: float = 60.0
+
+    # Pinned known_hosts file for ssh remotes (mounted read-only in §15's compose).
+    # Empty ⇒ ssh's default resolution.
+    known_hosts_path: str = ""
+
     # Failed-auth throttling: per-client-IP sliding window over FAILED bearer auths.
     # After `limit` failures within `window` seconds, that IP gets 429 (Retry-After)
     # until the window drains. Successful auth is never throttled. limit=0 disables.

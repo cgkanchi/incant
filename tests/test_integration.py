@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
 from incant import db, models
 from incant.config import Settings, set_settings
@@ -194,6 +195,105 @@ def test_targeting_revisions_and_rollback(app):
         r2 = s.get(models.Rule, "r2")
         assert r1.priority == 5 and r1.serve == {"version": 1}  # restored to original
         assert r2.status == "archived"                           # created after target
+
+
+def test_total_rollback_restores_pointers_defaults_and_kills(app):
+    # §7 "one-click rollback of … the whole environment's targeting state": rules,
+    # segments, defaults, kill switches AND live pointers — not just rules.
+    out1 = _author_version(app, "support/system", 1, "v1 {{ x }}")
+    _author_version(app, "support/system", 2, "v2 {{ x }}", make_live=True)
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.set_default("prod", "support/system", 1)
+        target_rv = s.get(models.Environment, "prod").rules_version
+
+    # Everything changes after the checkpoint: pointer (a v1 tweak made live),
+    # default, kill switch, a new rule, a new segment.
+    _author_version(app, "support/system", 1, "v1 edited {{ x }}", make_live=True)
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.set_default("prod", "support/system", 2)
+        tgt.set_kill("prod", "support/system", True)
+        tgt.upsert_rule("prod", {"id": "late-rule", "scope": "prompt",
+                                 "prompt_id": "support/system", "priority": 1,
+                                 "when": None, "serve": {"version": 2}})
+        tgt.upsert_segment("prod", "late-segment", {"flag": "x", "op": "eq", "values": [1]})
+
+    with session_scope() as s:
+        result = app.targeting(s, "op").rollback("prod", target_rv)
+        assert result["scope"] == "full"
+        assert result["changed"]["defaults"] == 1
+        assert result["changed"]["pointers"] == 1
+        assert result["changed"]["kills"] == 1
+        assert result["changed"]["rules"] >= 1
+
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        # Default and pointer restored; the pointer history GREW (append-only).
+        d = s.execute(select(models.EnvDefault).where(
+            models.EnvDefault.environment_id == "prod",
+            models.EnvDefault.prompt_id == "support/system")).scalar_one()
+        assert d.version_number == 1
+        assert tgt.current_live("prod", "support/system", 1) == out1.sha
+        moves = tgt.pointer_history("prod", "support/system", 1)
+        assert len(moves) == 3 and moves[0].comment.startswith("rollback")
+        # Kill disengaged; late rule archived.
+        kill = s.execute(select(models.KillSwitch).where(
+            models.KillSwitch.environment_id == "prod",
+            models.KillSwitch.prompt_id == "support/system")).scalar_one()
+        assert kill.engaged is False
+        assert s.get(models.Rule, "late-rule").status == "archived"
+
+
+def test_rollback_falls_back_to_rules_only_for_legacy_revisions(app):
+    # Pre-upgrade revisions carry no state; rollback degrades to the legacy
+    # rules-only reconstruction and SAYS so.
+    _author_version(app, "support/system", 1, "v1 {{ x }}")
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.upsert_rule("prod", {"id": "r1", "scope": "prompt",
+                                 "prompt_id": "support/system", "priority": 5,
+                                 "when": None, "serve": {"version": 1}})
+        target_rv = s.get(models.Environment, "prod").rules_version
+        tgt.upsert_rule("prod", {"id": "r2", "scope": "prompt",
+                                 "prompt_id": "support/system", "priority": 1,
+                                 "when": None, "serve": {"version": 1}})
+    with session_scope() as s:  # simulate pre-upgrade rows
+        for rev in s.execute(select(models.RuleRevision)).scalars():
+            rev.state = None
+    with session_scope() as s:
+        result = app.targeting(s, "op").rollback("prod", target_rv)
+        assert result["scope"] == "rules"
+    with session_scope() as s:
+        assert s.get(models.Rule, "r2").status == "archived"
+        assert s.get(models.Rule, "r1").serve == {"version": 1}
+
+
+def test_old_validated_pin_serves_via_db_fallback(app, monkeypatch):
+    # The snapshot's servable set is bounded to what targeting REFERENCES; a pin
+    # reaching past the windowed history must still serve, via the memoized one-row
+    # DB fallback (§8's cache-miss exception applied to validation). Shrink the
+    # window to 1 so the older validated SHA is provably outside the referenced set.
+    from incant.targeting import snapshot as snapmod
+    monkeypatch.setattr(snapmod, "_VALIDATED_ORDER_CAP", 1)
+
+    out_old = _author_version(app, "support/system", 1, "old {{ x }}", make_live=False)
+    out_new = _author_version(app, "support/system", 1, "new {{ x }}", make_live=True)
+    assert out_old.sha != out_new.sha
+    app.invalidate("prod")
+
+    with session_scope() as s:
+        resp = app.serve(s, "prod", "support/system", {}, {"x": "1"},
+                         pin={"support/system": (1, out_old.sha)})
+    assert resp["versions"]["support/system"]["commit"] == out_old.sha
+    assert resp["prompt"] == "old 1"
+
+    # A never-validated SHA still 409s — the fallback answers from the DB, not hope.
+    with session_scope() as s:
+        with pytest.raises(ServingError) as exc:
+            app.serve(s, "prod", "support/system", {}, {"x": "1"},
+                      pin={"support/system": (1, "f" * 40)})
+        assert exc.value.status == 409
 
 
 def test_track_tip_auto_advances_live_pointer(app):

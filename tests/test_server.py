@@ -515,6 +515,106 @@ def test_pin_rejects_abbreviated_sha(client):
     assert "40-character" in str(r.json()["detail"])
 
 
+def test_pin_rules_version_replays_targeting(client):
+    # §9: pin.rules_version alone replays the TARGETING state of that moment.
+    # u_12 resolves through the team-x-tip rule; capture that response, archive the
+    # rule (resolution changes), then replay the old rules_version — the old
+    # resolution comes back, and the response reports the replayed version.
+    body = {"flags": {"user_id": "u_12"},
+            "variables": {"customer_name": "Acme", "history": []}}
+    b1 = client.post("/prompt/support/system", json=body,
+                     headers=auth(client.renderer_key)).json()
+    old_rv = b1["rules_version"]
+    old_commit = b1["versions"]["support/system"]["commit"]
+
+    r = client.patch("/mgmt/envs/prod/rules/team-x-tip", json={"status": "archived"},
+                     headers=auth())
+    assert r.status_code == 200, r.text
+
+    b2 = client.post("/prompt/support/system", json=body,
+                     headers=auth(client.renderer_key)).json()
+    assert b2["versions"]["support/system"]["commit"] != old_commit  # targeting moved
+
+    b3 = client.post("/prompt/support/system",
+                     json={**body, "pin": {"rules_version": old_rv}},
+                     headers=auth(client.renderer_key)).json()
+    assert b3["versions"]["support/system"]["commit"] == old_commit
+    assert b3["rules_version"] == old_rv
+    assert b3["prompt"] == b1["prompt"]
+
+
+def test_pin_rejects_unknown_fields_and_bad_rules_version(client):
+    body = {"variables": {"customer_name": "Acme", "history": []}}
+    # A pin field the server would ignore is a silent lie — 422, not acceptance.
+    r = client.post("/prompt/support/system",
+                    json={**body, "pin": {"versions": {}, "rules_versoin": 3}},
+                    headers=auth(client.renderer_key))
+    assert r.status_code == 422 and "unknown pin field" in str(r.json()["detail"])
+    r = client.post("/prompt/support/system",
+                    json={**body, "pin": {"rules_version": "seven"}},
+                    headers=auth(client.renderer_key))
+    assert r.status_code == 422
+    # A rules_version with no recorded state is answered honestly.
+    r = client.post("/prompt/support/system",
+                    json={**body, "pin": {"rules_version": 999999}},
+                    headers=auth(client.renderer_key))
+    assert r.status_code == 422 and "pin.versions" in str(r.json()["detail"])
+
+
+def test_pin_rejects_unvalidated_sha(client):
+    # §5: only validated SHAs can ever serve — a pin naming a SHA with no valid
+    # CommitValidation row for the prompt is refused, never silently rendered.
+    r = client.post("/prompt/support/system",
+                    json={"variables": {"customer_name": "Acme", "history": []},
+                          "pin": {"versions": {"support/system": {
+                              "version": 2, "commit": "f" * 40}}}},
+                    headers=auth(client.renderer_key))
+    assert r.status_code == 409, r.text
+    assert "not a validated commit" in str(r.json()["detail"])
+
+
+def test_pin_cannot_serve_draft_content(client):
+    # Draft commits live in the same object store as main. A renderer key must not
+    # be able to render UNREVIEWED draft content by pinning the draft's commit SHA —
+    # that would sidestep the entire review gate (§5).
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": "UNREVIEWED {{customer_name}}"},
+                    headers=auth()).json()
+    assert d["draft_sha"], d
+    r = client.post("/prompt/support/system",
+                    json={"variables": {"customer_name": "Acme", "history": []},
+                          "pin": {"versions": {"support/system": {
+                              "version": 2, "commit": d["draft_sha"]}}}},
+                    headers=auth(client.renderer_key))
+    assert r.status_code == 409, r.text
+    assert "UNREVIEWED" not in r.text
+
+
+def test_refinement_drift_is_surfaced(client):
+    # §4's lint: a commit that changes the variable set out from under an existing
+    # refinement warns at commit time, and the variables endpoint flags the orphan.
+    r = client.put("/mgmt/prompts/support/system/variables?version=2",
+                   json={"name": "customer_name", "description": "who we serve"},
+                   headers=auth())
+    assert r.status_code == 200, r.text
+
+    d = client.post("/mgmt/prompts/support/system/drafts",
+                    json={"version_number": 2, "content": "no variables here at all"},
+                    headers=auth()).json()
+    assert client.post(f"/mgmt/drafts/{d['id']}/review", json={"state": "approved"},
+                       headers=auth()).status_code == 200
+    r = client.post(f"/mgmt/drafts/{d['id']}/commit",
+                    json={"message": "drop all variables", "force": True}, headers=auth())
+    assert r.status_code == 200, r.text
+    warnings = r.json()["refinement_warnings"]
+    assert any("customer_name" in w for w in warnings), warnings
+
+    vars_ = client.get("/mgmt/prompts/support/system/variables?version=2",
+                       headers=auth()).json()["variables"]
+    orphan = next(v for v in vars_ if v["name"] == "customer_name")
+    assert orphan.get("orphaned") is True
+
+
 def test_effective_schema_unions_include_closure(client):
     # §2.10/§4: a fragment's required variable must surface in the parent's schema.
     reviewer = make_key(client, "editor", project="support")

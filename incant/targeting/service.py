@@ -10,12 +10,108 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..core.parse import parse_rule as parse_core_rule
 from .audit import record_audit
+
+
+def _version_key(prompt_id: str, version_number: int) -> str:
+    """JSON object keys must be strings — ``(prompt, version)`` flattens to
+    ``"<prompt_id>@v<N>"`` in a revision's captured state."""
+    return f"{prompt_id}@v{version_number}"
+
+
+def capture_state(session: Session, env_id: str) -> dict:
+    """The environment's COMPLETE targeting state, as one JSON-serializable dict —
+    recorded on every revision (``_bump``) so rollback can restore everything and
+    ``pin.rules_version`` can replay it (§7, §9). Content is still only SHAs.
+
+    ``versions`` folds live pointers (newest move), tips (newest validated), labels
+    and status per ``(prompt, version)`` — the same inputs an ``EnvSnapshot``'s
+    ``VersionInfo`` is built from, minus ``previous_live`` (a replay never falls
+    back within a version: degraded replay would be a lie, it 409s instead)."""
+    rules = [
+        _rule_snapshot(r)
+        for r in session.execute(
+            select(models.Rule).where(models.Rule.environment_id == env_id)
+            .order_by(models.Rule.priority, models.Rule.id)
+        ).scalars()
+    ]
+    segments = [
+        {"name": s.name, "clauses": s.clauses, "version": s.version}
+        for s in session.execute(
+            select(models.Segment).where(models.Segment.environment_id == env_id)
+        ).scalars()
+    ]
+    defaults = {
+        d.prompt_id: d.version_number
+        for d in session.execute(
+            select(models.EnvDefault).where(models.EnvDefault.environment_id == env_id)
+        ).scalars()
+    }
+    kills = sorted(
+        k.prompt_id
+        for k in session.execute(
+            select(models.KillSwitch).where(
+                models.KillSwitch.environment_id == env_id,
+                models.KillSwitch.engaged.is_(True),
+            )
+        ).scalars()
+    )
+
+    # Current live pointer per (prompt, version): newest move, one windowed query.
+    rn = func.row_number().over(
+        partition_by=(models.PointerMove.prompt_id, models.PointerMove.version_number),
+        order_by=(models.PointerMove.moved_at.desc(), models.PointerMove.id.desc()),
+    ).label("rn")
+    ranked = (
+        select(models.PointerMove.prompt_id, models.PointerMove.version_number,
+               models.PointerMove.to_sha, rn)
+        .where(models.PointerMove.environment_id == env_id)
+        .subquery()
+    )
+    live = {
+        (pid, ver): sha
+        for pid, ver, sha in session.execute(
+            select(ranked.c.prompt_id, ranked.c.version_number, ranked.c.to_sha)
+            .where(ranked.c.rn == 1)
+        )
+    }
+
+    # Tip per (prompt, version): newest validated commit, one windowed query.
+    vrn = func.row_number().over(
+        partition_by=(models.CommitValidation.prompt_id,
+                      models.CommitValidation.version_number),
+        order_by=(models.CommitValidation.validated_at.desc(),
+                  models.CommitValidation.id.desc()),
+    ).label("rn")
+    vranked = (
+        select(models.CommitValidation.prompt_id, models.CommitValidation.version_number,
+               models.CommitValidation.sha, vrn)
+        .where(models.CommitValidation.status == "valid")
+        .subquery()
+    )
+    tips = {
+        (pid, ver): sha
+        for pid, ver, sha in session.execute(
+            select(vranked.c.prompt_id, vranked.c.version_number, vranked.c.sha)
+            .where(vranked.c.rn == 1)
+        )
+    }
+
+    versions: dict[str, dict] = {}
+    for v in session.execute(select(models.Version)).scalars():
+        key = (v.prompt_id, v.number)
+        versions[_version_key(*key)] = {
+            "live": live.get(key), "tip": tips.get(key),
+            "label": v.label, "status": v.status,
+        }
+
+    return {"rules": rules, "segments": segments, "defaults": defaults,
+            "kills": kills, "versions": versions}
 
 
 class TargetingError(Exception):
@@ -52,6 +148,9 @@ class TargetingService:
         rev = models.RuleRevision(
             environment_id=env.id, rule_id=rule_id, kind=kind,
             snapshot=snapshot, actor=self.actor, comment=comment,
+            # The complete post-change state (mutation already flushed by the
+            # caller) — what total rollback and pin.rules_version replay read.
+            state=capture_state(self.s, env.id),
         )
         self.s.add(rev)
         self.s.flush()
@@ -254,27 +353,24 @@ class TargetingService:
             .order_by(models.RuleRevision.id.desc()).limit(limit)
         ).scalars())
 
-    def rollback(self, env_id: str, to_rules_version: int) -> dict:
-        """Restore the environment's *rule* set to its state as of ``to_rules_version``.
-
-        Reconstructs each rule from the latest rule-kind revision at or before the
-        target version; rules first created after the target are archived (so they
-        stop serving). Segments/defaults/pointers/kills are not rolled back here.
-        The rollback is itself a change and bumps ``rules_version``.
-        """
-        env = self._env(env_id)
-        revs = self.s.execute(
+    def state_at(self, env_id: str, rules_version: int) -> dict | None:
+        """The environment's complete targeting state as of ``rules_version``: the
+        newest state-carrying revision at or before it. ``None`` when the target
+        predates state-tracked revisions (pre-upgrade history)."""
+        rev = self.s.execute(
             select(models.RuleRevision).where(
                 models.RuleRevision.environment_id == env_id,
-                models.RuleRevision.kind == "rule",
-                models.RuleRevision.rules_version <= to_rules_version,
-            ).order_by(models.RuleRevision.rules_version, models.RuleRevision.id)
-        ).scalars().all()
-        target: dict[str, dict] = {}
-        for r in revs:
-            if r.rule_id:
-                target[r.rule_id] = r.snapshot
+                models.RuleRevision.rules_version <= rules_version,
+                models.RuleRevision.state.isnot(None),
+            ).order_by(models.RuleRevision.rules_version.desc(),
+                       models.RuleRevision.id.desc())
+        ).scalars().first()
+        return rev.state if rev is not None else None
 
+    def _rollback_rules(self, env_id: str, target: dict[str, dict]) -> int:
+        """Restore the rule set to ``target`` ({rule_id -> rule snapshot}); rules
+        created after the target are archived (never deleted — ids are immutable
+        and history must keep resolving). Returns rules changed."""
         changed = 0
         existing = {r.id: r for r in self.list_rules(env_id)}
         for rid, rule in existing.items():
@@ -302,14 +398,150 @@ class TargetingService:
                     status=snap.get("status", "active"), comment=snap.get("comment", ""),
                 ))
                 changed += 1
+        return changed
+
+    def rollback(self, env_id: str, to_rules_version: int) -> dict:
+        """Restore the environment's COMPLETE targeting state as of
+        ``to_rules_version`` — rules, segments, defaults, kill switches, and live
+        pointers — from the revision's captured state (§7 "one-click rollback of …
+        the whole environment's targeting state").
+
+        Pointer restoration preserves the append-only model: a pointer whose
+        current live SHA differs from the recorded one gets a NEW move back to it
+        (history intact, §7), and a pointer that did not exist at the target simply
+        keeps its current value — there is no "un-make-live"; it only serves if the
+        restored rules/defaults reference it, which they by construction don't.
+
+        Falls back to the legacy rules-only reconstruction (per-rule revisions) for
+        targets that predate state-carrying revisions; the response says which.
+        The rollback is itself a change and bumps ``rules_version``.
+        """
+        env = self._env(env_id)
+        state = self.state_at(env_id, to_rules_version)
+
+        if state is None:
+            # Legacy fallback: replay per-rule revisions only (pre-upgrade history).
+            revs = self.s.execute(
+                select(models.RuleRevision).where(
+                    models.RuleRevision.environment_id == env_id,
+                    models.RuleRevision.kind == "rule",
+                    models.RuleRevision.rules_version <= to_rules_version,
+                ).order_by(models.RuleRevision.rules_version, models.RuleRevision.id)
+            ).scalars().all()
+            target = {r.rule_id: r.snapshot for r in revs if r.rule_id}
+            changed = {"rules": self._rollback_rules(env_id, target)}
+            scope = "rules"
+        else:
+            changed = {"rules": self._rollback_rules(
+                env_id, {r["id"]: r for r in state.get("rules", [])})}
+
+            # Segments: restore recorded clause sets. Extra segments (created after
+            # the target) are left in place — the restored rules don't reference
+            # them, and deleting a named object an operator may still want is worse.
+            changed["segments"] = 0
+            existing_segments = {s.name: s for s in self.list_segments(env_id)}
+            for snap in state.get("segments", []):
+                seg = existing_segments.get(snap["name"])
+                if seg is None:
+                    self.s.add(models.Segment(
+                        environment_id=env_id, name=snap["name"],
+                        clauses=snap["clauses"], version=snap.get("version", 1)))
+                    changed["segments"] += 1
+                elif seg.clauses != snap["clauses"]:
+                    seg.clauses = snap["clauses"]
+                    seg.version += 1
+                    changed["segments"] += 1
+
+            # Defaults: exactly the recorded map — updates, inserts, AND removals
+            # (a default added after the target is part of what's being undone).
+            changed["defaults"] = 0
+            recorded = state.get("defaults", {})
+            existing_defaults = {
+                d.prompt_id: d for d in self.s.execute(
+                    select(models.EnvDefault).where(
+                        models.EnvDefault.environment_id == env_id)
+                ).scalars()
+            }
+            for pid, ver in recorded.items():
+                d = existing_defaults.get(pid)
+                if d is None:
+                    self.s.add(models.EnvDefault(
+                        environment_id=env_id, prompt_id=pid, version_number=ver))
+                    changed["defaults"] += 1
+                elif d.version_number != ver:
+                    d.version_number = ver
+                    changed["defaults"] += 1
+            for pid, d in existing_defaults.items():
+                if pid not in recorded:
+                    self.s.delete(d)
+                    changed["defaults"] += 1
+
+            # Kill switches: engaged set exactly as recorded.
+            changed["kills"] = 0
+            recorded_kills = set(state.get("kills", []))
+            existing_kills = {
+                k.prompt_id: k for k in self.s.execute(
+                    select(models.KillSwitch).where(
+                        models.KillSwitch.environment_id == env_id)
+                ).scalars()
+            }
+            for pid in recorded_kills - {p for p, k in existing_kills.items() if k.engaged}:
+                k = existing_kills.get(pid)
+                if k is None:
+                    self.s.add(models.KillSwitch(
+                        environment_id=env_id, prompt_id=pid, engaged=True,
+                        by=self.actor))
+                else:
+                    k.engaged = True
+                    k.by = self.actor
+                changed["kills"] += 1
+            for pid, k in existing_kills.items():
+                if k.engaged and pid not in recorded_kills:
+                    k.engaged = False
+                    k.by = self.actor
+                    changed["kills"] += 1
+
+            # Live pointers: append a move back to the recorded SHA wherever the
+            # current live differs (append-only history preserved). Skip — and
+            # count — anything no longer validated (CommitValidation rows are never
+            # deleted, so this is belt-and-braces, not an expected path).
+            changed["pointers"] = 0
+            skipped_pointers = 0
+            for key, vinfo in state.get("versions", {}).items():
+                recorded_sha = vinfo.get("live")
+                if not recorded_sha:
+                    continue
+                pid, _, vpart = key.rpartition("@v")
+                version_number = int(vpart)
+                if self.current_live(env_id, pid, version_number) == recorded_sha:
+                    continue
+                if not self._is_validated_for(pid, version_number, recorded_sha):
+                    skipped_pointers += 1
+                    continue
+                from_sha = self.current_live(env_id, pid, version_number)
+                self.s.add(models.PointerMove(
+                    environment_id=env_id, prompt_id=pid,
+                    version_number=version_number, from_sha=from_sha,
+                    to_sha=recorded_sha, moved_by=self.actor,
+                    comment=f"rollback to rules_version {to_rules_version}",
+                ))
+                changed["pointers"] += 1
+            if skipped_pointers:
+                changed["pointers_skipped"] = skipped_pointers
+            scope = "full"
+
         self.s.flush()
         rv = self._bump(env, "rollback",
-                        {"to_rules_version": to_rules_version, "rules_changed": changed},
+                        {"to_rules_version": to_rules_version, "scope": scope,
+                         "changed": changed},
                         comment=f"rollback to rules_version {to_rules_version}")
         record_audit(self.s, self.actor, "targeting.rollback", "environment", env_id,
-                     after={"to_rules_version": to_rules_version, "rules_changed": changed})
-        return {"to_rules_version": to_rules_version, "rules_changed": changed,
-                "rules_version": rv}
+                     after={"to_rules_version": to_rules_version, "scope": scope,
+                            "changed": changed})
+        return {"to_rules_version": to_rules_version, "scope": scope,
+                "changed": changed, "rules_version": rv,
+                # Back-compat for existing clients/UI: the rules count keeps its key.
+                "rules_changed": changed.get("rules", 0)}
 
     # ── defaults ─────────────────────────────────────────────────────
 

@@ -280,11 +280,30 @@ status.
   volume. Single `main` branch; drafts live at `refs/incant/drafts/<id>`; commits are
   authored as the acting user, committed by Incant, with structured trailers
   (`Incant-Prompt`, `Incant-Version`, `Incant-Draft`) for machine-readable history.
-- **Backup pushes are asynchronous and queued** (queue state in the DB): every commit
-  propagates to all configured remotes; remote down → queue grows, alerts fire
-  (`incant_backup_lag_seconds`), nothing else happens.
+- **Publishes are staged, then promoted.** `main` only ever holds commits the control
+  plane fully describes: a publish stages its commit on
+  `refs/incant/pending/<draft>`, lands the DB rows (validation record, version row,
+  draft flip) in one transaction, and only then promotes `main` — a pure CAS ref move
+  to the already-recorded SHA. A failed transaction leaves `main` untouched (the
+  pending ref is discarded; the draft stays open and editable); a crash between the
+  two phases leaves a pending ref that boot/interval recovery promotes or discards by
+  consulting the DB. The reconcile sweep remains as an invariant check, not a drift
+  janitor.
+- **Backup pushes are asynchronous and queued**: the queue is the commit range
+  between a remote's recorded `last_pushed_sha` (DB) and `main`; a background pass
+  (`INCANT_BACKUP_POLL_SECONDS`) force-pushes the full ref set (`--mirror`, drafts
+  included) to every enabled remote that is behind. Remote down → queue grows, alerts
+  fire (`incant_backup_lag_seconds`, `incant_backup_queue_depth`), nothing else
+  happens. Remotes are managed at `/mgmt/remotes` (admin; URLs with embedded
+  credentials are redacted in every response), each with an optional `auth_ref`
+  pointing at a push-only deploy key; `POST /mgmt/remotes/{id}/push` pushes one now.
 - Remotes are write-only from Incant's perspective. Pushes to them by anything else are
   ignored — Incant force-pushes its own lineage on conflict.
+- **Remotes double as the content-distribution channel**: `serve` replicas hydrate
+  (mirror-clone on first boot against an empty volume) and follow (periodic
+  mirror-fetch, `INCANT_CONTENT_FETCH_SECONDS`) an enabled remote, so every SHA a
+  targeting change references becomes fetchable on every replica within one fetch
+  interval — rules propagate through the DB poll, content through this.
 - **Restore**: content = clone from any remote (it's the real repo — full history, no
   reconstruction step); control plane = Postgres backup. Losing only the DB never loses
   content; the version registry rebuilds from the tree + trailers, targeting/RBAC/audit
@@ -376,11 +395,17 @@ work even during a DB outage.
 
 ### Lifecycle, audit, propagation
 
-Every targeting mutation (rules, segments, pointers, defaults) snapshots to
-`rule_revisions` (actor, at, comment) and bumps the environment's monotonic
-**`rules_version`** — full history, one-click rollback of a rule or the whole
-environment's targeting state. Nodes hold rule snapshots in memory; Postgres
-`LISTEN/NOTIFY` (2s poll fallback) propagates bumps. Target: any targeting change —
+Every targeting mutation (rules, segments, pointers, defaults, kills) writes a
+`rule_revisions` row (actor, at, comment) carrying BOTH the changed object and the
+environment's **complete post-change targeting state** (rules, segments, defaults,
+kills, live pointers, tips, labels — SHAs only, never content), and bumps the
+environment's monotonic **`rules_version`**. That full-state capture is what makes
+rollback *total* — restoring rules, segments, defaults, kills, and pointers
+(pointer restoration appends new moves; the history stays append-only) — and what
+makes §9's `pin.rules_version` replay possible. Rollback to a pre-upgrade revision
+(no recorded state) degrades to rules-only reconstruction and says so. Nodes hold
+rule snapshots in memory; a 2s control-plane poll propagates bumps (see
+Divergences: LISTEN/NOTIFY is deliberately unbuilt). Target: any targeting change —
 including "make live" — serves everywhere in **< 2 s**.
 
 ---
@@ -446,10 +471,28 @@ POST /prompt/{prompt_id}
 
 The `versions` map + `rules_version` is the reproducibility tuple — log it beside LLM
 calls; feed it back as `pin` to replay exactly. It is SHA-exact, so later tweaks to v2
-never blur an old trace. Humans read `v2`; machines pin `8c1f2ab`. On the rare §10
-fallback, the map reports the SHA *actually served* with `"fallback": true` on that
-entry (plus the top-level flag and an `X-Incant-Content-Fallback` header) — the
-reproducibility contract holds even in degraded states.
+never blur an old trace. Humans read `v2`; machines pin `8c1f2ab` (full 40-char SHAs
+only — abbreviations are refused). On the rare §10 fallback, the map reports the SHA
+*actually served* with `"fallback": true` on that entry (plus the top-level flag and
+an `X-Incant-Content-Fallback` header) — the reproducibility contract holds even in
+degraded states.
+
+Pin semantics, precisely:
+
+- **Pins obey §5.** A pinned SHA must be a validated commit for its prompt — a pin
+  can never resolve a validation-failed commit or a draft-ref commit (409). Review
+  and validation gate pins exactly as they gate pointers and rules.
+- **`pin.versions` replays content**: each listed prompt resolves to exactly that
+  (version, SHA), bypassing targeting. SHA-exact, always faithful.
+- **`pin.rules_version` replays targeting**: evaluation runs against the complete
+  targeting state recorded by that revision (§7). It must name an exact recorded
+  revision, or the request is refused (422) with the `pin.versions` alternative.
+  One documented bound: a rule serving `v2@tip` replays at the tip *as recorded by
+  that targeting change* — tips move on commits without bumping `rules_version`, so
+  content-exact replay of tip-rules is what `pin.versions` is for. Replays never
+  take the §10 fallback (a degraded replay would be a lie — they 409 instead).
+- Unknown pin fields are refused (422), never silently ignored.
+- Both together are allowed: `versions` entries win per prompt.
 
 Errors: `401/403` bad or under-scoped credential · `404` unknown prompt/environment ·
 `409` resolved content unservable (compound cache+DB failure — §10) · `422`
@@ -484,8 +527,9 @@ for the control plane and sits on the refresh/write paths only, never per-reques
 | Rule resolves to something unservable | Skipped, evaluation continues; counted + surfaced. |
 | Version's current live SHA unservable (cache lost + store unreachable — compound failure) | **Within-version fallback**: serve the most recent *previous live* SHA of the same version that is still servable. Loud: `content_fallback` in the response, header, error-level logs, `incant_content_fallbacks_total` alerts. Never a different version. |
 | Nothing in the version's pointer history is servable | `409` for that request — never substitute another version. |
-| Repo volume lost | Restore by cloning a remote (full history, no reconstruction). Between backup pushes, the queue metric bounds the exposure window. |
-| Node restart | Caches/spills reload; re-warm before `readyz` goes green. |
+| Publish interrupted (crash/rollback between git and DB) | Staged publish (§6): a rolled-back transaction leaves `main` untouched and the draft editable — no residue. A crash between DB commit and promotion leaves a pending ref that recovery promotes (or rebases, with the same validation verdict) at boot and on the reconcile interval. |
+| Repo volume lost | Restore by cloning a remote (full history, no reconstruction). Between backup pushes, the queue metric bounds the exposure window. Serve replicas hydrate themselves from a remote the same way (§6). |
+| Node restart | Caches/spills reload; re-warm before `readyz` goes green. Readiness is gated on the **default environment** (plus the auth cache): a broken scratch environment must not hold new capacity out of rotation for a healthy prod — it is retried in the background, answered per-request by this table meanwhile, and named in `/healthz` (`degraded_environments`). |
 | Missing required variable / render error | `422` — caller-input problem, never a fallback trigger. |
 
 Availability posture: **rules freeze** (last-known-good targeting keeps evaluating
@@ -667,15 +711,24 @@ audit_log(actor, action, object_type, object_id, before, after, at)
 ## 14. Observability
 
 - Latency: `incant_render_seconds` histogram (p99 SLO alert),
-  `incant_template_cache_misses_total` (~0 expected).
-- Targeting: `incant_renders_total{prompt,version,environment,stale_rules}` ·
-  `incant_rules_snapshot_age_seconds{environment}` · `incant_rule_skips_total` ·
-  `incant_flag_eval_fallthrough_total` (dead rules) ·
-  `incant_content_fallbacks_total{prompt,version,environment}` (page on nonzero) ·
-  pointer history is queryable state (§7), not just audit entries.
+  `incant_template_cache_misses_total` (~0 expected on a warm node),
+  `incant_content_git_reads_total` (serving fell through to a git read; ~0 warm).
+- Targeting: `incant_renders_total{prompt,environment,stale_rules}` ·
+  `incant_rules_snapshot_age_seconds{environment}` (seconds since the poll last
+  confirmed freshness — rises through a DB outage) · `incant_rule_skips_total`
+  (matched-but-unservable rules; the rules console also flags them statically) ·
+  `incant_flag_eval_fallthrough_total` (dead rules: renders that fell through every
+  in-play rule to the default) · `incant_content_fallbacks_total{prompt,environment}`
+  (page on nonzero) · pointer history is queryable state (§7), not just audit
+  entries. Version identity rides in the render logs' version tuple, not in label
+  cardinality.
 - Authoring: `incant_commits_total{project}` · `incant_validation_failures_total`.
-- Backup: `incant_backup_lag_seconds{remote}` · `incant_backup_queue_depth` — bounds
-  the content-durability exposure window.
+- Governance drift: `incant_reconcile_git_orphans` · `incant_reconcile_unvalidated_tips`
+  · `incant_reconcile_missing_files` (latest sweep counts; page on nonzero — a
+  drifted node still serves correctly and is never pulled from rotation).
+- Backup: `incant_backup_lag_seconds{remote}` (remote id, not URL — URLs may embed
+  credentials) · `incant_backup_queue_depth` — bounds the content-durability
+  exposure window.
 - Render-path structured logs carry the full version tuple, joinable to LLM traffic.
 
 ---
@@ -732,9 +785,13 @@ volumes:
 - **Two durable things**: the `content` volume (canonical repo; off-site copy =
   backup pushes to remotes) and `pgdata` (control plane; normal Postgres backups). The
   `cache` volume is fully rebuildable.
-- `INCANT_MODE=serve` replicas scale horizontally (read-only DB role, no mgmt surface,
-  content cache hydrated from the full node or a remote); one `full` instance owns the
-  repo, commits, and backup pushing.
+- `INCANT_MODE=serve` replicas scale horizontally (read-only DB role, no mgmt
+  surface). A replica's repo copy hydrates automatically — a mirror clone from an
+  enabled backup remote on first boot — and follows by periodic mirror-fetch
+  (`INCANT_CONTENT_FETCH_SECONDS`; §6), so fresh targeting always finds its content;
+  a shared volume works too (set the interval to 0). One `full` instance owns the
+  canonical repo, commits, and backup pushing. Run one worker process per container:
+  the snapshot/auth caches and the failed-auth throttle are per-process.
 - Kubernetes: StatefulSet (or Deployment + PVC) for the full node, Deployment for serve
   replicas, Secret mounts, managed Postgres; `readyz` as the readiness probe.
 
@@ -757,3 +814,37 @@ volumes:
 6. **Later** — SDK clients (Python/TS) with client-side caching and stale-on-fail,
    releases (named bundles of prompt versions promoted together), experiment analytics,
    scheduled ramps, eval hooks.
+
+---
+
+## 17. Deliberate divergences (v1 implementation)
+
+This document is the source of truth for intent; where the implementation
+deliberately departs from a section above, the departure is recorded HERE — not
+scattered through code comments — so a reader knows which promises are live.
+
+- **No propose→approve ceremony (§7, §11).** Pointer-class changes are unilateral:
+  gated to `releaser`, audited, and — in protected environments — behind
+  LaunchDarkly-style type-to-confirm. The `approvals` table and two-person flow are
+  not built; the `releaser` role is the control. Rationale: a pointer can only ever
+  reference validated, reviewed content, so the second person's review already
+  happened at commit time; a second ceremony added friction without adding safety.
+  Draft review (N approvals, self-review configurable per project) IS enforced.
+- **No Postgres LISTEN/NOTIFY (§7, §13).** Propagation is the 2-second poll alone
+  (`INCANT_CONTROL_POLL_SECONDS`), which already meets the <2s target and works
+  identically on SQLite. NOTIFY remains an optimization to layer in when poll load
+  matters.
+- **No OIDC/SSO (§11).** Principals are API keys plus browser sessions minted from a
+  key (`POST /auth/session`, HttpOnly + CSRF). OIDC would mint the same server-side
+  sessions and is additive.
+- **Metric label trims (§14).** `incant_renders_total` and
+  `incant_content_fallbacks_total` omit the `version` label — version identity lives
+  in the render logs' version tuple; labels stay low-cardinality.
+- **Rollback and pointers (§7).** Rollback restores live pointers by APPENDING moves
+  (history is never rewritten), and a pointer created after the rollback target
+  simply keeps its current value — there is no "un-make-live". It only serves if the
+  restored rules/defaults reference it, which they by construction don't.
+- **Validation renders against the default environment (§5).** A commit's
+  test-context render resolves includes through the default env's targeting; other
+  environments' include resolution can differ. The §7 write-time integrity checks
+  and eval-time skip backstop cover the gap.

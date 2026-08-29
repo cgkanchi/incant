@@ -63,6 +63,7 @@ async function screenRules() {
         <span class="ord-n">${ordinal(i + 1)}</span>
         <span class="ord-title">${esc(r.comment || r.id)}</span>
         ${scopeChip}${isTip ? pill("warn", "testing") : ""}
+        ${r.unservable_reason ? `<span class="pill warn" title="${esc(r.unservable_reason)}">⚠ can't serve — ${esc(r.unservable_reason)}</span>` : ""}
         <div class="grow"></div>${statusCol}</div>
       <div class="ord-body">${ruleServeLine(r)}</div>
       ${canTarget ? `<div class="ord-actions">${up}${down}

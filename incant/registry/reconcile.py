@@ -120,6 +120,102 @@ def sweep_expired_sessions(session: Session) -> int:
     return deleted
 
 
+# ── pending-promotion recovery (staged publishes interrupted by a crash) ─────
+
+@dataclass
+class PendingRecoveryResult:
+    promoted: int      # DB committed, main was at the staged parent → fast-forwarded
+    rebased: int       # DB committed, main diverged → re-committed atop current main
+    discarded: int     # DB never committed → staging residue deleted, draft intact
+
+    def summary(self) -> str:
+        return (f"pending recovery: promoted {self.promoted}, rebased {self.rebased}, "
+                f"discarded {self.discarded} staged publish(es)")
+
+
+def recover_pending_promotions(session: Session, git: GitStore) -> PendingRecoveryResult:
+    """Converge staged publishes that a crash stranded between their two phases.
+
+    ``commit_draft`` stages each publish on ``refs/incant/pending/<draft>`` and
+    promotes it to main only after the control-plane transaction commits. A crash in
+    between leaves the pending ref; the DB is the arbiter of which side of the line
+    the publish died on:
+
+    * a ``CommitValidation`` row exists for the staged SHA → the transaction
+      COMMITTED, so the promotion is owed: fast-forward main if it is still at the
+      staged parent (or already contains the SHA — a double-run), else re-commit the
+      same content atop the current main (recording a fresh validation row for the
+      new SHA, same verdict — validation is a pure function of the content);
+    * no row → the transaction never committed: the staging residue is deleted, and
+      the draft ref + still-open row remain the recoverable source of truth.
+
+    Runs at boot and on the reconcile interval, under the publish lock so it never
+    races a live publish. Caller owns the transaction."""
+    promoted = rebased = discarded = 0
+    with git.publish_lock:
+        for draft_id, sha in git.list_pending_refs():
+            cv = session.execute(
+                select(models.CommitValidation).where(models.CommitValidation.sha == sha)
+            ).scalars().first()
+            if cv is None:
+                git.delete_pending(draft_id)
+                discarded += 1
+                log.warning(
+                    "pending recovery: discarded staged publish %s for draft %s — its "
+                    "control-plane transaction never committed; the draft is intact.",
+                    sha, draft_id,
+                )
+                continue
+
+            if git.is_ancestor(sha):
+                git.delete_pending(draft_id)
+                git.delete_draft(draft_id)
+                continue  # promotion already happened (crash after CAS, before cleanup)
+
+            parent = git.commit_parent(sha)
+            if parent is not None and git.head() == parent:
+                git.promote_pending(sha, parent)
+                git.delete_pending(draft_id)
+                git.delete_draft(draft_id)
+                promoted += 1
+                log.warning(
+                    "pending recovery: promoted staged publish %s for draft %s "
+                    "(crash between DB commit and ref promotion).", sha, draft_id,
+                )
+            else:
+                # Main diverged while the publish was stranded: replay the same
+                # content as a fresh commit and record its (identical) verdict.
+                content = git.read(cv.path, ref=sha)
+                if content is None:  # pragma: no cover - staged object vanished
+                    log.error("pending recovery: staged content for %s unreadable; "
+                              "leaving the ref for a human", draft_id)
+                    continue
+                new_sha = git.commit_version(
+                    cv.prompt_id, cv.version_number, content,
+                    author_name="Incant recovery", author_email="incant@localhost",
+                    message=f"recovered publish (draft {draft_id})", draft_id=draft_id,
+                )
+                session.add(models.CommitValidation(
+                    sha=new_sha, blob_sha=cv.blob_sha, path=cv.path,
+                    prompt_id=cv.prompt_id, version_number=cv.version_number,
+                    status=cv.status, error=cv.error,
+                    extracted_variables=cv.extracted_variables,
+                ))
+                git.delete_pending(draft_id)
+                git.delete_draft(draft_id)
+                rebased += 1
+                log.warning(
+                    "pending recovery: main diverged from staged publish %s for draft "
+                    "%s — re-committed as %s with the same validation verdict.",
+                    sha, draft_id, new_sha,
+                )
+
+    result = PendingRecoveryResult(promoted=promoted, rebased=rebased, discarded=discarded)
+    if promoted or rebased or discarded:
+        log.info(result.summary())
+    return result
+
+
 # ── main-commit orphan detection (detect-and-log, never auto-repair) ─────────
 
 @dataclass

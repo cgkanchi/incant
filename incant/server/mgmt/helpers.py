@@ -251,6 +251,17 @@ def _effective_variables(app, session, prompt_id, version) -> list[dict]:
             "description": (r.description if r else "") or "",
             "overridden": bool(r and r.required is not None and r.required != (name in required)),
         })
+    # §4's drift lint: a refinement whose variable no longer exists in the template
+    # closure (a commit changed the variable set out from under it). Surfaced —
+    # never silently dropped — so the author deletes or re-points it deliberately.
+    for name in sorted(set(refinements) - names):
+        r = refinements[name]
+        out.append({
+            "name": name, "required": False, "inferred_required": False,
+            "type": r.type or "string", "default": r.default,
+            "description": r.description or "", "overridden": False,
+            "orphaned": True,
+        })
     return out
 
 

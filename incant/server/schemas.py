@@ -173,6 +173,28 @@ class KillRequest(BaseModel):
 
 # ── admin ────────────────────────────────────────────────────────────
 
+class RemoteRequest(BaseModel):
+    # A backup remote (§6): any URL `git push` understands. `auth_ref` is a path to a
+    # push-only ssh deploy key (mounted into the container); https URLs may embed a
+    # token instead (redacted in every response/log).
+    url: str
+    auth_ref: Optional[str] = None
+    enabled: bool = True
+
+    @field_validator("url")
+    @classmethod
+    def _nonempty_url(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("remote url must not be empty")
+        return v.strip()
+
+
+class RemotePatchRequest(BaseModel):
+    # Partial update; unset fields untouched.
+    url: Optional[str] = None
+    auth_ref: Optional[str] = None
+    enabled: Optional[bool] = None
+
 class ProjectRequest(BaseModel):
     id: str
     review_policy: int = 0

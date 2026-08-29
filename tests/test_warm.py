@@ -119,16 +119,36 @@ def test_warm_succeeds_when_live_is_fetchable(app):
     assert ("support/system", 1, "sha_live") in app.content.warmed
 
 
-def test_warm_all_reports_not_ready_then_ready(app):
-    # _warm_all turns a WarmError into "not ready"; the retry loop keeps calling it.
+def test_warm_all_reports_per_environment(app):
+    # _warm_all reports each environment's warm result; the retry loop keeps calling it.
     with session_scope() as s:
         _version(s)
         _pointer(s, "sha_prev", _T0)
         _pointer(s, "sha_live", _T1)
     app.content = FakeContent(servable=set())
-    assert _warm_all(app) is False                       # nothing servable → not ready
+    assert _warm_all(app) == {"prod": False}             # nothing servable
     app.content = FakeContent(servable={"sha_live", "sha_prev"})
-    assert _warm_all(app) is True                        # content available → ready
+    assert _warm_all(app) == {"prod": True}              # content available
+
+
+def test_broken_scratch_env_does_not_block_readiness(app):
+    # Per-environment readiness: a scratch env whose live pointer has NO servable
+    # content must not hold the node out of rotation for a healthy default env.
+    from incant.server.app import _boot_prime
+    with session_scope() as s:
+        _version(s)
+        _pointer(s, "sha_live", _T0)                     # prod: healthy
+        s.add(models.Environment(id="scratch", name="scratch"))
+        _pointer(s, "sha_gone", _T0, env="scratch")      # scratch: unservable live
+    app.content = FakeContent(servable={"sha_live"})
+    ready, env_warm = _boot_prime(app)
+    assert ready is True                                 # default env warm → green
+    assert env_warm == {"prod": True, "scratch": False}  # degradation is NAMED
+
+    # The default env failing is what flips readiness.
+    app.content = FakeContent(servable=set())
+    ready, env_warm = _boot_prime(app)
+    assert ready is False and env_warm["prod"] is False
 
 
 class BoomSession:
