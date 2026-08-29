@@ -11,12 +11,13 @@ from sqlalchemy.orm import Session
 from ... import models
 from ...registry import RegistryError
 from ...targeting import build_snapshot
-from ..auth import ANY_ENVIRONMENT, Identity
+from ..auth import ANY_ENVIRONMENT, _IMPLIES, Identity
 from ..deps import app_context, get_session, identity
 from ...service import AppContext, ServingError
 from ..schemas import (
     CreatePromptRequest,
     RefinementRequest,
+    RenderRequest,
     TestContextRequest,
 )
 from .helpers import (
@@ -65,6 +66,12 @@ def overview(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
+    # The body below filters projects by viewer scope, but a principal holding NO
+    # viewer-implying binding anywhere (e.g. a renderer-only service key) must get a
+    # clear 403, not an empty library that reads as "no prompts exist".
+    if not any("viewer" in _IMPLIES.get(b.role, set()) for b in ident.bindings):
+        raise HTTPException(403, "the library requires a viewer credential; this key "
+                                 "only holds renderer access")
     snap = build_snapshot(session, environment)
     # Bulk-load everything the per-prompt loop needs BEFORE the loop, so the landing
     # screen stays flat as the library grows. It used to fan out — per prompt — into a
@@ -203,6 +210,32 @@ def create_prompt(
     except RegistryError as exc:
         raise HTTPException(409, str(exc))
     return {"prompt_id": p.id, "project_id": p.project_id}
+
+
+@router.post("/prompts/{prompt_id:path}/preview")
+def preview_prompt(
+    prompt_id: str, req: RenderRequest,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    """Render a prompt through the REAL serving resolution, for the UI's Playground
+    and 'Check who gets what'. The serving API itself is bearer-only (sessions are
+    control-plane credentials, §11), so browser sessions preview through this
+    mgmt door instead: same resolver, same response shape, viewer-gated. Pins are
+    honoured (the Playground's 'reproduce this exact result')."""
+    from ..serving import _parse_pin  # same validation as the serving door
+
+    env = req.environment or app.settings.default_environment
+    _require(ident, "viewer", project=_project_of(prompt_id), environment=env)
+    pin, pin_rules_version = _parse_pin(req.pin)
+    try:
+        resp = app.serve(session, env, prompt_id, req.flags, req.variables,
+                         pin=pin, pin_rules_version=pin_rules_version)
+    except ServingError as exc:
+        raise HTTPException(status_code=exc.status, detail={"detail": exc.detail, **exc.extra})
+    resp.pop("_rules_considered", None)  # serving-route internal (metrics only)
+    return resp
 
 
 @router.get("/prompts/{prompt_id:path}/variables")

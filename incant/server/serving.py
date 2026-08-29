@@ -82,13 +82,15 @@ def _parse_pin(pin: dict | None) -> tuple[dict | None, int | None]:
     return out or None, rules_version
 
 
-@router.post("/prompt/{prompt_id:path}/evaluate")
+@router.post("/prompt/{prompt_id:path}/evaluate", summary="Resolve without rendering")
 def evaluate_prompt(
     prompt_id: str, req: EvaluateRequest,
     app: AppContext = Depends(app_context),
     session: Session = Depends(get_readonly_session),
     ident: Identity = Depends(serving_identity),
 ):
+    """Which version (at which commit) these flags would get — no variables needed,
+    nothing rendered. Requires `renderer` on the prompt's (project, environment)."""
     env = _env(app, req.environment)
     _require_render(ident, prompt_id, env)
     try:
@@ -104,13 +106,20 @@ def evaluate_prompt(
     }
 
 
-@router.post("/prompt/{prompt_id:path}")
+@router.post("/prompt/{prompt_id:path}", summary="Render a prompt")
 def render_prompt(
     prompt_id: str, req: RenderRequest, response: Response,
     app: AppContext = Depends(app_context),
     session: Session = Depends(get_readonly_session),
     ident: Identity = Depends(serving_identity),
 ):
+    """Resolve this prompt through targeting for the given `flags`, render it with
+    `variables`, and report exactly what was served: the version AND commit SHA of
+    the prompt and every included fragment (`versions`), plus `rules_version`. Log
+    that tuple beside your LLM call; feed it back as `pin` to reproduce the render
+    exactly. Requires `renderer` on the prompt's (project, environment). Errors:
+    422 names the missing variable; 404 explains whether the prompt is unknown or
+    simply not yet targeted in this environment."""
     env = _env(app, req.environment)
     _require_render(ident, prompt_id, env)
     pin, pin_rules_version = _parse_pin(req.pin)
@@ -135,13 +144,16 @@ def render_prompt(
     return resp
 
 
-@router.post("/evaluate")
+@router.post("/evaluate", summary="Resolve every prompt for one user")
 def evaluate_all(
     req: EvaluateRequest,
     app: AppContext = Depends(app_context),
     session: Session = Depends(get_readonly_session),
     ident: Identity = Depends(serving_identity),
 ):
+    """One call answering "what does this experiment change?": the resolved version
+    and commit for EVERY prompt in the environment under these flags, filtered to
+    the prompts your credential can render."""
     env = _env(app, req.environment)
     try:
         results = app.evaluate_all(session, env, req.flags)
@@ -159,7 +171,7 @@ def evaluate_all(
     return {"environment": env, "resolutions": out}
 
 
-@router.get("/prompts")
+@router.get("/prompts", summary="List renderable prompts")
 def list_prompts(
     environment: str | None = None,
     app: AppContext = Depends(app_context),

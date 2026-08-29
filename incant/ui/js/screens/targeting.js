@@ -118,7 +118,7 @@ async function screenRules() {
     <div class="card" style="overflow-x:auto"><table class="grid">
       <thead class="ghead"><tr><th>Version</th><th>Change</th><th>Who</th><th>Comment</th><th>When</th><th></th></tr></thead>
       <tbody>${revRows}</tbody></table></div>
-    <div style="font-size:11px;color:var(--faint);margin-top:12px">Going back restores the rules to an earlier point — rules created afterward stop serving. It's itself a change, so history is never rewritten.</div></div>`;
+    <div style="font-size:11px;color:var(--faint);margin-top:12px">Going back restores the whole targeting state — rules, defaults, kill switches, and what's live — to an earlier point; changes made afterward stop applying. It's itself a change, so history is never rewritten.</div></div>`;
 }
 
 // The reframed kill switch. Turning targeting OFF is destructive (falls everyone

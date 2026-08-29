@@ -378,12 +378,27 @@ class AppContext:
 
     # ── serving ──────────────────────────────────────────────────────
 
+    def _unresolved_error(self, snap: EnvSnapshot, env_id: str, prompt_id: str) -> ServingError:
+        """The honest 404 for an unresolvable prompt. 'Unknown prompt' is only true
+        when the prompt genuinely doesn't exist; a prompt that EXISTS but has no
+        default/rules in this environment is the normal commits-change-nothing state
+        right after publishing, and saying 'unknown' at that exact moment convinces
+        an integrating dev their commit failed. Name the real situation and the fix."""
+        if prompt_id in snap.versions:
+            return ServingError(
+                404,
+                f"prompt {prompt_id!r} exists but serves nothing in {env_id!r}: no rule "
+                "targets it and it has no environment default. Set a default (POST "
+                f"/mgmt/envs/{env_id}/defaults) or add a rule to start serving it.",
+            )
+        return ServingError(404, f"unknown prompt {prompt_id!r} in {env_id!r}")
+
     def evaluate(self, session: Session, env_id: str, prompt_id: str, flags: dict) -> Resolution:
         snap = self.get_snapshot(session, env_id)
         try:
             return resolve(snap, prompt_id, flags)
         except UnresolvedPrompt:
-            raise ServingError(404, f"no resolution for {prompt_id!r} in {env_id!r}")
+            raise self._unresolved_error(snap, env_id, prompt_id)
         except Unservable:
             raise ServingError(409, f"resolved content for {prompt_id!r} is unservable")
 
@@ -450,7 +465,7 @@ class AppContext:
             try:
                 root_version = resolve(snap, prompt_id, flags).version
             except UnresolvedPrompt:
-                raise ServingError(404, f"unknown prompt {prompt_id!r} in {env_id!r}")
+                raise self._unresolved_error(snap, env_id, prompt_id)
             except Unservable:
                 raise ServingError(409, f"resolved content for {prompt_id!r} is unservable")
 

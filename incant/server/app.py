@@ -19,6 +19,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -326,8 +328,34 @@ def _has_viewer_anywhere(ident) -> bool:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="Incant", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title="Incant",
+        version="0.1.0",
+        lifespan=lifespan,
+        description=(
+            "Prompt management: git for content, flag-based targeting for who sees "
+            "what. Serving endpoints (`/prompt/*`, `/evaluate`) take a bearer API key "
+            "with `renderer` scope; `/mgmt/*` is the authoring/targeting/admin "
+            "surface. Every render reports the resolved version and commit SHA of "
+            "the prompt and every included fragment — feed the `versions` map back "
+            "as `pin` to reproduce a render exactly."
+        ),
+    )
     app.state.ready = False
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_hint(request: Request, exc: RequestValidationError):
+        # FastAPI's default 422 for an unparseable body is famously cryptic when the
+        # real problem is a missing Content-Type: curl defaults to form encoding, the
+        # body never parses, and the error blames "input". Say the actual fix.
+        body = {"detail": jsonable_encoder(exc.errors())}
+        ct = request.headers.get("content-type", "")
+        if request.method in ("POST", "PUT", "PATCH") and "application/json" not in ct:
+            body["hint"] = (
+                f"request Content-Type is {ct or 'not set'!r} — this endpoint expects a "
+                "JSON body; send the header 'Content-Type: application/json'"
+            )
+        return JSONResponse(status_code=422, content=body)
 
     @app.middleware("http")
     async def _security_headers(request: Request, call_next):

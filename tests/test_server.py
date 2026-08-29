@@ -1370,6 +1370,77 @@ def test_rotate_unknown_key_404(client):
     assert client.post("/mgmt/keys/999999/rotate", headers=auth()).status_code == 404
 
 
+# ── mgmt preview (the UI's Playground / "Check who gets what" door) ──
+
+def test_preview_renders_via_cookie_session(client):
+    # THE regression this guards: the serving API is bearer-only, so the signed-in
+    # UI (HttpOnly cookie, no key in JS) must be able to preview through /mgmt.
+    body = login(client)
+    csrf = {"X-Incant-CSRF": body["csrf"]}
+    r = client.post("/mgmt/prompts/support/system/preview",
+                    json={"flags": {"user_id": "u_12"},
+                          "variables": {"customer_name": "Acme", "history": []},
+                          "environment": "prod"},
+                    headers=csrf)
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert "Acme" in b["prompt"] and b["matched_rule"] and b["versions"]
+    assert "_rules_considered" not in b            # serving-route internal, stripped
+    # Cookie mutations without the CSRF echo stay refused.
+    assert client.post("/mgmt/prompts/support/system/preview",
+                       json={"variables": {}}).status_code == 403
+
+
+def test_preview_honours_pins_and_scope(client):
+    b1 = client.post("/mgmt/prompts/support/system/preview",
+                     json={"flags": {"user_id": "u_12"},
+                           "variables": {"customer_name": "Acme", "history": []}},
+                     headers=auth()).json()
+    pin = {"versions": b1["versions"], "rules_version": b1["rules_version"]}
+    b2 = client.post("/mgmt/prompts/support/system/preview",
+                     json={"variables": {"customer_name": "Acme", "history": []},
+                           "pin": pin}, headers=auth()).json()
+    assert b2["prompt"] == b1["prompt"]
+    # A renderer-only key is a serving credential, not a viewer: no preview.
+    rk = make_key(client, "renderer", project="support", env="prod")
+    assert client.post("/mgmt/prompts/support/system/preview",
+                       json={"variables": {}}, headers=auth(rk)).status_code == 403
+
+
+def test_untargeted_prompt_404_explains_itself(client):
+    # A prompt that EXISTS but serves nowhere must not be called "unknown" — that
+    # message lands at the exact moment a dev just committed and misleads them.
+    client.post("/mgmt/projects", json={"id": "docs", "review_policy": 0}, headers=auth())
+    client.post("/mgmt/prompts", json={"prompt_id": "docs/faq"}, headers=auth())
+    d = client.post("/mgmt/prompts/docs/faq/drafts",
+                    json={"version_number": 1, "content": "Answer {{ q }}"},
+                    headers=auth()).json()
+    client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth())
+    r = client.post("/prompt/docs/faq", json={"variables": {"q": "x"}}, headers=auth())
+    assert r.status_code == 404, r.text
+    detail = str(r.json()["detail"])
+    assert "serves nothing" in detail and "default" in detail
+    # A genuinely unknown prompt keeps the plain message.
+    r = client.post("/prompt/docs/ghost", json={"variables": {}}, headers=auth())
+    assert "unknown prompt" in str(r.json()["detail"])
+
+
+def test_overview_requires_viewer(client):
+    rk = make_key(client, "renderer", project="support", env="prod")
+    r = client.get("/mgmt/overview?environment=prod", headers=auth(rk))
+    assert r.status_code == 403
+    assert "viewer" in str(r.json()["detail"])
+
+
+def test_missing_content_type_gets_a_hint(client):
+    # curl without -H 'Content-Type: application/json' form-encodes the body; the
+    # 422 must say the actual fix instead of blaming "input".
+    r = client.post("/prompt/support/system", data={"variables": "{}"},
+                    headers=auth(client.renderer_key))
+    assert r.status_code == 422
+    assert "Content-Type: application/json" in r.json().get("hint", "")
+
+
 # ── browser sessions (HttpOnly cookie auth + CSRF) ───────────────────
 
 def login(client, key=ADMIN, remember=False):

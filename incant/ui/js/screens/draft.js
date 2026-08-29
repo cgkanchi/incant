@@ -6,7 +6,8 @@
 // that a tab switch or navigation triggers — a keystroke is never dropped.
 // baseSha chains autosaves (echoed as base_revision); conflict holds a 409 stale_write
 // until the author picks "load newer" or "keep mine".
-const Auto = { draftId: null, timer: null, seq: 0, applied: 0, inflight: null, baseSha: null, conflict: null };
+const Auto = { draftId: null, timer: null, seq: 0, applied: 0, inflight: null,
+               queued: false, baseSha: null, conflict: null };
 let _draftNotice = null;   // one-shot notice shown atop the review tab (e.g. after a 412)
 
 function scheduleAutosave() {
@@ -18,6 +19,12 @@ function fireAutosave() {
   clearTimeout(Auto.timer); Auto.timer = null;
   const ta = el("draftTa");
   if (!ta || !Auto.draftId || Auto.conflict) return;
+  // SERIALIZE: never race two PUTs. A save fired while one is in flight would carry
+  // the same base_revision (the chain hasn't advanced yet), and the server would
+  // correctly 409 it — surfacing a "changed somewhere else" conflict that is really
+  // the author's own typing. Queue instead; the in-flight save re-fires us with the
+  // then-current textarea content chained onto its response.
+  if (Auto.inflight) { Auto.queued = true; return Auto.inflight; }
   const draftId = Auto.draftId, content = ta.value, seq = ++Auto.seq;
   setAutosaveChip("saving");
   Auto.inflight = (async () => {
@@ -37,15 +44,19 @@ function fireAutosave() {
       if (e && e.status === 409 && detail && typeof detail === "object" && detail.error === "stale_write")
         enterAutosaveConflict(detail);
       else setAutosaveChip("failed");
+    } finally {
+      Auto.inflight = null;
+      if (Auto.queued && !Auto.conflict) { Auto.queued = false; fireAutosave(); }
     }
   })();
   return Auto.inflight;
 }
-// Fire any pending debounce immediately and await the in-flight PUT — called before
-// the DOM is replaced (render) and before a commit, so no edit is lost or stale.
+// Fire any pending debounce immediately and drain the save chain (in-flight PUT plus
+// anything queued behind it) — called before the DOM is replaced (render) and before
+// a commit, so no edit is lost or stale.
 async function flushAutosave() {
   if (Auto.timer) fireAutosave();
-  if (Auto.inflight) { try { await Auto.inflight; } catch (_) {} }
+  while (Auto.inflight) { try { await Auto.inflight; } catch (_) {} }
 }
 function setAutosaveChip(state) {
   const c = el("autoChip"); if (!c) return;
@@ -54,6 +65,17 @@ function setAutosaveChip(state) {
   else if (state === "failed") { c.textContent = "save failed"; c.className = "autochip err"; }
   else if (state === "conflict") { c.textContent = "conflict"; c.className = "autochip err"; }
   else { c.textContent = "saved"; c.className = "autochip faint"; }
+  // The lint chip describes the LAST SAVED content. While a save is failing or
+  // conflicted, the textarea is ahead of it — a green "lint clean" next to a red
+  // "save failed" is a contradiction, so mark the verdict stale until a save lands.
+  const lc = el("draftLintChip");
+  if (lc) {
+    if (state === "failed" || state === "conflict") {
+      lc.innerHTML = `<span class="pill warn">lint: unsaved edits not checked</span>`;
+    } else if (state === "saved" && window._dp && window._dp.draft) {
+      lc.innerHTML = lintChipHtml(window._dp.draft);
+    }
+  }
 }
 
 // ── autosave conflict (409 stale_write) ──────────────────────────────

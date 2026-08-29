@@ -612,6 +612,10 @@ GET/POST /mgmt/projects/{p}/prompts            GET /mgmt/prompts/{id}/versions
 POST /mgmt/prompts/{id}/versions               # create vN+1 (seeded from a version/SHA)
 POST /mgmt/prompts/{id}/drafts                 PUT /mgmt/drafts/{id}/content
 POST /mgmt/drafts/{id}/render                  # test-context render, rendered diff
+POST /mgmt/prompts/{id}/preview                # render via the REAL serving resolution,
+                                               #   viewer-gated — the UI's Playground /
+                                               #   audience tester door (sessions can't
+                                               #   call the bearer-only serving API)
 POST /mgmt/drafts/{id}/review  /approve  /commit
 GET/PUT /mgmt/prompts/{id}/variables           # refine extracted metadata
 GET/PUT /mgmt/prompts/{id}/test-contexts

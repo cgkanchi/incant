@@ -560,9 +560,10 @@ const Actions = {
     catch (e) { toast(errText(e), true); }
   },
   rollback(ds) {
-    const body = `Restore <b>${esc(State.env)}</b>'s rules to this earlier point
-      <span class="mono faint">rv${esc(ds.rv)}</span>. Rules created after that point stop
-      serving. This is itself a change, so history is never rewritten.`;
+    const body = `Restore <b>${esc(State.env)}</b>'s targeting — rules, defaults,
+      kill switches, and what's live — to this earlier point
+      <span class="mono faint">rv${esc(ds.rv)}</span>. Changes made after that point stop
+      applying. This is itself a change, so history is never rewritten.`;
     // A locked env asks you to type the env name; rollback is env-scoped.
     if (isLocked()) {
       openModal(typeToConfirm({
@@ -584,7 +585,12 @@ const Actions = {
       const r = await POST(`/mgmt/envs/${enc(State.env)}/rollback`,
                            { to_rules_version: parseInt(ds.rv), confirm: State.env });
       closeModal();
-      toast(`Went back — ${r.rules_changed} rule(s) changed`);
+      const c = r.changed || {};
+      const parts = [["rules", c.rules], ["defaults", c.defaults],
+                     ["published pointers", c.pointers], ["kill switches", c.kills]]
+        .filter(([, n]) => n > 0).map(([w, n]) => `${n} ${w}`);
+      toast(parts.length ? `Went back — restored ${parts.join(", ")}`
+                         : "Went back — nothing needed changing");
       render();
     } catch (e) { toast(errText(e), true); }
   },
@@ -651,7 +657,9 @@ const Actions = {
     const body = { flags, variables: vars, environment: State.env };
     if (window._playPin) body.pin = window._playPin;
     try {
-      window._playLast = await POST(`/prompt/${enc(window._playPid)}`, body);
+      // The serving API is bearer-only (sessions are control-plane credentials);
+      // the browser previews through the mgmt door — same resolver, same shape.
+      window._playLast = await POST(`/mgmt/prompts/${enc(window._playPid)}/preview`, body);
       render();
     } catch (e) { toast(errText(e), true); }
   },
@@ -1102,7 +1110,9 @@ const Actions = {
     if (a.needVars) { try { vars = (a.vars || "").trim() ? JSON.parse(a.vars) : {}; } catch { a.err = "Variables: invalid JSON"; return renderAudience(); } }
     a.err = "";
     try {
-      const r = await POST(`/prompt/${enc(pid)}`, { flags, variables: vars, environment: State.env });
+      // Preview through the mgmt door — the serving API is bearer-only (§11).
+      const r = await POST(`/mgmt/prompts/${enc(pid)}/preview`,
+                           { flags, variables: vars, environment: State.env });
       a.result = audienceResult(r, pid); a.needVars = false;
       renderAudienceHighlight(a.result);
     } catch (e) {

@@ -200,10 +200,40 @@ def test_targeting_composer_and_audience(server, page):
     assert "VIP accounts get the formal voice" in page.inner_text("#main")
 
     # Audience tester: a seeded user that a rule targets → resolves to a version.
+    # Assert on the RESULT line ("→ they'd get …"), not the card's static copy —
+    # the old loose assertion matched the help text even when the check failed,
+    # which is exactly how the cookie-session regression slipped through.
     page.locator("#audFlags").fill('{"user_id": "u_12"}')
     page.click("text=/^Check$/")
     page.wait_for_timeout(1500)
-    assert "they'd get" in page.inner_text("#main").lower()
+    body = page.inner_text("#main")
+    # support/system needs variables to render: the tester asks for them (not an
+    # auth error), then resolves on the second check.
+    assert "missing bearer credential" not in body.lower(), body[-600:]
+    assert "needs variables" in body.lower(), body[-600:]
+    page.locator("#audVars").fill('{"customer_name": "Acme", "history": []}')
+    page.click("text=/^Check$/")
+    page.wait_for_timeout(1500)
+    body = page.inner_text("#main")
+    assert "→ they'd get" in body, body[-600:]
+
+
+def test_playground_renders_for_session_user(server, page):
+    """The Playground must work for a signed-in (cookie-session) user: the serving
+    API is bearer-only, so the UI previews through the mgmt door. Guards the
+    'missing bearer credential' regression."""
+    page.goto(server + "/#/play")
+    signin(page)
+    page.wait_for_selector("text=Playground", timeout=15000)
+
+    page.select_option("#playPid", "support/system")
+    page.locator("#playFlags").fill('{"user_id": "u_12"}')
+    page.locator("#playVars").fill('{"customer_name": "Acme", "history": []}')
+    page.click("text=/^Render$/")
+    page.wait_for_timeout(1500)
+    body = page.inner_text("#main")
+    assert "Acme" in body, body[-600:]                       # rendered output arrived
+    assert "missing bearer credential" not in page.inner_text("body").lower()
 
 
 def test_publish_impact_flow(server, page):
