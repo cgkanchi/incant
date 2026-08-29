@@ -80,7 +80,7 @@ def test_overview_payload_matches_seed(client):
     assert greet["newest_version_live"] is False   # v2 committed but never published
     assert greet["updated"]["who"] == "Maya"
 
-    lang = rows["shared/style/language-rules"]
+    lang = rows["support/style/language-rules"]
     assert lang["live_version"] == 1
     assert lang["live_by"] == "Rae"
     assert lang["newest_version"] == 2
@@ -140,8 +140,11 @@ def test_overview_query_and_subprocess_counts_are_constant(client):
     """~40 prompts with committed content and live pointers, yet the overview is a small
     constant number of SQL statements (not ~4*N) and a single git subprocess (not one
     `git log` per prompt)."""
+    # One project per deployment: these prompts share seeded `support` (policy 1);
+    # drop the review gate — this test measures query counts, not the review flow.
+    client.patch("/mgmt/projects/support", json={"review_policy": 0}, headers=auth())
     for i in range(40):
-        pid = f"scale/p{i:02d}"
+        pid = f"support/scale/p{i:02d}"
         client.post("/mgmt/prompts", json={"prompt_id": pid}, headers=auth())
         d = client.post(f"/mgmt/prompts/{pid}/drafts",
                         json={"version_number": 1, "content": f"Hi {{{{ name }}}} #{i}"},
@@ -220,7 +223,7 @@ def test_validated_by_version_windows_to_cap(client):
     newest-first order is preserved, the tip is still the newest, and tip_ahead is the real
     index for a recent live pointer but saturates at K (the honest cap) for an ancient one."""
     K = _OVERVIEW_TIP_CAP
-    pid, ver = "scale/window", 1
+    pid, ver = "support/scale/window", 1
     newest_first = _seed_validations(pid, ver, K + 10)
 
     with session_scope() as s:
@@ -242,7 +245,7 @@ def test_current_live_bulk_equivalent_to_reduce(client):
     """The windowed row_number()==1 bulk read returns the SAME newest move per
     (prompt, version) as the per-call `_current_live` reduce, and partitions cleanly across
     keys (no bleed between versions)."""
-    env, pid = "prod", "scale/moves"
+    env, pid = "prod", "support/scale/moves"
     base = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
     with session_scope() as s:
         for i in range(6):                     # v1: six moves, newest = sha5
@@ -267,7 +270,9 @@ def test_current_live_bulk_equivalent_to_reduce(client):
 def test_get_versions_history_capped_at_constant(client):
     """The version-detail `history` array is bounded to `_VERSION_HISTORY_LIMIT` even when
     the file has many more commits — the per-version `git log` walk is capped, not unbounded."""
-    pid = "scale/histcap"   # fresh project → review_policy 0, commit freely (as elsewhere here)
+    pid = "support/scale/histcap"
+    # Drop the seeded review gate — this test measures the history cap, not review.
+    client.patch("/mgmt/projects/support", json={"review_policy": 0}, headers=auth())
     client.post("/mgmt/prompts", json={"prompt_id": pid}, headers=auth())
     d = client.post(f"/mgmt/prompts/{pid}/drafts",
                     json={"version_number": 1, "content": "rev 0"}, headers=auth()).json()
@@ -292,7 +297,7 @@ def test_snapshot_servable_complete_despite_validation_window(client):
     OBSERVABLE contract stays complete: a validated SHA far outside the newest-K window
     is still servable via the memoized DB fallback. An old pinned rule or rolled-back
     pointer must never lose servability just because newer edits pushed it down."""
-    env, pid, ver = "prod", "scale/snap", 1
+    env, pid, ver = "prod", "support/scale/snap", 1
     client.post("/mgmt/prompts", json={"prompt_id": pid}, headers=auth())  # FK parents
     with session_scope() as s:
         s.add(models.Version(prompt_id=pid, number=ver))
@@ -312,7 +317,7 @@ def test_snapshot_servable_complete_despite_validation_window(client):
 def test_snapshot_previous_live_recent_distinct(client):
     """The windowed pointer history still yields the §10 `previous_live` fallback: recent
     distinct previous-live SHAs, newest-first, excluding the current live."""
-    env, pid, ver = "prod", "scale/prev", 1
+    env, pid, ver = "prod", "support/scale/prev", 1
     base = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
     client.post("/mgmt/prompts", json={"prompt_id": pid}, headers=auth())  # FK parents
     with session_scope() as s:

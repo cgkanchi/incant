@@ -72,17 +72,23 @@ def test_concurrent_rule_upserts_never_lose_a_bump(app):
             .order_by(models.RuleRevision.rules_version)
         ).scalars().all()
 
-    # Each serialized revision is a cumulative post-change state.  A later
+    # Each serialized revision names a cumulative post-change state. A later
     # revision may not omit a rule captured by an earlier committed revision.
+    # Under checkpointing most revisions carry no materialized state — state_at
+    # reconstructs them, and the reconstruction must honor the same invariant.
     assert len(revisions) == N
     seen: set[str] = set()
-    for revision in revisions:
-        seen.add(revision.rule_id)
-        captured = {
-            rule["id"] for rule in revision.state["rules"]
-            if rule["id"].startswith("rule-")
-        }
-        assert captured == seen
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        for revision in revisions:
+            seen.add(revision.rule_id)
+            state = tgt.state_at("prod", revision.rules_version)
+            assert state is not None, revision.rules_version
+            captured = {
+                rule["id"] for rule in state["rules"]
+                if rule["id"].startswith("rule-")
+            }
+            assert captured == seen
 
 
 def test_concurrent_pointer_moves_are_all_recorded(app):

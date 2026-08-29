@@ -17,11 +17,12 @@ import pytest
 
 from .test_server import auth, make_client, make_key
 
-# Project A = "support" (has support/system @ v2); Project B = "shared" (has
-# shared/style/language-rules @ v1). Both are seeded with prompts/versions.
+# One project per deployment: everything lives under "support". The surviving
+# authority boundary is project-scoped operator vs ENV-WIDE operator — global
+# rules govern every prompt, so they need the env-wide (or instance) grant.
 ENV = "prod"
-A_PROMPT = "support/system"          # project A, version 2 exists
-B_PROMPT = "shared/style/language-rules"  # project B, version 1 exists
+A_PROMPT = "support/system"                 # version 2 exists
+B_PROMPT = "support/style/language-rules"   # version 1 exists (the fragment)
 
 
 @pytest.fixture()
@@ -36,8 +37,8 @@ def _rules(client, env=ENV):
 
 
 def _seed_cross_scope_rules(client):
-    """As admin, plant a GLOBAL rule and a project-B (shared) prompt-scoped rule that a
-    project-A operator can see (GET /rules) but must not be able to hijack/rehome."""
+    """As admin, plant a GLOBAL rule (env-wide authority required) and an ordinary
+    prompt-scoped rule the project operator legitimately governs."""
     r = client.post(f"/mgmt/envs/{ENV}/rules",
                     json={"id": "glob-1", "scope": "global", "priority": 50,
                           "serve": {"version": 2}, "comment": "env-wide global"},
@@ -89,18 +90,19 @@ def test_a_operator_cannot_hijack_global_rule(client):
     assert got["comment"] == "env-wide global" and got["priority"] == 50
 
 
-def test_a_operator_cannot_rehome_project_b_rule(client):
+def test_project_operator_governs_every_prompt_rule(client):
+    # One project per deployment: a project-scoped operator legitimately edits ANY
+    # prompt-scoped rule (there is no foreign project to protect), including moving
+    # it between prompts. Global rules remain the env-wide-only surface (below).
     _seed_cross_scope_rules(client)
     op = make_key(client, "operator", project="support", env=ENV)
-    # Take project-B's rule id and rehome it into project A. Requested scope (A) is
-    # authorized, but the STORED scope is project B -> needs operator on B -> 403.
     r = client.post(f"/mgmt/envs/{ENV}/rules",
                     json={"id": "b-rule", "scope": "prompt", "prompt_id": A_PROMPT,
-                          "priority": 2, "serve": {"version": 2}, "comment": "rehome"},
+                          "priority": 2, "serve": {"version": 2}, "comment": "retargeted"},
                     headers=auth(op))
-    assert r.status_code == 403, r.text
+    assert r.status_code == 200, r.text
     got = _rules(client)["b-rule"]
-    assert got["prompt_id"] == B_PROMPT and got["comment"] == "project B"  # untouched
+    assert got["prompt_id"] == A_PROMPT and got["comment"] == "retargeted"
 
 
 def test_a_operator_cannot_flip_own_rule_to_global(client):
@@ -175,12 +177,13 @@ def test_patch_status_on_foreign_or_global_rule_forbidden(client):
     r = client.patch(f"/mgmt/envs/{ENV}/rules/glob-1", json={"status": "archived"},
                      headers=auth(op))
     assert r.status_code == 403, r.text
-    # Archiving project-B's rule needs operator on B -> 403.
+    # One project per deployment: any prompt-scoped rule is the project operator's
+    # to govern — archiving the fragment's rule succeeds.
     r = client.patch(f"/mgmt/envs/{ENV}/rules/b-rule", json={"status": "archived"},
                      headers=auth(op))
-    assert r.status_code == 403, r.text
+    assert r.status_code == 200, r.text
     got = _rules(client)
-    assert got["glob-1"]["status"] == "active" and got["b-rule"]["status"] == "active"
+    assert got["glob-1"]["status"] == "active" and got["b-rule"]["status"] == "archived"
     # An own-project rule CAN be archived (releaser/operator on its stored scope).
     client.post(f"/mgmt/envs/{ENV}/rules",
                 json={"id": "a-own", "scope": "prompt", "prompt_id": A_PROMPT,

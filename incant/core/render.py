@@ -14,6 +14,8 @@ and enforces the depth limit (static validation is the primary cycle guard).
 from __future__ import annotations
 
 import contextvars
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
@@ -136,25 +138,32 @@ _ENV = _IncantEnvironment(
 )
 
 # Blob-keyed compiled-template cache: immutable content ⇒ never invalidated.
-_COMPILED: dict[str, Template] = {}
-_COMPILE_ORDER: list[str] = []
+# LRU via OrderedDict under a mutex — sync routes run in a thread pool, and the
+# compound get/move/evict operations are not atomic on their own. Compilation and
+# extraction happen OUTSIDE the lock (both are pure per blob; a racing duplicate
+# is a harmless identical insert), so hits never wait on a slow miss.
 _CACHE_MAX = 4096
+_COMPILED: "OrderedDict[str, Template]" = OrderedDict()
+_COMPILED_LOCK = threading.Lock()
 compile_misses = 0
 
 # Blob-keyed variable-extraction cache (parsing is deterministic per blob).
-_EXTRACT: dict[str, Any] = {}
-_EXTRACT_ORDER: list[str] = []
+_EXTRACT: "OrderedDict[str, Any]" = OrderedDict()
+_EXTRACT_LOCK = threading.Lock()
 
 
 def _extract_cached(blob_sha: str, source: str):
-    ev = _EXTRACT.get(blob_sha)
-    if ev is not None:
-        return ev
+    with _EXTRACT_LOCK:
+        ev = _EXTRACT.get(blob_sha)
+        if ev is not None:
+            _EXTRACT.move_to_end(blob_sha)
+            return ev
     ev = extract(source)
-    _EXTRACT[blob_sha] = ev
-    _EXTRACT_ORDER.append(blob_sha)
-    if len(_EXTRACT_ORDER) > _CACHE_MAX:
-        _EXTRACT.pop(_EXTRACT_ORDER.pop(0), None)
+    with _EXTRACT_LOCK:
+        _EXTRACT[blob_sha] = ev
+        _EXTRACT.move_to_end(blob_sha)
+        while len(_EXTRACT) > _CACHE_MAX:
+            _EXTRACT.popitem(last=False)
     return ev
 
 
@@ -208,10 +217,12 @@ def _closure_inputs(
 
 def _compile(env: SandboxedEnvironment, blob_sha: str, source: str, name: str) -> Template:
     global compile_misses
-    cached = _COMPILED.get(blob_sha)
-    if cached is not None:
-        return cached
-    compile_misses += 1
+    with _COMPILED_LOCK:
+        cached = _COMPILED.get(blob_sha)
+        if cached is not None:
+            _COMPILED.move_to_end(blob_sha)
+            return cached
+        compile_misses += 1
     # Lazy + defensive (the gitstore/content.py idiom): core stays a pure library
     # with no hard server dependency; the counter is best-effort telemetry (§14).
     try:
@@ -224,11 +235,11 @@ def _compile(env: SandboxedEnvironment, blob_sha: str, source: str, name: str) -
         tmpl = Template.from_code(env, code, env.make_globals(None), None)
     except JinjaTemplateError as exc:  # syntax error reaching compile
         raise RenderError(str(exc), prompt_id=name, lineno=getattr(exc, "lineno", None))
-    _COMPILED[blob_sha] = tmpl
-    _COMPILE_ORDER.append(blob_sha)
-    if len(_COMPILE_ORDER) > _CACHE_MAX:
-        evict = _COMPILE_ORDER.pop(0)
-        _COMPILED.pop(evict, None)
+    with _COMPILED_LOCK:
+        _COMPILED[blob_sha] = tmpl
+        _COMPILED.move_to_end(blob_sha)
+        while len(_COMPILED) > _CACHE_MAX:
+            _COMPILED.popitem(last=False)
     return tmpl
 
 

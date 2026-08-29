@@ -43,6 +43,9 @@ class SetupRequest(BaseModel):
     name: str
     email: str
     password: str
+    # Names the deployment's ONE project (optional — the first prompt's prefix can
+    # also claim it). Slug rules match environment ids.
+    project: Optional[str] = None
 
 
 class AcceptInviteRequest(BaseModel):

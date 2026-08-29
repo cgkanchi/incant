@@ -74,13 +74,16 @@ def invite_user(
         raise HTTPException(400, f"unknown role {req.role!r}")
 
     user = create_user(session, email=req.email, name=req.name)
-    if req.role is not None:
-        session.add(models.RoleBinding(
-            principal_id=user.principal_id, role=req.role,
-            project_id=req.project_id, environment_id=req.environment_id))
+    # Default to instance-wide viewer: a person who can sign in but see nothing is
+    # a support ticket, not a security posture. Admins narrow or widen from Access.
+    role = req.role or "viewer"
+    session.add(models.RoleBinding(
+        principal_id=user.principal_id, role=role,
+        project_id=req.project_id if req.role else None,
+        environment_id=req.environment_id if req.role else None))
     token = issue_invite(user)
     record_audit(session, ident.name, "user.invite", "user", user.id,
-                 after={"email": user.email, "role": req.role})
+                 after={"email": user.email, "role": role})
     app.invalidate_auth_after_commit(session)
     return _invite_response(user, token)
 

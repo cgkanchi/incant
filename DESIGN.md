@@ -81,7 +81,7 @@ serving; pointer moves do.
 
 | Term | Meaning |
 |---|---|
-| **Project** | Top-level namespace and permission scope (`support`, `growth`, `shared`). |
+| **Project** | The deployment's namespace — exactly ONE per database (named at first-run setup or by the first prompt's prefix). Multi-project = multiple deployments; a future schema-sharding direction keeps auth shared and gives each project a private schema. |
 | **Prompt** | A folder of version files. Its id is a path: `support/system`. Fragments are not a separate type — any prompt can include any other (§4). |
 | **Version** | A file: `support/system/v2.j2`. A stable, targetable identity whose content iterates via commits — not a frozen point. Optional label, notes, status in the DB. |
 | **Tip** | The newest validated commit touching a version file. Content that *exists* but serves only where explicitly targeted. |
@@ -156,15 +156,16 @@ support/                        # project
 └── escalation/
     └── triage/                 # prompt: support/escalation/triage
         └── v1.j2
-shared/                         # a project of shared fragments — just prompts
 └── style/
-    └── language-rules/         # prompt: shared/style/language-rules
+    └── language-rules/         # shared fragments are just prompts, same project
         ├── v1.j2
         └── v2.j2
 ```
 
-- **Projects** are top-level directories, registered in the DB; they scope permissions
-  (§11), group the UI, and namespace prompt ids.
+- **The project** is the single top-level directory (one per deployment), registered
+  in the DB; it namespaces prompt ids and carries the review policy. There is no
+  cross-project mental model to learn: every prompt, rule, and key in a database
+  belongs to the same project.
 - **A prompt is a folder of versions; a version is one file; there is no manifest.**
   New version = new file (seeded from any existing version). Tweak or backport = a
   commit to an existing file. HEAD holds every version's current text side by side —
@@ -187,7 +188,7 @@ picks the commit; no rule → the environment's default. "Roll out the new style
 10% of enterprise" is targeting on the fragment prompt — every consumer follows,
 coherently, with no consumer edited.
 
-- Includes may cross projects (RBAC governs who can *edit*, not who can include).
+- Any prompt may include any other in the deployment (RBAC governs who can *edit*, not who can include). Sharing fragments across deployments is deliberately not a feature — teams that share style share a deployment.
 - **Cycles:** validation-time static check over the include graph at current defaults,
   plus a render-time depth limit (32) as backstop — resolution is flag-dependent.
 - Every response reports the resolved version *and SHA* of the prompt and every
@@ -353,7 +354,8 @@ nodes in seconds.
 ### Clause & rollout semantics
 
 - Operators: `eq`, `neq`, `in`, `not_in`, `contains`, `starts_with`, `ends_with`,
-  `matches`, `gt/gte/lt/lte`, `semver_gt/semver_lt`, `exists`; `all`/`any` composition.
+  `gt/gte/lt/lte`, `semver_gt/semver_lt`, `exists`; `all`/`any` composition
+  (no user-authored regex — see Divergences).
   A clause referencing an absent flag does not match (no error).
 - **Segments**: named clause groups per environment, referencable from any rule.
 - **Rollout bucketing is coherent across prompts for global rules**:
@@ -397,9 +399,13 @@ work even during a DB outage.
 
 Every targeting mutation (rules, segments, pointers, defaults, kills) runs under
 its environment's row lock and writes a `rule_revisions` row (actor, at, comment)
-carrying BOTH the changed object and the environment's **complete post-change
-targeting state** (rules, segments, defaults, kills, live pointers, tips, labels —
-SHAs only, never content), then bumps the environment's monotonic
+carrying the changed object — and, on CHECKPOINT revisions (baseline, rollback,
+and every Kth per `INCANT_REVISION_CHECKPOINT_INTERVAL`), the environment's
+**complete post-change targeting state** (rules, segments, defaults, kills, live
+pointers, tips, labels — SHAs only, never content). Non-checkpoint states
+reconstruct exactly by forward-applying at most K−1 per-object changes from the
+nearest older checkpoint: O(1) recent, bounded slow path old, O(N/K) state
+storage. Each mutation bumps the environment's monotonic
 **`rules_version`** (unique per environment — the lock makes each revision a true
 serial history point, so no captured state can miss a concurrent change).
 Environments get an exact **baseline revision** before their first mutation. That
@@ -493,9 +499,12 @@ Pin semantics, precisely:
   targeting state recorded by that revision (§7). It must name an exact recorded
   revision, or the request is refused (422) with the `pin.versions` alternative.
   One documented bound: a rule serving `v2@tip` replays at the tip *as recorded by
-  that targeting change* — tips move on commits without bumping `rules_version`, so
-  content-exact replay of tip-rules is what `pin.versions` is for. Replays never
-  take the §10 fallback (a degraded replay would be a lie — they 409 instead).
+  the nearest checkpoint state* — tips move on commits without bumping
+  `rules_version`, and reconstructed states inherit the checkpoint's tips. A
+  tip-rule whose tip the checkpoint cannot vouch for is skipped and reported in
+  `skipped_rules`, never silently substituted; content-exact replay of tip-rules
+  is what `pin.versions` is for. Replays never take the §10 fallback (a degraded
+  replay would be a lie — they 409 instead).
 - Unknown pin fields are refused (422), never silently ignored.
 - Both together are allowed: `versions` entries win per prompt.
 
@@ -576,9 +585,9 @@ Bindings are `(principal, role, scope)`; scope = instance, project, or
 | `releaser` | `operator` + approvals for pointer-class changes in protected environments |
 | `admin` | Everything: projects, environments, principals, keys, bindings, remotes |
 
-- **Serving:** key holds `renderer` on `(project, environment)` → else `403`. Scoping
-  no finer than project — wanting per-prompt render ACLs is the signal to split
-  projects.
+- **Serving:** key holds `renderer` on the environment → else `403`. Scoping is per
+  environment (the project dimension is vestigial with one project per deployment);
+  wanting per-prompt render ACLs is the signal to split deployments.
 - **Authoring:** `editor` on the project; commits gated by project review policy
   (N approvals, approver ≠ author).
 - **Targeting:** `operator`; protected environments add two-person approval for
@@ -849,6 +858,15 @@ scattered through code comments — so a reader knows which promises are live.
 - **No Postgres LISTEN/NOTIFY (§7, §13).** Propagation is the 2-second poll alone
   (`INCANT_CONTROL_POLL_SECONDS`), which already meets the <2s target. NOTIFY
   remains an optimization to layer in when poll load matters.
+- **One project per deployment (§2, §4, §11).** The database hosts exactly one
+  project; creating a second is refused. Cross-project includes and cross-project
+  RBAC collapsed into non-features — the surviving authority boundary is the
+  environment (plus env-wide-only global rules). Multi-project returns, if ever,
+  as schema sharding: shared `public` auth, one private schema per project.
+- **No user-authored regex (§7).** The `matches` operator was removed: every real
+  targeting predicate is expressible with the structured operators and segments,
+  and operator-authored patterns were a ReDoS surface on the serving thread. If
+  demand appears it returns RE2-backed with a length cap.
 - **No OIDC/SSO (§11).** Humans use local email+password accounts (first-run setup +
   admin invites, scrypt hashing); machines use API keys. OIDC would mint the same
   server-side sessions for the same principals and is additive.

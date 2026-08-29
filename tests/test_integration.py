@@ -429,18 +429,18 @@ def test_track_tip_no_advance_without_live_pointer(app):
 
 
 def test_full_loop_render(app):
-    _author_version(app, "shared/style/language-rules", 1, "Write in plain English.")
+    _author_version(app, "support/style/language-rules", 1, "Write in plain English.")
     _author_version(
         app, "support/system", 1,
         'You are a support agent for {{ customer_name }}.\n'
-        '{% include "shared/style/language-rules" %}',
+        '{% include "support/style/language-rules" %}',
     )
     with session_scope() as s:
         resp = app.serve(s, "prod", "support/system", {}, {"customer_name": "Acme"})
     assert "support agent for Acme" in resp["prompt"]
     assert "Write in plain English." in resp["prompt"]
     assert resp["matched_rule"] == "default"
-    assert set(resp["versions"]) == {"support/system", "shared/style/language-rules"}
+    assert set(resp["versions"]) == {"support/system", "support/style/language-rules"}
     assert resp["content_fallback"] is False
 
 
@@ -592,3 +592,64 @@ def test_set_default_rejects_missing_version(app):
     with session_scope() as s:
         with pytest.raises(TargetingError):
             app.targeting(s, "op").set_default("prod", "support/system", 42)
+
+
+def test_checkpointed_revisions_reconstruct_exactly(app, monkeypatch):
+    # With a tiny checkpoint interval, most revisions carry NO materialized state;
+    # state_at reconstructs them from the nearest older checkpoint by forward-
+    # applying per-object deltas — and rollback/replay to them stays exact.
+    from incant.config import get_settings
+    monkeypatch.setattr(get_settings(), "revision_checkpoint_interval", 5)
+
+    out1 = _author_version(app, "support/system", 1, "v1 {{ x }}")
+    _author_version(app, "support/system", 2, "v2 {{ x }}", make_live=True)
+
+    probes = {}
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        for i in range(9):   # a mix of kinds spanning several checkpoint gaps
+            if i % 3 == 0:
+                tgt.upsert_rule("prod", {"id": f"r{i}", "scope": "prompt",
+                                         "prompt_id": "support/system", "priority": i + 1,
+                                         "when": None, "serve": {"version": 1}})
+            elif i % 3 == 1:
+                tgt.set_default("prod", "support/system", 1 + (i % 2))
+            else:
+                tgt.set_kill("prod", "support/system", i % 2 == 0)
+            rv = s.get(models.Environment, "prod").rules_version
+            from incant.targeting.service import capture_state
+            probes[rv] = capture_state(s, "prod")   # ground truth at this instant
+
+    with session_scope() as s:
+        # Storage is actually thinned: some probed revisions carry no state row.
+        stored = {r.rules_version: r.state for r in s.execute(
+            select(models.RuleRevision).where(
+                models.RuleRevision.environment_id == "prod")).scalars()}
+        assert any(stored[rv] is None for rv in probes), "expected thinned revisions"
+        # Every probed revision — checkpointed or reconstructed — matches ground truth.
+        tgt = app.targeting(s, "op")
+        for rv, truth in probes.items():
+            state = tgt.state_at("prod", rv)
+            assert state is not None, rv
+            assert {r["id"] for r in state["rules"]} == {r["id"] for r in truth["rules"]}, rv
+            assert state["defaults"] == truth["defaults"], rv
+            assert sorted(state["kills"]) == sorted(truth["kills"]), rv
+            live = {k: v.get("live") for k, v in state["versions"].items()}
+            live_truth = {k: v.get("live") for k, v in truth["versions"].items()}
+            assert live == live_truth, rv
+
+    # Exact rollback to a NON-checkpoint revision works via reconstruction.
+    target_rv = sorted(rv for rv in probes if stored[rv] is None)[0]
+    with session_scope() as s:
+        result = app.targeting(s, "op").rollback("prod", target_rv)
+        assert result["scope"] == "full"
+    with session_scope() as s:
+        truth = probes[target_rv]
+        tgt = app.targeting(s, "op")
+        assert {r.id for r in tgt.list_rules("prod")
+                if r.status != "archived"} >= {r["id"] for r in truth["rules"]}
+        d = s.execute(select(models.EnvDefault).where(
+            models.EnvDefault.environment_id == "prod",
+            models.EnvDefault.prompt_id == "support/system")).scalar_one_or_none()
+        assert (d.version_number if d else None) == truth["defaults"].get("support/system")
+    assert out1.sha  # anchor

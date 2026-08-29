@@ -28,7 +28,7 @@ from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
-from ..db import engine, session_scope
+from ..db import claim_full_writer_role, engine, release_full_writer_role, session_scope
 from ..registry import (
     reconcile_drafts,
     reconcile_main_commits,
@@ -166,8 +166,10 @@ async def _session_sweep_loop() -> None:
     while True:
         await asyncio.sleep(_SESSION_SWEEP_SECONDS)
         try:
-            with session_scope() as s:
-                sweep_expired_sessions(s)
+            def _pass() -> None:
+                with session_scope() as s:
+                    sweep_expired_sessions(s)
+            await asyncio.to_thread(_pass)  # blocking DB work off the serving loop
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("periodic session sweep errored")
 
@@ -183,9 +185,11 @@ async def _reconcile_loop(ctx) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            with session_scope() as s:
-                recover_pending_promotions(s, ctx.git)
-                ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
+            def _pass() -> None:
+                with session_scope() as s:
+                    recover_pending_promotions(s, ctx.git)
+                    ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
+            await asyncio.to_thread(_pass)  # DB + git subprocess work off the loop
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("periodic main reconcile errored")
 
@@ -254,8 +258,10 @@ async def _control_poll_loop(ctx) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            with session_scope() as s:
-                ctx.refresh_control_plane(s)
+            def _pass() -> None:
+                with session_scope() as s:
+                    ctx.refresh_control_plane(s)
+            await asyncio.to_thread(_pass)  # snapshot rebuilds must not stall renders
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("control-plane poll errored")
 
@@ -268,6 +274,9 @@ async def lifespan(app: FastAPI):
     if settings.mode == "serve":
         _verify_serve_prerequisites(ctx)  # fail fast; no writes in serve mode
     else:
+        # Exactly one full writer per deployment: claim the role before touching
+        # anything (a second full node fails fast here, not mid-double-reconcile).
+        claim_full_writer_role()
         ctx.initialize()  # git init + schema (Alembic migrations)
         with session_scope() as s:
             ensure_bootstrap_admin(s, settings.bootstrap_admin_key)
@@ -316,10 +325,19 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task in (retry_task, sweep_task, reconcile_task, backup_task, fetch_task,
-                     poll_task):
-            if task is not None:
-                task.cancel()
+        # Graceful shutdown: cancel AND await each loop so an in-flight pass (a
+        # backup push, a reconcile sweep) finishes its cancellation cleanly instead
+        # of dying mid-await when the loop is torn down.
+        tasks = [t for t in (retry_task, sweep_task, reconcile_task, backup_task,
+                             fetch_task, poll_task) if t is not None]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
+                pass
+        release_full_writer_role()
 
 
 def _has_viewer_anywhere(ident) -> bool:
@@ -333,7 +351,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title="Incant",
-        version="0.1.0",
+        version="1.0.0",
         lifespan=lifespan,
         description=(
             "Prompt management: git for content, flag-based targeting for who sees "

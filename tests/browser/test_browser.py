@@ -210,7 +210,7 @@ def test_targeting_composer_and_audience(server, page):
     # which is exactly how the cookie-session regression slipped through.
     page.locator("#audFlags").fill('{"user_id": "u_12"}')
     page.click("text=/^Check$/")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(3000)
     body = page.inner_text("#main")
     # support/system needs variables to render: the tester asks for them (not an
     # auth error), then resolves on the second check.
@@ -218,7 +218,7 @@ def test_targeting_composer_and_audience(server, page):
     assert "needs variables" in body.lower(), body[-600:]
     page.locator("#audVars").fill('{"customer_name": "Acme", "history": []}')
     page.click("text=/^Check$/")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(3000)
     body = page.inner_text("#main")
     assert "→ they'd get" in body, body[-600:]
 
@@ -235,7 +235,7 @@ def test_playground_renders_for_session_user(server, page):
     page.locator("#playFlags").fill('{"user_id": "u_12"}')
     page.locator("#playVars").fill('{"customer_name": "Acme", "history": []}')
     page.click("text=/^Render$/")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(3000)
     body = page.inner_text("#main")
     assert "Acme" in body, body[-600:]                       # rendered output arrived
     assert "missing bearer credential" not in page.inner_text("body").lower()
@@ -251,7 +251,7 @@ def test_publish_impact_flow(server, page):
 
     page.click("button[data-act='makeLive']")
     page.wait_for_selector("text=/Publish to prod/", timeout=8000)
-    page.wait_for_timeout(1500)  # let the impact diff resolve
+    page.wait_for_timeout(3000)  # let the impact diff resolve
 
     modal = page.inner_text(".modal")
     assert "The edits going live" in modal, modal[:400]

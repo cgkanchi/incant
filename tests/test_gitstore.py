@@ -141,3 +141,28 @@ def test_validation_detects_syntax_and_cycles(tmp_path):
         is_known_prompt=lambda p: False, include_source=lambda _p: None,
     )
     assert not unknown.ok and "not a registered prompt" in unknown.error
+
+
+def test_content_store_thread_safe_under_churn(tmp_path):
+    # Tiny capacity + many threads across more keys than fit: the locked LRU must
+    # never raise and every returned blob must be the right content.
+    import concurrent.futures as cf
+
+    g = GitStore(tmp_path / "repo")
+    g.init()
+    shas = {}
+    for i in range(8):
+        shas[i] = g.commit_version(f"p/c{i}", 1, f"content {i}",
+                                   author_name="A", author_email="a@x", message=f"c{i}")
+    store = ContentStore(g, cache_max=3)
+
+    def churn(worker: int) -> bool:
+        for i in range(120):
+            k = (worker + i) % 8
+            blob = store.get(f"p/c{k}", 1, shas[k])
+            assert blob.source == f"content {k}"
+        return True
+
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        assert all(f.result() for f in [pool.submit(churn, w) for w in range(8)])
+    assert len(store._cache) <= 3

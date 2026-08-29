@@ -1,7 +1,7 @@
 """Clause and condition evaluation — pure functions over a flag dict.
 
 Semantics (from the design):
-  * Operators: eq, neq, in, not_in, contains, starts_with, ends_with, matches,
+  * Operators: eq, neq, in, not_in, contains, starts_with, ends_with,
     gt/gte/lt/lte, semver_gt/semver_lt, exists; all/any/not composition.
   * A clause referencing an absent flag does not match — never errors.
   * Segments are named conditions, referenced from any rule.
@@ -9,7 +9,6 @@ Semantics (from the design):
 
 from __future__ import annotations
 
-import re
 from typing import Any, Mapping
 
 from .model import All, Any_, Clause, Condition, Not, Segment, SegmentRef
@@ -54,8 +53,6 @@ def eval_clause(clause: Clause, flags: Mapping[str, Any]) -> bool:
             return str(actual).startswith(str(v))
         if op == "ends_with":
             return str(actual).endswith(str(v))
-        if op == "matches":
-            return re.search(str(v), str(actual)) is not None
         if op == "gt":
             return actual > v
         if op == "gte":

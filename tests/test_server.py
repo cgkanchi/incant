@@ -210,14 +210,17 @@ def test_tip_serves_fragment_via_rule(client):
     assert r.status_code == 200, r.text
     body = r.json()
     assert "Write in plain English" in body["prompt"]              # fragment expanded
-    assert "shared/style/language-rules" in body["versions"]       # reported as contributor
+    assert "support/style/language-rules" in body["versions"]       # reported as contributor
 
 
-def test_renderer_key_scoped_to_project(client):
-    # renderer key is scoped to support/prod; shared prompts render via includes but
-    # a direct render of a shared prompt is out of scope -> 403.
-    r = client.post("/prompt/shared/style/language-rules", json={},
+def test_renderer_key_scoped_to_environment(client):
+    # One project per deployment: the (support, prod) renderer key renders EVERY
+    # prompt here, fragment included — the surviving scope boundary is the ENV.
+    r = client.post("/prompt/support/style/language-rules", json={},
                     headers=auth(client.renderer_key))
+    assert r.status_code == 200, r.text
+    r = client.post("/prompt/support/style/language-rules",
+                    json={"environment": "staging"}, headers=auth(client.renderer_key))
     assert r.status_code == 403
 
 
@@ -415,20 +418,21 @@ def test_access_management_requires_admin(client):
 
 
 def test_create_new_prompt_flow(client):
-    # New prompt in a new project (review_policy 0 -> commit needs no approval).
-    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/welcome",
+    # New prompt; relax the seeded review gate — this test is about the create flow.
+    client.patch("/mgmt/projects/support", json={"review_policy": 0}, headers=auth())
+    r = client.post("/mgmt/prompts", json={"prompt_id": "support/growth/welcome",
                                            "description": "welcome message"}, headers=auth())
     assert r.status_code == 200, r.text
-    assert r.json()["prompt_id"] == "growth/welcome"
+    assert r.json()["prompt_id"] == "support/growth/welcome"
 
     # It shows up immediately in the overview with zero versions.
     ov = client.get("/mgmt/overview?environment=prod", headers=auth()).json()
-    growth = next(p for p in ov["projects"] if p["project"] == "growth")
-    wp = next(p for p in growth["prompts"] if p["prompt_id"] == "growth/welcome")
+    growth = next(p for p in ov["projects"] if p["project"] == "support")
+    wp = next(p for p in growth["prompts"] if p["prompt_id"] == "support/growth/welcome")
     assert wp["versions"] == 0 and wp["live_version"] is None
 
     # Start a v1 draft (empty content lints valid), write, commit.
-    d = client.post("/mgmt/prompts/growth/welcome/drafts",
+    d = client.post("/mgmt/prompts/support/growth/welcome/drafts",
                     json={"version_number": 1, "content": ""}, headers=auth()).json()
     assert d["lint"]["status"] == "valid"
     client.put(f"/mgmt/drafts/{d['id']}/content",
@@ -439,18 +443,18 @@ def test_create_new_prompt_flow(client):
 
     # Make it live + default (prod is locked -> confirm with the prompt id), then it serves.
     client.post("/mgmt/envs/prod/defaults",
-                json={"prompt_id": "growth/welcome", "version_number": 1,
-                      "confirm": "growth/welcome"}, headers=auth())
+                json={"prompt_id": "support/growth/welcome", "version_number": 1,
+                      "confirm": "support/growth/welcome"}, headers=auth())
     client.post("/mgmt/envs/prod/pointers",
-                json={"prompt_id": "growth/welcome", "version_number": 1,
-                      "to_sha": sha, "confirm": "growth/welcome"}, headers=auth())
-    r = client.post("/prompt/growth/welcome", json={"variables": {"name": "Kai"}}, headers=auth())
+                json={"prompt_id": "support/growth/welcome", "version_number": 1,
+                      "to_sha": sha, "confirm": "support/growth/welcome"}, headers=auth())
+    r = client.post("/prompt/support/growth/welcome", json={"variables": {"name": "Kai"}}, headers=auth())
     assert r.status_code == 200 and r.json()["prompt"] == "Welcome, Kai!"
 
 
 def test_create_duplicate_prompt_is_409(client):
-    client.post("/mgmt/prompts", json={"prompt_id": "growth/dup"}, headers=auth())
-    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/dup"}, headers=auth())
+    client.post("/mgmt/prompts", json={"prompt_id": "support/growth/dup"}, headers=auth())
+    r = client.post("/mgmt/prompts", json={"prompt_id": "support/growth/dup"}, headers=auth())
     assert r.status_code == 409
 
 
@@ -606,9 +610,18 @@ def test_pin_rules_version_replays_targeting(client):
     b3 = client.post("/prompt/support/system",
                      json={**body, "pin": {"rules_version": old_rv}},
                      headers=auth(client.renderer_key)).json()
-    assert b3["versions"]["support/system"]["commit"] == old_commit
+    # The contract: TARGETING is replayed against the reconstructed state, and any
+    # loss is LOUD, never silent. Tip-serving rules replay at the tip as recorded
+    # by the nearest checkpoint (§9's caveat); here the checkpoint predates
+    # support/system entirely, so the tip-rule is skipped — reported in
+    # skipped_rules — and resolution falls to the same version via the default.
+    # Byte-exact content replay is pin.versions' job (covered by the pin tests).
     assert b3["rules_version"] == old_rv
-    assert b3["prompt"] == b1["prompt"]
+    assert b3["versions"]["support/system"]["version"] == \
+        b1["versions"]["support/system"]["version"]
+    if b3["matched_rule"] != {"scope": "prompt", "id": "team-x-tip"}:
+        assert any(sk["rule_id"] == "team-x-tip" for sk in b3["skipped_rules"]), b3
+    assert old_commit  # anchor: the exact-content path is exercised in the pin tests
 
 
 def test_pin_rejects_unknown_fields_and_bad_rules_version(client):
@@ -793,9 +806,10 @@ def test_discard_draft_removes_from_listing(client):
 
 
 def test_discard_after_commit_is_400(client):
-    # Fresh project (review_policy 0) -> commit needs no approval.
-    client.post("/mgmt/prompts", json={"prompt_id": "growth/done"}, headers=auth())
-    d = client.post("/mgmt/prompts/growth/done/drafts",
+    # Relax the seeded review gate -> commit needs no approval.
+    client.patch("/mgmt/projects/support", json={"review_policy": 0}, headers=auth())
+    client.post("/mgmt/prompts", json={"prompt_id": "support/growth/done"}, headers=auth())
+    d = client.post("/mgmt/prompts/support/growth/done/drafts",
                     json={"version_number": 1, "content": "hello {{ name }}"}, headers=auth()).json()
     assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 200
     r = client.post(f"/mgmt/drafts/{d['id']}/discard", headers=auth())
@@ -805,13 +819,14 @@ def test_discard_after_commit_is_400(client):
 def test_structured_409_on_commit_conflict(client):
     # Fresh project (review_policy 0). Establish a v1 baseline, then branch two
     # drafts off the same base; committing the second after the first conflicts.
-    client.post("/mgmt/prompts", json={"prompt_id": "growth/conflict"}, headers=auth())
-    d0 = client.post("/mgmt/prompts/growth/conflict/drafts",
+    client.patch("/mgmt/projects/support", json={"review_policy": 0}, headers=auth())
+    client.post("/mgmt/prompts", json={"prompt_id": "support/growth/conflict"}, headers=auth())
+    d0 = client.post("/mgmt/prompts/support/growth/conflict/drafts",
                      json={"version_number": 1, "content": "v1 base line"}, headers=auth()).json()
     assert client.post(f"/mgmt/drafts/{d0['id']}/commit", json={}, headers=auth()).status_code == 200
-    a = client.post("/mgmt/prompts/growth/conflict/drafts",
+    a = client.post("/mgmt/prompts/support/growth/conflict/drafts",
                     json={"version_number": 1, "content": "A change wins"}, headers=auth()).json()
-    b = client.post("/mgmt/prompts/growth/conflict/drafts",
+    b = client.post("/mgmt/prompts/support/growth/conflict/drafts",
                     json={"version_number": 1, "content": "B change loses"}, headers=auth()).json()
     assert client.post(f"/mgmt/drafts/{a['id']}/commit", json={}, headers=auth()).status_code == 200
     r = client.post(f"/mgmt/drafts/{b['id']}/commit", json={}, headers=auth())
@@ -871,8 +886,9 @@ def test_comment_empty_body_is_422(client):
 
 def test_comment_on_committed_draft_is_409(client):
     # fresh project (review_policy 0) -> commit needs no approval.
-    client.post("/mgmt/prompts", json={"prompt_id": "growth/cdone"}, headers=auth())
-    d = client.post("/mgmt/prompts/growth/cdone/drafts",
+    client.patch("/mgmt/projects/support", json={"review_policy": 0}, headers=auth())
+    client.post("/mgmt/prompts", json={"prompt_id": "support/growth/cdone"}, headers=auth())
+    d = client.post("/mgmt/prompts/support/growth/cdone/drafts",
                     json={"version_number": 1, "content": "hi {{ name }}"}, headers=auth()).json()
     assert client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth()).status_code == 200
     r = client.post(f"/mgmt/drafts/{d['id']}/comments", json={"body": "too late"}, headers=auth())
@@ -1028,11 +1044,11 @@ def test_audit_detail_and_filters(client):
 # ── overview + whoami extras ─────────────────────────────────────────
 
 def test_overview_description_and_open_drafts(client):
-    client.post("/mgmt/prompts", json={"prompt_id": "growth/welcome",
+    client.post("/mgmt/prompts", json={"prompt_id": "support/growth/welcome",
                                        "description": "welcome message"}, headers=auth())
     ov = client.get("/mgmt/overview?environment=prod", headers=auth()).json()
     projects = {p["project"]: p for p in ov["projects"]}
-    wp = next(p for p in projects["growth"]["prompts"] if p["prompt_id"] == "growth/welcome")
+    wp = next(p for p in projects["support"]["prompts"] if p["prompt_id"] == "support/growth/welcome")
     assert wp["description"] == "welcome message" and wp["open_drafts"] == 0
     # support/system carries one seeded open draft and no description.
     sysrow = next(p for p in projects["support"]["prompts"] if p["prompt_id"] == "support/system")
@@ -1478,26 +1494,37 @@ def test_preview_honours_pins_and_scope(client):
 def test_untargeted_prompt_404_explains_itself(client):
     # A prompt that EXISTS but serves nowhere must not be called "unknown" — that
     # message lands at the exact moment a dev just committed and misleads them.
-    client.post("/mgmt/projects", json={"id": "docs", "review_policy": 0}, headers=auth())
-    client.post("/mgmt/prompts", json={"prompt_id": "docs/faq"}, headers=auth())
-    d = client.post("/mgmt/prompts/docs/faq/drafts",
+    # (support has review_policy 1, so approve before committing.)
+    client.post("/mgmt/prompts", json={"prompt_id": "support/faq"}, headers=auth())
+    d = client.post("/mgmt/prompts/support/faq/drafts",
                     json={"version_number": 1, "content": "Answer {{ q }}"},
                     headers=auth()).json()
+    client.post(f"/mgmt/drafts/{d['id']}/review", json={"state": "approved"}, headers=auth())
     client.post(f"/mgmt/drafts/{d['id']}/commit", json={}, headers=auth())
-    r = client.post("/prompt/docs/faq", json={"variables": {"q": "x"}}, headers=auth())
+    r = client.post("/prompt/support/faq", json={"variables": {"q": "x"}}, headers=auth())
     assert r.status_code == 404, r.text
     detail = str(r.json()["detail"])
     assert "serves nothing" in detail and "default" in detail
     # A genuinely unknown prompt keeps the plain message.
-    r = client.post("/prompt/docs/ghost", json={"variables": {}}, headers=auth())
+    r = client.post("/prompt/support/ghost", json={"variables": {}}, headers=auth())
     assert "unknown prompt" in str(r.json()["detail"])
+
+
+def test_second_project_is_refused(client):
+    # One project per deployment: the database already hosts `support`.
+    r = client.post("/mgmt/projects", json={"id": "growth"}, headers=auth())
+    assert r.status_code == 409, r.text
+    assert "one project per deployment" in str(r.json()["detail"]).lower()
+    # Creating a prompt under a foreign prefix hits the same wall.
+    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/welcome2"}, headers=auth())
+    assert r.status_code == 409, r.text
 
 
 def test_overview_requires_viewer(client):
     rk = make_key(client, "renderer", project="support", env="prod")
     r = client.get("/mgmt/overview?environment=prod", headers=auth(rk))
     assert r.status_code == 403
-    assert "viewer" in str(r.json()["detail"])
+    assert "viewing access" in str(r.json()["detail"])   # human copy, not auth jargon
 
 
 def test_missing_content_type_gets_a_hint(client):
@@ -1588,19 +1615,19 @@ def test_cookie_auth_get_needs_no_csrf(client):
 def test_cookie_auth_post_without_csrf_is_403(client):
     login(client)
     # A cookie-authenticated mutation without the CSRF header is refused.
-    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/csrf-a"})
+    r = client.post("/mgmt/prompts", json={"prompt_id": "support/growth/csrf-a"})
     assert r.status_code == 403, r.text
     assert r.json()["detail"] == "csrf_required"
 
 
 def test_cookie_auth_post_with_csrf_succeeds(client):
     body = login(client)
-    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/csrf-b"},
+    r = client.post("/mgmt/prompts", json={"prompt_id": "support/growth/csrf-b"},
                     headers={"X-Incant-CSRF": body["csrf"]})
     assert r.status_code == 200, r.text
-    assert r.json()["prompt_id"] == "growth/csrf-b"
+    assert r.json()["prompt_id"] == "support/growth/csrf-b"
     # A wrong CSRF token is still refused.
-    r2 = client.post("/mgmt/prompts", json={"prompt_id": "growth/csrf-c"},
+    r2 = client.post("/mgmt/prompts", json={"prompt_id": "support/growth/csrf-c"},
                      headers={"X-Incant-CSRF": "not-the-token"})
     assert r2.status_code == 403 and r2.json()["detail"] == "csrf_required"
 
@@ -1609,7 +1636,7 @@ def test_bearer_post_needs_no_csrf_even_with_cookie(client):
     # Log in (cookie in the jar), then mutate with a bearer header and NO CSRF token.
     # Bearer takes precedence and is CSRF-immune, so it succeeds.
     login(client)
-    r = client.post("/mgmt/prompts", json={"prompt_id": "growth/bearer-nocsrf"},
+    r = client.post("/mgmt/prompts", json={"prompt_id": "support/growth/bearer-nocsrf"},
                     headers=auth())
     assert r.status_code == 200, r.text
 

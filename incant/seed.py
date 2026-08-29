@@ -1,8 +1,9 @@
 """Seed the design's example dataset so the app is explorable out of the box.
 
-Two projects (support, shared), two environments (prod protected, staging
-track-tip), the support/system v1–v3 lineage with v2 live and tip ahead +2, the
-shared style fragment, rules, segments, refinements, and test contexts.
+One project (support — one per deployment), two environments (prod protected,
+staging track-tip), the support/system v1–v3 lineage with v2 live and tip ahead
++2, the shared style fragment (a prompt like any other), rules, segments,
+refinements, and test contexts.
 """
 
 from __future__ import annotations
@@ -28,14 +29,14 @@ SYSTEM_V2_WARM = (
     "You are a support agent for {{ customer_name }}.\n"
     "Match the customer's tone; default to warm and concise.\n"
     "{% if plan_name %}The customer is on the {{ plan_name }} plan.{% endif %}\n"
-    '{% include "shared/style/language-rules" %}\n'
+    '{% include "support/style/language-rules" %}\n'
     "Never promise timelines you cannot verify.\n"
     "{% for m in history %}{{ m.text }}{% endfor %}"
 )
 
 SYSTEM_V3_VOICE = (
     "You're on the {{ customer_name }} support team — speak like a helpful colleague.\n"
-    '{% include "shared/style/language-rules" %}\n'
+    '{% include "support/style/language-rules" %}\n'
     "Lead with the answer, then the why.\n"
     "{% for m in history %}{{ m.text }}{% endfor %}"
 )
@@ -66,17 +67,16 @@ def seed() -> str:
                 s.add(models.Environment(id=eid, name=eid, protected=protected, track_tip=track_tip))
         # Projects (seed with review_policy 0 so we can commit freely).
         reg = ctx.registry(s, "system")
-        reg.ensure_project("support", review_policy=0)
-        reg.ensure_project("shared", review_policy=0)
+        reg.ensure_project("support", review_policy=0)  # the deployment's ONE project
 
     with session_scope() as s:
         # Shared fragment first (referenced by support/system).
-        _author(ctx, s, "shared/style/language-rules", 1, LANGUAGE_RULES_V1, "Rae", "language rules v1")
-        _author(ctx, s, "shared/style/language-rules", 2,
+        _author(ctx, s, "support/style/language-rules", 1, LANGUAGE_RULES_V1, "Rae", "language rules v1")
+        _author(ctx, s, "support/style/language-rules", 2,
                 LANGUAGE_RULES_V1 + "\nNo double negatives.", "Rae", "tighten language rules",
                 make_live=False)
-        ctx.targeting(s, "Rae").set_default("prod", "shared/style/language-rules", 1)
-        ctx.targeting(s, "Rae").set_default("staging", "shared/style/language-rules", 1)
+        ctx.targeting(s, "Rae").set_default("prod", "support/style/language-rules", 1)
+        ctx.targeting(s, "Rae").set_default("staging", "support/style/language-rules", 1)
 
     with session_scope() as s:
         # support/system v1 (archived), v2 (live + tip ahead +2), v3 (voice-v2 label).

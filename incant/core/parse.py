@@ -24,7 +24,7 @@ from .model import (
 
 _OPERATORS = {
     "eq", "neq", "in", "not_in", "contains", "starts_with", "ends_with",
-    "matches", "gt", "gte", "lt", "lte", "semver_gt", "semver_lt", "exists",
+    "gt", "gte", "lt", "lte", "semver_gt", "semver_lt", "exists",
 }
 _AT_VALUES = {"live", "tip", "sha"}
 _SCOPES = {"global", "prompt"}

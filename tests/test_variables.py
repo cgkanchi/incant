@@ -7,7 +7,7 @@ def test_design_example_inference():
         "You are a support agent for {{ customer_name }}.\n"
         "Match the customer's tone; default to warm and concise.\n"
         "{% if plan_name %}The customer is on the {{ plan_name }} plan.{% endif %}\n"
-        '{% include "shared/style/language-rules" %}\n'
+        '{% include "support/style/language-rules" %}\n'
         "Never promise timelines you cannot verify.\n"
         "{% for m in history %}{{ m.text }}{% endfor %}\n"
     )
@@ -15,7 +15,7 @@ def test_design_example_inference():
     assert v.names == {"customer_name", "plan_name", "history"}
     assert v.required == {"customer_name"}      # bare {{ }} usage
     assert v.optional == {"plan_name", "history"}  # guarded by if / for-iterable
-    assert v.includes == ("shared/style/language-rules",)
+    assert v.includes == ("support/style/language-rules",)
 
 
 def test_default_filter_marks_optional():

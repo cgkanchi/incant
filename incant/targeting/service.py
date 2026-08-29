@@ -175,13 +175,21 @@ class TargetingService:
         # point.  The unique constraint is the database backstop.
         env.rules_version += 1
         self.s.flush()
+        # CHECKPOINTING: the full state is materialized every Kth revision (plus
+        # always on baseline/rollback — anchors whose per-object snapshot cannot
+        # describe their whole effect). Everything else stores only its per-object
+        # change; ``state_at`` reconstructs the in-between states by forward-
+        # applying at most K-1 changes from the nearest older checkpoint. O(1)
+        # recent, bounded slow path old, O(N/K) storage.
+        from ..config import get_settings
+        interval = get_settings().revision_checkpoint_interval
+        checkpoint = (kind in ("baseline", "rollback")
+                      or env.rules_version % interval == 0)
         rev = models.RuleRevision(
             environment_id=env.id, rule_id=rule_id, kind=kind,
             rules_version=env.rules_version,
             snapshot=snapshot, actor=self.actor, comment=comment,
-            # The complete post-change state (mutation already flushed by the
-            # caller) — what total rollback and pin.rules_version replay read.
-            state=capture_state(self.s, env.id),
+            state=capture_state(self.s, env.id) if checkpoint else None,
         )
         self.s.add(rev)
         self.s.flush()
@@ -405,17 +413,47 @@ class TargetingService:
         ).scalars())
 
     def state_at(self, env_id: str, rules_version: int) -> dict | None:
-        """Return the exact captured state named by ``rules_version``, if any."""
+        """The environment's exact targeting state at ``rules_version``.
+
+        O(1) when that revision is a checkpoint (baseline/rollback/every Kth);
+        otherwise the bounded slow path: take the nearest OLDER checkpoint and
+        forward-apply the ≤K-1 per-object changes up to and including the target.
+        ``None`` only when no revision with that number exists at all.
+
+        Reconstructed states carry ``versions``' tips/labels/status as of the
+        checkpoint — those move without bumping ``rules_version``, the same §9
+        caveat class the checkpointed states already document.
+        """
         if rules_version < 1:
             return None
         rev = self.s.execute(
             select(models.RuleRevision).where(
                 models.RuleRevision.environment_id == env_id,
                 models.RuleRevision.rules_version == rules_version,
-                models.RuleRevision.state.isnot(None),
             )
         ).scalar_one_or_none()
-        return rev.state if rev is not None else None
+        if rev is None:
+            return None
+        if rev.state is not None:
+            return rev.state
+
+        base = self.s.execute(
+            select(models.RuleRevision).where(
+                models.RuleRevision.environment_id == env_id,
+                models.RuleRevision.rules_version < rules_version,
+                models.RuleRevision.state.isnot(None),
+            ).order_by(models.RuleRevision.rules_version.desc())
+        ).scalars().first()
+        if base is None:  # pragma: no cover - every env gets a baseline before mutating
+            return None
+        deltas = self.s.execute(
+            select(models.RuleRevision).where(
+                models.RuleRevision.environment_id == env_id,
+                models.RuleRevision.rules_version > base.rules_version,
+                models.RuleRevision.rules_version <= rules_version,
+            ).order_by(models.RuleRevision.rules_version)
+        ).scalars().all()
+        return _apply_deltas(base.state, deltas)
 
     def _rollback_rules(self, env_id: str, target: dict[str, dict]) -> int:
         """Restore the rule set to ``target`` ({rule_id -> rule snapshot}); rules
@@ -634,6 +672,44 @@ class TargetingService:
         record_audit(self.s, self.actor, "kill.engage" if engaged else "kill.restore",
                      "kill", f"{env_id}/{prompt_id}", after={"engaged": engaged})
         return existing
+
+
+def _apply_deltas(base_state: dict, deltas: list[models.RuleRevision]) -> dict:
+    """Forward-apply per-object revision snapshots onto a checkpoint state (deep
+    copy first — checkpoint states are shared history, never mutated). Every
+    non-checkpoint kind's snapshot fully describes its change: rules carry the
+    whole rule, pointers carry (prompt, version, to_sha) including tombstones,
+    defaults/kills carry their new value, segments their new clauses. Baseline and
+    rollback — the two kinds whose snapshot does NOT describe their effect — are
+    always checkpoints, so they never appear as deltas."""
+    import copy
+    state = copy.deepcopy(base_state)
+    rules = {r["id"]: r for r in state.get("rules", [])}
+    segments = {s["name"]: s for s in state.get("segments", [])}
+    for rev in deltas:
+        snap = rev.snapshot or {}
+        if rev.kind == "rule" and rev.rule_id:
+            rules[rev.rule_id] = snap
+        elif rev.kind == "segment":
+            existing = segments.get(snap.get("name"))
+            version = (existing.get("version", 0) + 1) if existing else 1
+            segments[snap["name"]] = {"name": snap["name"],
+                                      "clauses": snap.get("clauses"),
+                                      "version": version}
+        elif rev.kind == "default":
+            state.setdefault("defaults", {})[snap["prompt_id"]] = snap["version"]
+        elif rev.kind == "kill":
+            kills = set(state.get("kills", []))
+            (kills.add if snap.get("engaged") else kills.discard)(snap["prompt_id"])
+            state["kills"] = sorted(kills)
+        elif rev.kind == "pointer":
+            key = _version_key(snap["prompt_id"], snap["version"])
+            entry = state.setdefault("versions", {}).setdefault(
+                key, {"live": None, "tip": None, "label": None, "status": "active"})
+            entry["live"] = snap.get("to_sha")
+    state["rules"] = list(rules.values())
+    state["segments"] = list(segments.values())
+    return state
 
 
 def _rule_snapshot(r: models.Rule) -> dict:

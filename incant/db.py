@@ -51,6 +51,50 @@ def _discard_after_commit_callbacks(session: Session) -> None:
 # Docker image the whole tree is copied to /app, so this resolves there too.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# ── single full-writer enforcement ───────────────────────────────────
+# Exactly one `full` node may own a database (and its canonical repo): reconcile,
+# backup pushing, sweeps, and staged-publish promotion all assume one writer. The
+# claim is a SESSION-level Postgres advisory lock held on a dedicated connection
+# for the process lifetime — a second full node fails fast at boot instead of
+# quietly double-running the background jobs. If this connection ever drops, the
+# lock releases with it (crashed writers don't wedge the deployment).
+_FULL_WRITER_LOCK_ID = 0x496E6332  # ASCII "Inc2" — distinct from the setup lock
+_writer_conn = None
+
+
+def claim_full_writer_role() -> None:
+    global _writer_conn
+    if _writer_conn is not None:
+        return
+    from sqlalchemy import func, select
+    conn = engine().connect()
+    got = conn.execute(select(func.pg_try_advisory_lock(_FULL_WRITER_LOCK_ID))).scalar()
+    if not got:
+        conn.close()
+        raise RuntimeError(
+            "another `full` Incant node already owns this database (and its canonical "
+            "repo). Exactly one full writer per deployment — run additional nodes "
+            "with INCANT_MODE=serve, or stop the other full node first."
+        )
+    _writer_conn = conn
+
+
+def release_full_writer_role() -> None:
+    global _writer_conn
+    if _writer_conn is not None:
+        try:
+            # Unlock explicitly: a pooled connection's close() returns it to the
+            # pool with its backend session — and the session-level lock — alive.
+            from sqlalchemy import func, select
+            _writer_conn.execute(select(func.pg_advisory_unlock(_FULL_WRITER_LOCK_ID)))
+        except Exception:  # pragma: no cover - conn already dead ⇒ lock already gone
+            pass
+        try:
+            _writer_conn.close()
+        except Exception:  # pragma: no cover - shutdown best-effort
+            pass
+        _writer_conn = None
+
 
 class Base(DeclarativeBase):
     pass

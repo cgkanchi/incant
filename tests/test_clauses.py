@@ -16,7 +16,6 @@ def test_operators():
     assert eval_condition(cond({"flag": "name", "op": "contains", "value": "corp"}), f, {})
     assert eval_condition(cond({"flag": "name", "op": "starts_with", "value": "acme"}), f, {})
     assert eval_condition(cond({"flag": "name", "op": "ends_with", "value": "corp"}), f, {})
-    assert eval_condition(cond({"flag": "name", "op": "matches", "value": r"acme-\w+"}), f, {})
     assert eval_condition(cond({"flag": "count", "op": "gt", "value": 3}), f, {})
     assert eval_condition(cond({"flag": "count", "op": "gte", "value": 5}), f, {})
     assert eval_condition(cond({"flag": "count", "op": "lt", "value": 9}), f, {})
@@ -30,7 +29,7 @@ def test_absent_flag_never_matches_and_never_errors():
     f = {}
     for op, extra in [
         ("eq", {"value": "x"}), ("neq", {"value": "x"}), ("in", {"values": ["x"]}),
-        ("gt", {"value": 1}), ("contains", {"value": "x"}), ("matches", {"value": ".*"}),
+        ("gt", {"value": 1}), ("contains", {"value": "x"}),
     ]:
         assert eval_condition(cond({"flag": "missing", "op": op, **extra}), f, {}) is False
     # exists on an absent flag is simply False

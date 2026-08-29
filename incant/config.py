@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from typing import Literal
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,12 +21,12 @@ class Settings(BaseSettings):
     repo_path: str = "./var/repo"          # canonical git repository (bare)
 
     # Serving
-    default_environment: str = "prod"
-    mode: str = "full"                     # full | serve
+    default_environment: str = Field(default="prod", min_length=1, max_length=32)
+    mode: Literal["full", "serve"] = "full"
 
     # Bind
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = Field(default=8080, ge=1, le=65535)
 
     # Auth: the bootstrap admin key. Empty by default — on first boot with no admin
     # yet, Incant generates a strong random key and prints it once (see
@@ -41,7 +44,7 @@ class Settings(BaseSettings):
     # In-memory API-key cache TTL (seconds). Revocation/issuance is immediate on the
     # local process (invalidate_auth); on multi-replica deployments a change made on
     # one node propagates to the others within this TTL.
-    auth_ttl: float = 5.0
+    auth_ttl: float = Field(default=5.0, gt=0)
 
     # Control-plane poll interval (seconds). The serving hot path never reads the DB
     # itself (§8 "No DB per request"; §10 "the DB is never on the per-request path"); a
@@ -49,7 +52,7 @@ class Settings(BaseSettings):
     # TTL-driven auth reload into memory. This is the poll fallback for the design's
     # Postgres LISTEN/NOTIFY (§7), which names a 2s poll — so a targeting change
     # (including "make live") propagates to every replica in < 2 s.
-    control_poll_seconds: float = 2.0
+    control_poll_seconds: float = Field(default=2.0, gt=0)
 
     # Periodic git↔DB main-commit drift check interval (seconds). `reconcile_main_commits`
     # runs once at boot and then on this cadence (full mode) so governance drift — an
@@ -58,32 +61,40 @@ class Settings(BaseSettings):
     # state"; §5 "Validation first") — stays visible in metrics and /healthz instead of
     # being a boot-only log line. Detect-and-log only: it NEVER flips readiness (a drifted
     # node still serves correct content from the last VALIDATED SHAs).
-    reconcile_interval_seconds: float = 3600.0
+    reconcile_interval_seconds: float = Field(default=3600.0, gt=0)
 
     # Backup pushes (§6, full mode): every this-many seconds, push the full ref set to
     # any enabled remote that is behind main. The interval bounds the content-durability
     # exposure window between a commit landing and its off-site copy. 0 disables the loop
     # (remotes can still be pushed manually via POST /mgmt/remotes/{id}/push).
-    backup_poll_seconds: float = 15.0
+    backup_poll_seconds: float = Field(default=15.0, ge=0)   # 0 disables
 
     # Serve replicas (§13/§15): every this-many seconds, mirror-fetch content from the
     # first enabled remote that answers, so SHAs referenced by fresh targeting become
     # fetchable without a shared volume. 0 disables (shared-volume deployments).
-    content_fetch_seconds: float = 30.0
+    content_fetch_seconds: float = Field(default=30.0, ge=0)  # 0 disables
 
     # Timeout (seconds) for one remote git operation (push/fetch/clone) — a hung ssh
     # must not wedge the backup or fetch loop.
-    backup_timeout_seconds: float = 60.0
+    backup_timeout_seconds: float = Field(default=60.0, gt=0)
 
     # Pinned known_hosts file for ssh remotes (mounted read-only in §15's compose).
     # Empty ⇒ ssh's default resolution.
     known_hosts_path: str = ""
 
+    # Targeting-revision checkpointing (§7): a FULL environment state is materialized
+    # every this-many revisions (plus always on baseline and rollback revisions); the
+    # revisions in between carry only their per-object change. Replay/rollback to a
+    # checkpoint is O(1); to any other revision it reconstructs by forward-applying at
+    # most K-1 per-object changes from the nearest older checkpoint — bounded work,
+    # off the hot path. Storage: O(N/K) states instead of O(N).
+    revision_checkpoint_interval: int = Field(default=20, ge=1)
+
     # Failed-auth throttling: per-client-IP sliding window over FAILED bearer auths.
     # After `limit` failures within `window` seconds, that IP gets 429 (Retry-After)
     # until the window drains. Successful auth is never throttled. limit=0 disables.
-    auth_throttle_limit: int = 20
-    auth_throttle_window: float = 60.0
+    auth_throttle_limit: int = Field(default=20, ge=0)        # 0 disables
+    auth_throttle_window: float = Field(default=60.0, gt=0)
 
     # /metrics access: a Prometheus scraper with no principal can authenticate with
     # `Authorization: Bearer <this>`. Empty ⇒ /metrics requires a real viewer key.
@@ -98,6 +109,17 @@ class Settings(BaseSettings):
     # (request.client.host) is in this list; otherwise the direct peer is used. Empty
     # (default) ⇒ never trust XFF — a client can't spoof its IP past an untrusted hop.
     trusted_proxies: str = ""
+
+    @model_validator(mode="after")
+    def _cross_field(self) -> "Settings":
+        # Fail at BOOT with the actual problem, not at 3am with a tight loop or a
+        # cookie that never arrives. These are the combinations users actually get
+        # wrong; single-field bounds live on the fields above.
+        if self.mode == "serve" and not self.database_url.startswith("postgres"):
+            raise ValueError("serve mode requires a Postgres INCANT_DATABASE_URL")
+        if self.control_poll_seconds < 0.1:
+            raise ValueError("INCANT_CONTROL_POLL_SECONDS below 0.1s is a busy-loop, not a poll")
+        return self
 
     def trusted_proxy_set(self) -> set[str]:
         return {p.strip() for p in self.trusted_proxies.split(",") if p.strip()}

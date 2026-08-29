@@ -80,8 +80,9 @@ def overview(
     # viewer-implying binding anywhere (e.g. a renderer-only service key) must get a
     # clear 403, not an empty library that reads as "no prompts exist".
     if not any("viewer" in _IMPLIES.get(b.role, set()) for b in ident.bindings):
-        raise HTTPException(403, "the library requires a viewer credential; this key "
-                                 "only holds renderer access")
+        raise HTTPException(403, "your account doesn't have viewing access yet — ask "
+                                 "an admin to grant you a role in Access (service "
+                                 "render keys can't browse the library)")
     snap = build_snapshot(session, environment)
     # Bulk-load everything the per-prompt loop needs BEFORE the loop, so the landing
     # screen stays flat as the library grows. It used to fan out — per prompt — into a

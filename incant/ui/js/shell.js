@@ -86,6 +86,7 @@ function signInCard() {
     <input id="setupName" class="signin-input" placeholder="Your name" autocomplete="name" data-enter="setupBtn">
     <input id="setupEmail" type="email" class="signin-input" placeholder="you@company.com" autocomplete="email" data-enter="setupBtn" style="margin-top:8px">
     <input id="setupPassword" type="password" class="signin-input" placeholder="Password (10+ characters)" autocomplete="new-password" data-enter="setupBtn" style="margin-top:8px">
+    <input id="setupProject" class="signin-input" placeholder="Project name — e.g. acme (optional)" spellcheck="false" autocomplete="off" data-enter="setupBtn" style="margin-top:8px">
     <button id="setupBtn" class="btn primary" data-act="doSetup" style="width:100%;margin-top:12px">Create admin account</button>
     <div class="err" id="signinErr" style="margin-top:8px"></div>
     <div class="signin-hint"><button type="button" class="link btn-bare" data-act="signinMode" data-mode="key">Sign in with an API key instead</button></div>`;

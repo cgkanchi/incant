@@ -12,7 +12,7 @@ from incant.core import (
 from .conftest import DictContent, snapshot, vinfo
 
 SYS = "support/system"
-FRAG = "shared/style/language-rules"
+FRAG = "support/style/language-rules"
 
 
 def test_basic_render():
@@ -71,7 +71,7 @@ def test_guarded_optional_renders_when_missing():
 def test_fragments_optional_var_is_lenient_across_closure():
     # A guarded-optional variable inside an included fragment renders leniently too.
     content = DictContent({
-        (SYS, "c1"): 'top {% include "shared/style/language-rules" %}',
+        (SYS, "c1"): 'top {% include "support/style/language-rules" %}',
         (FRAG, "f1"): "{% if extra %}{{ extra }}{% endif %}frag",
     })
     snap = snapshot(
@@ -90,7 +90,7 @@ def test_defaults_applied_pre_render():
 
 def test_include_resolves_through_targeting():
     content = DictContent({
-        (SYS, "c1"): 'A {% include "shared/style/language-rules" %} B',
+        (SYS, "c1"): 'A {% include "support/style/language-rules" %} B',
         (FRAG, "f1"): "PLAIN-ENGLISH",
     })
     snap = snapshot(
@@ -107,7 +107,7 @@ def test_include_resolves_through_targeting():
 def test_include_follows_flag_targeting():
     # A rule targets the fragment's v2 for enterprise; everyone else gets v1.
     content = DictContent({
-        (SYS, "c1"): '[{% include "shared/style/language-rules" %}]',
+        (SYS, "c1"): '[{% include "support/style/language-rules" %}]',
         (FRAG, "f1"): "v1-rules",
         (FRAG, "f2"): "v2-rules",
     })
@@ -128,7 +128,7 @@ def test_include_follows_flag_targeting():
 def test_nested_fragment_defaults_follow_resolved_versions():
     leaf = "shared/leaf"
     content = DictContent({
-        (SYS, "c1"): '{% include "shared/style/language-rules" %}',
+        (SYS, "c1"): '{% include "support/style/language-rules" %}',
         (FRAG, "f1"): 'style={% include "shared/leaf" %}',
         (leaf, "l1"): "{{ tone }}-{{ audience }}",
     })
@@ -149,7 +149,7 @@ def test_nested_fragment_defaults_follow_resolved_versions():
 
 def test_fragment_default_follows_flag_targeted_version():
     content = DictContent({
-        (SYS, "c1"): '{% include "shared/style/language-rules" %}',
+        (SYS, "c1"): '{% include "support/style/language-rules" %}',
         (FRAG, "f1"): "{{ voice }}", (FRAG, "f2"): "{{ voice }}",
     })
     snap = snapshot(
@@ -171,7 +171,7 @@ def test_fragment_default_follows_flag_targeted_version():
 
 def test_conflicting_contributor_defaults_are_rejected():
     content = DictContent({
-        (SYS, "c1"): '{% include "shared/style/language-rules" %}',
+        (SYS, "c1"): '{% include "support/style/language-rules" %}',
         (FRAG, "f1"): "{{ tone }}",
     })
     snap = snapshot(
@@ -239,7 +239,7 @@ def test_pin_bypasses_targeting():
 
 def test_pin_bypasses_include_targeting():
     content = DictContent({
-        (SYS, "c1"): '[{% include "shared/style/language-rules" %}]',
+        (SYS, "c1"): '[{% include "support/style/language-rules" %}]',
         (FRAG, "f1"): "v1-rules", (FRAG, "f2"): "v2-rules",
     })
     snap = snapshot(
@@ -294,3 +294,28 @@ def test_content_fallback_flag_propagates():
     r = render(snap, SYS, {}, {}, content)
     assert r.text == "old-content" and r.content_fallback is True
     assert r.contributions[SYS].content_fallback is True
+
+
+def test_compiled_cache_thread_safe_under_churn(monkeypatch):
+    # Sync routes run in a thread pool: the LRU's compound get/move/evict must hold
+    # under contention with a deliberately tiny capacity forcing constant eviction.
+    import concurrent.futures as cf
+
+    import sys
+
+    import incant.core.render  # noqa: F401 — the package re-exports the render FUNCTION
+    render_mod = sys.modules["incant.core.render"]  # under the same name; go via sys.modules
+
+    monkeypatch.setattr(render_mod, "_CACHE_MAX", 4)
+
+    def churn(worker: int) -> str:
+        for i in range(300):
+            blob = f"w{worker}-b{i % 9}"
+            render_mod._compile(render_mod._ENV, blob, f"text {worker} {i % 9}", blob)
+            render_mod._extract_cached(blob, f"{{{{ v{i % 9} }}}}")
+        return "ok"
+
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        results = [f.result() for f in [pool.submit(churn, w) for w in range(8)]]
+    assert results == ["ok"] * 8
+    assert len(render_mod._COMPILED) <= 4 and len(render_mod._EXTRACT) <= 4

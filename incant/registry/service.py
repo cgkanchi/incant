@@ -73,8 +73,20 @@ class RegistryService:
 
     def ensure_project(self, project_id: str, review_policy: int = 0,
                        allow_self_review: bool = True) -> models.Project:
+        """The deployment's project — exactly ONE per database. The first call
+        names it (setup screen, seed, or the first prompt's prefix); every later
+        call must match. Multi-project is deliberately a multi-deployment (and,
+        later, a schema-sharding) story, not an in-database one — it keeps RBAC,
+        keys, and the library free of a cross-project mental model."""
         p = self.s.get(models.Project, project_id)
         if p is None:
+            existing = self.s.execute(select(models.Project)).scalars().first()
+            if existing is not None:
+                raise RegistryError(
+                    f"this deployment's project is {existing.id!r} — prompt ids must "
+                    f"start with {existing.id!r}/. One project per deployment; run "
+                    "another instance (or database) for another project."
+                )
             p = models.Project(id=project_id, name=project_id, review_policy=review_policy,
                                allow_self_review=allow_self_review)
             self.s.add(p)

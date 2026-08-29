@@ -61,4 +61,4 @@ jobs:
           INCANT_BROWSER_TESTS: "1"
           INCANT_BROWSER_CHROME: /usr/bin/google-chrome
           INCANT_TEST_DATABASE_URL: postgresql+psycopg://incant:incant@localhost:5432/incant
-        run: uv run --group browser pytest tests/browser -q
+        run: uv run --group browser pytest tests/browser -v

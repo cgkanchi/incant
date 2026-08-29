@@ -271,11 +271,12 @@ class RuleRevision(Base):
     kind: Mapped[str] = mapped_column(String)                           # rule | segment | pointer | default | kill
     rules_version: Mapped[int] = mapped_column(Integer, default=1, index=True)  # env rules_version after this change
     snapshot: Mapped[Any] = mapped_column(JSON)                         # the changed object (revision-list display)
-    # COMPLETE environment targeting state after this change (rules, segments,
-    # defaults, kills, live pointers, tips, labels) — what makes rollback total and
-    # pin.rules_version replay possible. Nullable: rows from before the upgrade have
-    # only the per-object snapshot; state-based features fall back gracefully there.
-    state: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    # COMPLETE environment targeting state after this change — materialized only on
+    # CHECKPOINT revisions (baseline/rollback/every Kth); other revisions carry only
+    # their per-object snapshot and reconstruct via state_at's forward replay.
+    # none_as_null matters: a Python None must land as SQL NULL, or the
+    # `state IS NOT NULL` checkpoint queries would happily return JSON-null rows.
+    state: Mapped[Optional[Any]] = mapped_column(JSON(none_as_null=True), nullable=True)
     actor: Mapped[str] = mapped_column(String, default="")
     at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     comment: Mapped[str] = mapped_column(Text, default="")

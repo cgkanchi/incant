@@ -251,10 +251,12 @@ class AppContext:
         """A historical targeting snapshot for §9 ``pin.rules_version`` replay.
 
         A response's ``rules_version`` always names an exact revision, so replay
-        requires an EXACT state-carrying revision — anything else is a caller error,
-        answered honestly (422 with the ``pin.versions`` alternative) rather than
-        approximated. The one DB read sits off the common path (replays only) and
-        the result is memoized — a revision's state never changes."""
+        requires that revision to EXIST — anything else is a caller error, answered
+        honestly (422 with the ``pin.versions`` alternative) rather than
+        approximated. Checkpoint revisions resolve O(1); the rest reconstruct from
+        the nearest older checkpoint (bounded by the checkpoint interval). The DB
+        reads sit off the common path (replays only) and the result is memoized —
+        history never changes."""
         current = self.get_snapshot(session, env_id)
         if rules_version == current.rules_version:
             return current
@@ -264,24 +266,18 @@ class AppContext:
             self._historical.move_to_end(key)
             return hit
         try:
-            rev = session.execute(
-                select(models.RuleRevision).where(
-                    models.RuleRevision.environment_id == env_id,
-                    models.RuleRevision.rules_version == rules_version,
-                    models.RuleRevision.state.isnot(None),
-                ).order_by(models.RuleRevision.id.desc())
-            ).scalars().first()
+            state = self.targeting(session).state_at(env_id, rules_version)
         except SQLAlchemyError:
             raise ServingError(503, "targeting replay unavailable: control plane "
                                     "unreachable (pin.versions replay stays memory-only)")
-        if rev is None:
+        if state is None:
             raise ServingError(
                 422,
                 f"rules_version {rules_version} has no recorded targeting state for "
                 f"{env_id!r} (it may predate state-tracked revisions); replay with "
                 "pin.versions instead — the response's versions map is SHA-exact",
             )
-        snap = snapshot_from_state(rev.state, env_id, rules_version, current.servable)
+        snap = snapshot_from_state(state, env_id, rules_version, current.servable)
         # Variable defaults ride along from the live snapshot: refinements are
         # authoring metadata, not targeting state (documented replay semantics).
         snap.refinement_defaults = current.refinement_defaults

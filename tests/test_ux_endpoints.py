@@ -36,7 +36,7 @@ def test_project_scoped_rules_read(client):
     assert client.post(
         "/mgmt/envs/prod/rules",
         json={"id": "shared-only", "scope": "prompt",
-              "prompt_id": "shared/style/language-rules", "priority": 30,
+              "prompt_id": "support/style/language-rules", "priority": 30,
               "serve": {"version": 1}, "comment": "shared project rule"},
         headers=auth()).status_code == 200
     assert client.post(
@@ -61,14 +61,13 @@ def test_project_scoped_rules_read(client):
     body = r.json()
     ids = {rule["id"] for rule in body["rules"]}
     assert {"beta-gets-v3", "team-x-tip"} <= ids   # support's own prompt-scoped rules
-    assert "glob-voice" in ids                      # global rules govern every project's prompts
-    assert "shared-only" not in ids                 # another project's rule stays hidden
-    # Every returned prompt-scoped rule really is support's (global rules aside).
+    assert "glob-voice" in ids                      # global rules govern every prompt
+    # One project per deployment: every prompt-scoped rule belongs to it, so the
+    # project-scoped read shows the fragment's rule too — nothing foreign exists.
+    assert "shared-only" in ids
     for rule in body["rules"]:
         assert rule["scope"] == "global" or rule["prompt_id"].split("/", 1)[0] == "support"
-    # kills/defaults are filtered to the project too, for internal consistency.
     assert all(k.split("/", 1)[0] == "support" for k in body["defaults"])
-    assert "shared/style/language-rules" not in body["defaults"]
     assert all(k.split("/", 1)[0] == "support" for k in body["kills"])
 
 
@@ -84,7 +83,7 @@ def test_env_wide_rules_read_unchanged(client):
     # defaults span BOTH projects (no project filter applied) — support/system and the shared
     # fragment both carry a prod default in the seed.
     assert body["defaults"]["support/system"] == 2
-    assert "shared/style/language-rules" in body["defaults"]
+    assert "support/style/language-rules" in body["defaults"]
     # passing project=None explicitly (query absent) is the unfiltered path; the shape carries
     # kills + defaults maps as before.
     assert "kills" in body and "defaults" in body
@@ -102,12 +101,14 @@ def test_overview_drafts_needing_review(client):
     assert sys["open_drafts"] == 1
     assert sys["drafts_needing_review"] == 1
 
-    # A no-review project (a freshly created project defaults to review_policy 0): an open
-    # draft there is in-flight but does NOT "need review".
-    client.post("/mgmt/prompts", json={"prompt_id": "growth/welcome"}, headers=auth())
-    client.post("/mgmt/prompts/growth/welcome/drafts",
+    # Under review_policy 0 an open draft is in-flight but does NOT "need review".
+    # One project per deployment, so the contrast is temporal: relax the policy,
+    # then a new draft counts as open without needing review.
+    client.patch("/mgmt/projects/support", json={"review_policy": 0}, headers=auth())
+    client.post("/mgmt/prompts", json={"prompt_id": "support/welcome"}, headers=auth())
+    client.post("/mgmt/prompts/support/welcome/drafts",
                 json={"version_number": 1, "content": "Hi {{ name }}"}, headers=auth())
-    welcome = rows_by_id()["growth/welcome"]
+    welcome = rows_by_id()["support/welcome"]
     assert welcome["open_drafts"] == 1
     assert welcome["drafts_needing_review"] == 0     # policy 0 → nothing to review
 
@@ -192,10 +193,14 @@ def test_scoped_viewer_end_to_end(client):
     assert client.get("/mgmt/envs/prod/pointers?prompt_id=support/system&version=2",
                       headers=auth(v)).status_code == 200
 
-    # Scoping still enforced: the SAME key can't read another project's versions or variables.
-    assert client.get("/mgmt/prompts/shared/style/language-rules/versions?environment=prod",
-                      headers=auth(v)).status_code == 403
-    assert client.get("/mgmt/prompts/shared/style/language-rules/variables?version=1",
+    # One project per deployment: the project-scoped viewer reads EVERY prompt here
+    # (there is no foreign project to hide) — env scoping remains the real boundary.
+    assert client.get("/mgmt/prompts/support/style/language-rules/versions?environment=prod",
+                      headers=auth(v)).status_code == 200
+    assert client.get("/mgmt/prompts/support/style/language-rules/variables?version=1",
+                      headers=auth(v)).status_code == 200
+    # A different ENVIRONMENT stays out of reach for the (project, prod)-scoped key.
+    assert client.get("/mgmt/prompts/support/system/versions?environment=staging",
                       headers=auth(v)).status_code == 403
 
 
@@ -210,7 +215,7 @@ def test_env_wide_revisions_and_history_unchanged(client):
     full = client.get("/mgmt/envs/prod/revisions", headers=auth()).json()["revisions"]
     assert any(rev.get("rule_id") == "glob-test" for rev in full)     # global-rule revision kept
     assert any(rev["kind"] == "segment" for rev in full)              # segment revision kept
-    assert any((rev["snapshot"] or {}).get("prompt_id") == "shared/style/language-rules"
+    assert any((rev["snapshot"] or {}).get("prompt_id") == "support/style/language-rules"
                for rev in full)                                       # cross-project default kept
 
     # An env-wide viewer (project=None, env=prod) reads both, unchanged.

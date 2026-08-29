@@ -201,7 +201,9 @@ const Actions = {
     if (!name || !email || !password) { if (errEl) errEl.textContent = "Fill in name, email, and a password."; return; }
     let session;
     try {
-      session = await POST("/auth/setup", { name, email, password });
+      session = await POST("/auth/setup",
+                           { name, email, password,
+                             project: (el("setupProject")?.value || "").trim() || null });
     } catch (e) {
       const msg = e && e.status === 409 ? "Setup already happened — sign in instead" : errText(e);
       if (errEl) errEl.textContent = msg; else toast(msg, true);
@@ -786,11 +788,10 @@ const Actions = {
         <input id="invEmail" type="email" placeholder="them@company.com" data-enter="invBtn"></div>
       <div class="field"><label>Name (optional)</label>
         <input id="invName" placeholder="Their name" data-enter="invBtn"></div>
-      <div class="field"><label>Starting role (optional)</label>
-        <select id="invRole"><option value="">— no role yet —</option>${_roleOpts("")}</select></div>
-      <div class="field"><label>Scope</label>
-        <div style="display:flex;gap:8px"><select id="invProject" style="flex:1">${_projectOpts()}</select>
-        <select id="invEnv" style="flex:1">${_envOpts()}</select></div></div>
+      <div class="field"><label>Starting role</label>
+        <select id="invRole">${_roleOpts("viewer")}</select></div>
+      <div class="field"><label>Environment scope</label>
+        <select id="invEnv" style="width:100%">${_envOpts()}</select></div>
       <div class="err" id="invErr"></div>
       <div class="modal-actions">
         <button class="btn" data-act="closeModal">Cancel</button>
@@ -806,7 +807,7 @@ const Actions = {
     const role = el("invRole")?.value || "";
     if (role) {
       body.role = role;
-      body.project_id = el("invProject")?.value || null;
+      body.project_id = null;  // one project per deployment
       body.environment_id = el("invEnv")?.value || null;
     }
     try {
@@ -881,7 +882,6 @@ const Actions = {
       <div class="field"><label>Name</label>
         <input id="auName" placeholder="e.g. dana or ci-deploy" spellcheck="false"></div>
       <div class="field"><label>Role</label><select id="auRole" class="envsel" style="width:100%">${_roleOpts("editor")}</select></div>
-      <div class="field"><label>Project scope</label><select id="auProject" class="envsel" style="width:100%">${_projectOpts()}</select></div>
       <div class="field"><label>Environment scope</label><select id="auEnv" class="envsel" style="width:100%">${_envOpts()}</select></div>
       <div class="field"><label>Expires in (days) <span style="text-transform:none;font-weight:400">· optional, blank = never</span></label>
         <input id="auExpires" type="number" min="1" placeholder="never" spellcheck="false"></div>
@@ -897,7 +897,7 @@ const Actions = {
     try {
       const body = {
         principal_name: name, role: el("auRole").value,
-        project_id: el("auProject").value || null, environment_id: el("auEnv").value || null,
+        project_id: null, environment_id: el("auEnv").value || null,
       };
       const days = parseInt((el("auExpires") && el("auExpires").value) || "", 10);
       if (!isNaN(days) && days > 0) body.expires_in_days = days;
@@ -911,7 +911,6 @@ const Actions = {
       <h3>Add role</h3>
       <p class="hint">Grant another role to this user, optionally scoped to a project and/or environment.</p>
       <div class="field"><label>Role</label><select id="abRole" class="envsel" style="width:100%">${_roleOpts("viewer")}</select></div>
-      <div class="field"><label>Project scope</label><select id="abProject" class="envsel" style="width:100%">${_projectOpts()}</select></div>
       <div class="field"><label>Environment scope</label><select id="abEnv" class="envsel" style="width:100%">${_envOpts()}</select></div>
       <div class="modal-actions">
         <button class="btn" data-act="closeModal">Cancel</button>
@@ -922,7 +921,7 @@ const Actions = {
     try {
       await POST(`/mgmt/principals/${enc(ds.pid)}/bindings`, {
         role: el("abRole").value,
-        project_id: el("abProject").value || null, environment_id: el("abEnv").value || null,
+        project_id: null, environment_id: el("abEnv").value || null,
       });
       closeModal();
       toast("Role added");

@@ -1,4 +1,7 @@
-# Docker-first deployment: the app image plus Postgres.
+# DEVELOPMENT compose: the app image plus Postgres with default credentials and
+# the database port published to localhost — convenient locally, NOT a production
+# posture. For production follow docs/DEPLOYING.md: real secrets, no published DB
+# port, TLS at a proxy in front, and backup remotes registered.
 # Two durable volumes: `content` (canonical repo — back up off-site via git remotes)
 # and `pgdata` (control plane — normal Postgres backups). `cache` is rebuildable.
 services:

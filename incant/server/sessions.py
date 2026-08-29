@@ -196,8 +196,19 @@ def initial_setup(
     user.status = "active"
     user.last_login_at = dt.datetime.now(dt.timezone.utc)
     session.add(models.RoleBinding(principal_id=user.principal_id, role="admin"))
+    # Optionally name the deployment's ONE project here (the natural moment); the
+    # first prompt's prefix can also claim it later. Same slug rules as env ids.
+    project = (req.project or "").strip().lower()
+    if project:
+        import re
+        if not re.fullmatch(r"[a-z0-9]([a-z0-9_-]*[a-z0-9])?", project) or len(project) > 32:
+            raise HTTPException(422, "project name: 1–32 lowercase letters, digits, "
+                                     "'-' or '_' (starting and ending alphanumeric)")
+        from ..registry import RegistryService
+        RegistryService(session, get_app().git, get_app().content).ensure_project(project)
     record_audit(session, user.email, "auth.setup", "user", user.id,
-                 after={"email": user.email, "role": "admin"})
+                 after={"email": user.email, "role": "admin",
+                        "project": project or None})
     get_app().invalidate_auth_after_commit(session)
     return _mint_session(request, response, session,
                          _ident_for_user(session, user), remember=False)

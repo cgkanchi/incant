@@ -7,6 +7,7 @@ LRU-bounded — a blob's bytes never change, so entries are never invalidated.
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 
 from ..core import ContentBlob
@@ -25,10 +26,18 @@ def _record_git_read() -> None:
 
 
 class ContentStore:
+    """Deliberately in-process (no Redis/valkey tier): this cache IS the memory-first
+    hot path — content-addressed, immutable, per-replica, warmed from the replica's
+    own repo copy. An external cache would put a network hop inside every render to
+    share state that nothing needs shared (git is already the durable common layer).
+    FastAPI's sync routes run in a thread pool, so the compound LRU operations are
+    guarded by a mutex; the critical sections are dict lookups, never git I/O."""
+
     def __init__(self, git: GitStore, cache_max: int = 4096) -> None:
         self.git = git
         self._cache: OrderedDict[str, ContentBlob] = OrderedDict()
         self._cache_max = cache_max
+        self._lock = threading.Lock()
         self.misses = 0
 
     @staticmethod
@@ -39,21 +48,26 @@ class ContentStore:
         path = self._path(prompt_id, version)
         # Cache key is the (commit, path) pair; the blob within is content-addressed.
         key = f"{commit_sha}:{path}"
-        hit = self._cache.get(key)
-        if hit is not None:
-            self._cache.move_to_end(key)
-            return hit
-        self.misses += 1
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit is not None:
+                self._cache.move_to_end(key)
+                return hit
+            self.misses += 1
+        # The git read happens OUTSIDE the lock — a cold miss must not serialize
+        # every warm hit behind a subprocess. Two racing misses on one key both
+        # read; the second insert is a harmless identical overwrite (immutable).
         _record_git_read()  # serving fell through to git (cold/evicted blob or old pin)
         source = self.git.read(path, ref=commit_sha)
         if source is None:
             raise KeyError(f"{path} not present at {commit_sha}")
         blob_sha = self.git.blob_sha(path, ref=commit_sha) or ""
         blob = ContentBlob(blob_sha=blob_sha, source=source)
-        self._cache[key] = blob
-        self._cache.move_to_end(key)
-        if len(self._cache) > self._cache_max:
-            self._cache.popitem(last=False)
+        with self._lock:
+            self._cache[key] = blob
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_max:
+                self._cache.popitem(last=False)
         return blob
 
     def warm(self, prompt_id: str, version: int, commit_sha: str) -> ContentBlob:

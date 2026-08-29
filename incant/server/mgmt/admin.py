@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ... import models
 from ..auth import _IMPLIES, Identity, issue_api_key
 from ..deps import app_context, get_session, identity
+from ...registry import RegistryError
 from ...service import AppContext
 from ..schemas import (
     BindingRequest,
@@ -77,8 +78,11 @@ def create_project(
 ):
     _require(ident, "admin")
     reg = app.registry(session, ident.name)
-    reg.ensure_project(req.id, review_policy=req.review_policy,
-                       allow_self_review=req.allow_self_review)
+    try:
+        reg.ensure_project(req.id, review_policy=req.review_policy,
+                           allow_self_review=req.allow_self_review)
+    except RegistryError as exc:
+        raise HTTPException(409, str(exc))
     return {"ok": True, "id": req.id}
 
 

@@ -3,7 +3,7 @@
 
 // ── describe rules ───────────────────────────────────────────────────
 const OPSYM = { eq: "=", neq: "≠", in: "∈", not_in: "∉", contains: "⊇", starts_with: "starts", ends_with: "ends",
-  matches: "~", gt: ">", gte: "≥", lt: "<", lte: "≤", semver_gt: "semver>", semver_lt: "semver<", exists: "exists" };
+  gt: ">", gte: "≥", lt: "<", lte: "≤", semver_gt: "semver>", semver_lt: "semver<", exists: "exists" };
 function describeWhen(c) {
   if (c == null) return '<span class="muted">always</span>';
   if (c.all) return c.all.map(describeWhen).join(' <span class="muted">and</span> ');
@@ -215,7 +215,7 @@ function ctxFormHtml(dp) {
 const CLAUSE_OPS = [
   ["eq", "is"], ["neq", "is not"], ["in", "is one of"], ["not_in", "is not one of"],
   ["contains", "contains"], ["starts_with", "starts with"], ["ends_with", "ends with"],
-  ["matches", "matches regex"], ["gt", ">"], ["gte", "≥"], ["lt", "<"], ["lte", "≤"],
+  ["gt", ">"], ["gte", "≥"], ["lt", "<"], ["lte", "≤"],
   ["semver_gt", "semver >"], ["semver_lt", "semver <"], ["exists", "exists"],
 ];
 

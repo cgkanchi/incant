@@ -332,3 +332,21 @@ def test_password_change_rotates_and_revokes_other_sessions(tmp_path):
         client.cookies.clear()
         assert _login(client, password=PW).status_code == 401
         assert _login(client, password="an-even-better-one").status_code == 200
+
+
+def test_setup_can_name_the_deployments_project(tmp_path):
+    with make_client(tmp_path) as client:
+        # NOTE: make_client seeds project `support`, so use a fresh-DB shaped check:
+        # the seeded project already exists — naming it again is idempotent, naming
+        # a different one is refused (one project per deployment).
+        r = client.post("/auth/setup", json={"name": "Pat", "email": EMAIL,
+                                             "password": PW, "project": "support"})
+        assert r.status_code == 200, r.text
+        r2 = client.post("/mgmt/projects", json={"id": "acme"}, headers=auth())
+        assert r2.status_code == 409
+        # Slug rules enforced at setup too.
+        client.cookies.clear()
+        with make_client(tmp_path / "b") as c2:
+            r = c2.post("/auth/setup", json={"name": "Pat", "email": EMAIL,
+                                             "password": PW, "project": "Bad Name!"})
+            assert r.status_code == 422

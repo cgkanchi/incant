@@ -177,6 +177,14 @@ Chrome/Chromium binary if yours lives elsewhere.
 | `INCANT_AUTH_THROTTLE_WINDOW` | `60.0` | sliding window (s) for the failed-auth throttle |
 | `INCANT_TRUSTED_PROXIES` | *(empty)* | comma-separated proxy IPs whose `X-Forwarded-For` is trusted for the client IP; empty ⇒ never trust XFF (use the direct peer) |
 
+## Deploying
+
+Production topology, the hardening checklist, and the restore drill live in
+[docs/DEPLOYING.md](./docs/DEPLOYING.md). The bundled docker-compose is a
+development convenience, not a production posture. One deployment hosts exactly
+**one project** (named at first-run setup); run another instance for another
+project.
+
 ## Security
 
 Incant authenticates every request; there is no side door. A few operational notes:

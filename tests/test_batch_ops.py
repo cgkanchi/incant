@@ -73,13 +73,15 @@ def test_rules_batch_rbac_scopes(client):
             "priority": 12, "serve": {"version": 2}, "comment": "own project"}]
     assert client.post("/mgmt/envs/staging/rules/batch", json={"rules": own},
                        headers=auth(op)).status_code == 200
-    # A prompt-scoped rule for ANOTHER project ANYWHERE in the batch -> 403; and because
-    # authz is checked before any upsert, the sibling own-project rule persists nothing.
+    # A GLOBAL rule ANYWHERE in the batch needs env-wide operator -> 403 for the
+    # project-scoped key; and because authz is checked before any upsert, the
+    # sibling prompt-scoped rule persists nothing. (One project per deployment:
+    # global rules are the surviving higher-authority surface.)
     mixed = [
         {"id": "own-2", "scope": "prompt", "prompt_id": "support/system",
          "priority": 13, "serve": {"version": 2}, "comment": "own project"},
-        {"id": "other-1", "scope": "prompt", "prompt_id": "shared/style/language-rules",
-         "priority": 14, "serve": {"version": 1}, "comment": "another project"},
+        {"id": "other-1", "scope": "global",
+         "priority": 14, "serve": {"version": 1}, "comment": "needs env-wide"},
     ]
     r = client.post("/mgmt/envs/staging/rules/batch", json={"rules": mixed}, headers=auth(op))
     assert r.status_code == 403, r.text
