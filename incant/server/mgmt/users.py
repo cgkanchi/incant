@@ -81,7 +81,7 @@ def invite_user(
     token = issue_invite(user)
     record_audit(session, ident.name, "user.invite", "user", user.id,
                  after={"email": user.email, "role": req.role})
-    app.invalidate_auth()
+    app.invalidate_auth_after_commit(session)
     return _invite_response(user, token)
 
 
@@ -146,5 +146,5 @@ def set_user_status(
         user.status = "active" if user.password_hash else "invited"
         record_audit(session, ident.name, "user.enable", "user", user.id,
                      before={"status": before}, after={"status": user.status})
-    app.invalidate_auth()
+    app.invalidate_auth_after_commit(session)
     return {"user": user_payload(user)}

@@ -395,18 +395,23 @@ work even during a DB outage.
 
 ### Lifecycle, audit, propagation
 
-Every targeting mutation (rules, segments, pointers, defaults, kills) writes a
-`rule_revisions` row (actor, at, comment) carrying BOTH the changed object and the
-environment's **complete post-change targeting state** (rules, segments, defaults,
-kills, live pointers, tips, labels — SHAs only, never content), and bumps the
-environment's monotonic **`rules_version`**. That full-state capture is what makes
-rollback *total* — restoring rules, segments, defaults, kills, and pointers
-(pointer restoration appends new moves; the history stays append-only) — and what
-makes §9's `pin.rules_version` replay possible. Rollback to a pre-upgrade revision
-(no recorded state) degrades to rules-only reconstruction and says so. Nodes hold
-rule snapshots in memory; a 2s control-plane poll propagates bumps (see
-Divergences: LISTEN/NOTIFY is deliberately unbuilt). Target: any targeting change —
-including "make live" — serves everywhere in **< 2 s**.
+Every targeting mutation (rules, segments, pointers, defaults, kills) runs under
+its environment's row lock and writes a `rule_revisions` row (actor, at, comment)
+carrying BOTH the changed object and the environment's **complete post-change
+targeting state** (rules, segments, defaults, kills, live pointers, tips, labels —
+SHAs only, never content), then bumps the environment's monotonic
+**`rules_version`** (unique per environment — the lock makes each revision a true
+serial history point, so no captured state can miss a concurrent change).
+Environments get an exact **baseline revision** before their first mutation. That
+full-state capture is what makes rollback **exact**: it requires an exact recorded
+revision and restores rules (extras deleted; their revision history remains),
+segments, defaults, kills, and pointers — pointer restoration appends new moves,
+including `to_sha = NULL` **tombstones** for pointers that did not exist at the
+target, so the history stays append-only and the §10 fallback never reaches past
+an un-make-live. The same capture is what makes §9's `pin.rules_version` replay
+possible. Nodes hold rule snapshots in memory; a 2s control-plane poll propagates
+bumps (see Divergences: LISTEN/NOTIFY is deliberately unbuilt). Target: any
+targeting change — including "make live" — serves everywhere in **< 2 s**.
 
 ---
 
@@ -702,8 +707,9 @@ test_contexts(id, prompt_id, name, flags, variables)
 drafts(id, prompt_id, version_number?, base_sha, git_ref, author, status)
 reviews(id, draft_id, reviewer, state)  review_comments(...)
 environments(id, name, protected, track_tip)
-pointer_moves(environment_id, prompt_id, version_number, from_sha?, to_sha,
+pointer_moves(environment_id, prompt_id, version_number, from_sha?, to_sha?,
               moved_by, moved_at, comment)      -- append-only; current live = newest row
+                                                --   (NULL to_sha = rollback tombstone)
 env_defaults(environment_id, prompt_id, version_number)
 segments(id, environment_id, name, clauses, version)
 rules(id, environment_id, scope, prompt_id?, priority, clauses, serve, status, comment)

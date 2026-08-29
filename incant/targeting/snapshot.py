@@ -6,8 +6,7 @@ plain-data snapshot the render hot path can evaluate against with no further I/O
 
 from __future__ import annotations
 
-import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -53,53 +52,20 @@ def _validated_order(session: Session) -> dict[tuple[str, int], list[str]]:
     return by_version
 
 
-# Servability fallback memo for (prompt, sha) pairs OUTSIDE the referenced set — an
-# exotic old rule pin or request pin reaching past the windowed history. Positive
-# answers are immutable facts (validation rows are never deleted) and cache forever;
-# negatives expire after a short TTL (the SHA may simply not be validated YET).
-# Bounded LRU; a DB outage during a lookup returns False (fail closed: §5's "only
-# validated SHAs serve" beats availability for a pin no warm state can vouch for)
-# and is never cached.
-_FALLBACK_MEMO: "OrderedDict[tuple[str, str], tuple[bool, float]]" = OrderedDict()
-_FALLBACK_MEMO_MAX = 8192
-_FALLBACK_NEG_TTL = 30.0
-
-
 def clear_servable_memo() -> None:
-    """Reset the fallback memo (tests / service reset — commit SHAs are
-    deterministic under INCANT_FIXED_GIT_DATE, so entries could leak across
-    freshly-reset databases)."""
-    _FALLBACK_MEMO.clear()
+    """Compatibility no-op: servability now lives entirely in each snapshot."""
 
 
-def _validated_in_db(prompt_id: str, sha: str) -> bool:
-    key = (prompt_id, sha)
-    hit = _FALLBACK_MEMO.get(key)
-    if hit is not None:
-        ok, at = hit
-        if ok or (time.time() - at) < _FALLBACK_NEG_TTL:
-            _FALLBACK_MEMO.move_to_end(key)
-            return ok
-    from ..db import session_factory  # lazy: keep module import-light for pure tests
-    try:
-        s = session_factory()()
-        try:
-            ok = s.execute(
-                select(models.CommitValidation.id).where(
-                    models.CommitValidation.prompt_id == prompt_id,
-                    models.CommitValidation.sha == sha,
-                    models.CommitValidation.status == "valid",
-                ).limit(1)
-            ).first() is not None
-        finally:
-            s.close()
-    except Exception:
-        return False  # outage: fail closed, cache nothing
-    _FALLBACK_MEMO[key] = (ok, time.time())
-    _FALLBACK_MEMO.move_to_end(key)
-    if len(_FALLBACK_MEMO) > _FALLBACK_MEMO_MAX:
-        _FALLBACK_MEMO.popitem(last=False)
-    return ok
+def _validated_index(session: Session) -> set[tuple[str, int, str]]:
+    """Load immutable validation facts while building the control-plane snapshot."""
+    rows = session.execute(
+        select(
+            models.CommitValidation.prompt_id,
+            models.CommitValidation.version_number,
+            models.CommitValidation.sha,
+        ).where(models.CommitValidation.status == "valid")
+    ).all()
+    return {(prompt_id, version, sha) for prompt_id, version, sha in rows}
 
 
 def _pointer_history(session: Session, env_id: str) -> dict[tuple[str, int], list[str]]:
@@ -127,8 +93,15 @@ def _pointer_history(session: Session, env_id: str) -> dict[tuple[str, int], lis
         .order_by(ranked.c.prompt_id, ranked.c.version_number, ranked.c.rn)
     ).all()
     hist: dict[tuple[str, int], list[str]] = defaultdict(list)
+    tombstoned: set[tuple[str, int]] = set()
     for pid, ver, to_sha in rows:         # rn-ascending == newest move first within each key
-        hist[(pid, ver)].append(to_sha)
+        key = (pid, ver)
+        if key in tombstoned:
+            continue
+        if to_sha is None:
+            tombstoned.add(key)
+            continue
+        hist[key].append(to_sha)
     return hist
 
 
@@ -188,24 +161,8 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
         raise KeyError(f"unknown environment {env_id!r}")
 
     validated_by_version = _validated_order(session)
+    validated_index = _validated_index(session)
     pointer_hist = _pointer_history(session, env_id)
-
-    # Servability (§7 defense-in-depth, read-side backstop to the write-time
-    # (prompt, version, SHA) integrity checks in make_live/_validate_rule_targets).
-    # The closure answers from the REFERENCED pair set — every (prompt, sha) this
-    # snapshot itself enumerates: recent validated history (tips), the live-pointer
-    # history (§10 fallbacks), and explicit rule SHA pins. That bounds the per-
-    # rebuild work to what targeting references, O(referenced) instead of O(every
-    # commit ever). A (prompt, sha) OUTSIDE the set — an exotic pin deeper than the
-    # windowed history — falls through to a memoized one-row DB check
-    # (`_validated_in_db`), mirroring §8's content-cache-miss exception; during a DB
-    # outage that fallback fails CLOSED (the §10 rules-freeze posture protects
-    # everything warm; a pin nothing warm can vouch for gets a 409, not a guess).
-    referenced: set[tuple[str, str]] = set()
-    for (pid, _ver), shas in validated_by_version.items():
-        referenced.update((pid, sha) for sha in shas)
-    for (pid, _ver), shas in pointer_hist.items():
-        referenced.update((pid, sha) for sha in shas)
 
     # Versions
     versions: dict[str, dict[int, VersionInfo]] = defaultdict(dict)
@@ -246,15 +203,11 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
     ).scalars().all():
         refinement_defaults[(r.prompt_id, r.version_number)][r.name] = r.default
 
-    # Rules — explicit SHA pins join the referenced servable set (they may reach
-    # past the windowed history above and must not depend on the DB fallback).
+    # Rules
     rules: list[CoreRule] = []
     for r in session.execute(
         select(models.Rule).where(models.Rule.environment_id == env_id)
     ).scalars().all():
-        serve = r.serve if isinstance(r.serve, dict) else {}
-        if r.prompt_id and serve.get("at") == "sha" and serve.get("sha"):
-            referenced.add((r.prompt_id, serve["sha"]))
         rules.append(parse_rule({
             "id": r.id, "scope": r.scope, "prompt_id": r.prompt_id,
             "priority": r.priority, "when": r.clauses, "serve": r.serve,
@@ -292,7 +245,7 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
         track_tip=env.track_tip,
         stale=stale,
         killed=killed,
-        servable=lambda prompt_id, sha: (
-            (prompt_id, sha) in referenced or _validated_in_db(prompt_id, sha)
-        ),
+        servable=lambda prompt_id, version, sha: (
+            prompt_id, version, sha
+        ) in validated_index,
     )

@@ -63,6 +63,26 @@ def test_concurrent_rule_upserts_never_lose_a_bump(app):
     with session_scope() as s:
         rules = s.execute(select(models.Rule).where(models.Rule.environment_id == "prod")).scalars().all()
         assert len(rules) == N
+        revisions = s.execute(
+            select(models.RuleRevision)
+            .where(
+                models.RuleRevision.environment_id == "prod",
+                models.RuleRevision.rule_id.like("rule-%"),
+            )
+            .order_by(models.RuleRevision.rules_version)
+        ).scalars().all()
+
+    # Each serialized revision is a cumulative post-change state.  A later
+    # revision may not omit a rule captured by an earlier committed revision.
+    assert len(revisions) == N
+    seen: set[str] = set()
+    for revision in revisions:
+        seen.add(revision.rule_id)
+        captured = {
+            rule["id"] for rule in revision.state["rules"]
+            if rule["id"].startswith("rule-")
+        }
+        assert captured == seen
 
 
 def test_concurrent_pointer_moves_are_all_recorded(app):

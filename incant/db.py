@@ -11,14 +11,41 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Hashable, Iterator
 
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import get_settings
 
 log = logging.getLogger("incant.db")
+
+_AFTER_COMMIT_CALLBACKS = "incant_after_commit_callbacks"
+
+
+def after_commit(
+    session: Session, key: Hashable, callback: Callable[[], None],
+) -> None:
+    """Run a deduplicated process-side effect only after this transaction commits."""
+    callbacks = session.info.setdefault(_AFTER_COMMIT_CALLBACKS, {})
+    callbacks[key] = callback
+
+
+@event.listens_for(Session, "after_commit")
+def _run_after_commit_callbacks(session: Session) -> None:
+    callbacks = session.info.pop(_AFTER_COMMIT_CALLBACKS, {})
+    for callback in callbacks.values():
+        try:
+            callback()
+        except Exception:
+            # The database is already committed. A cache callback must never turn a
+            # successful mutation into a misleading 500 response.
+            log.exception("post-commit callback failed")
+
+
+@event.listens_for(Session, "after_rollback")
+def _discard_after_commit_callbacks(session: Session) -> None:
+    session.info.pop(_AFTER_COMMIT_CALLBACKS, None)
 
 # Repo root holds alembic.ini + alembic/ (a sibling of the incant package). In the
 # Docker image the whole tree is copied to /app, so this resolves there too.
@@ -149,6 +176,7 @@ def _adoption_revision(inspector) -> str:
       * b7d2e6f4a1c9 — uniqueness on ``reviews(draft_id, reviewer)`` (``uq_review``);
       * c4e8a17d5b23 — the ``rule_revisions.state`` column;
       * d7f3b92e6a41 — the ``users`` table.
+      * e9a1c4f27b63 — immutable principal-id columns on drafts/reviews/comments.
 
     We never return anything older than the baseline: a populated schema is assumed to
     contain at least ``da3e34b2b8fe``'s tables (that is what "has tables but no
@@ -159,13 +187,20 @@ def _adoption_revision(inspector) -> str:
         return _ADOPTION_BASELINE  # 67fb7465ee07's table is absent → adopt at baseline
     if not _has_unique_columns(inspector, "api_keys", ["prefix"]):
         return "67fb7465ee07"
+    # The newest migration replaces the old name-based review constraint. Its
+    # principal-id column is therefore both a head marker and the escape hatch that
+    # lets current create_all schemas skip the now-obsolete constraint probe below.
+    if "reviewer_principal_id" in {
+        c["name"] for c in inspector.get_columns("reviews")
+    }:
+        return "head"
     if not _has_unique_columns(inspector, "reviews", ["draft_id", "reviewer"]):
         return "a3f1c8e29b41"
     if "state" not in {c["name"] for c in inspector.get_columns("rule_revisions")}:
         return "b7d2e6f4a1c9"
     if "users" not in tables:
         return "c4e8a17d5b23"
-    return "head"
+    return "d7f3b92e6a41"
 
 
 def ensure_schema() -> None:

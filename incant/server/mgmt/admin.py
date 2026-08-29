@@ -104,6 +104,7 @@ def update_project(
 @router.post("/envs")
 def create_env(
     req: EnvironmentRequest,
+    app: AppContext = Depends(app_context),
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
@@ -114,8 +115,11 @@ def create_env(
     session.add(models.Environment(
         id=req.id, name=req.id, protected=req.protected, track_tip=req.track_tip,
     ))
+    session.flush()
+    app.targeting(session, ident.name).ensure_baseline(req.id)
     record_audit(session, ident.name, "env.create", "environment", req.id,
                  after={"protected": req.protected, "track_tip": req.track_tip})
+    app.invalidate_after_commit(session, req.id)
     return {"ok": True, "id": req.id}
 
 
@@ -141,7 +145,7 @@ def update_env(
     if after != before:
         record_audit(session, ident.name, "env.update", "environment", env,
                      before=before, after=after)
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return {"id": e.id, "protected": e.protected, "track_tip": e.track_tip}
 
 
@@ -197,8 +201,8 @@ def delete_env(
     session.delete(e)
     record_audit(session, ident.name, "env.delete", "environment", env,
                  before=before, after={"deleted": counts})
-    app.invalidate(env)
-    app.invalidate_auth()  # env-scoped role bindings changed
+    app.invalidate_after_commit(session, env)
+    app.invalidate_auth_after_commit(session)  # env-scoped role bindings changed
     return {"ok": True, "id": env, "deleted": counts}
 
 
@@ -250,9 +254,9 @@ def rename_env(
                  before={"id": env},
                  after={"id": new_id, "protected": protected, "track_tip": track_tip,
                         "rules_version": rules_version})
-    app.invalidate(env)
-    app.invalidate(new_id)
-    app.invalidate_auth()  # env-scoped role bindings moved to the new id
+    app.invalidate_after_commit(session, env)
+    app.invalidate_after_commit(session, new_id)
+    app.invalidate_auth_after_commit(session)  # env-scoped role bindings moved to the new id
     return {"id": new_id, "protected": protected, "track_tip": track_tip,
             "rules_version": rules_version}
 
@@ -278,7 +282,7 @@ def create_key(
                                    project_id=req.project_id, environment_id=req.environment_id))
     record_audit(session, ident.name, "principal.create", "principal", pid,
                  after={"name": req.principal_name, "role": req.role})
-    app.invalidate_auth()  # reload the in-memory key table so the new key authenticates
+    app.invalidate_auth_after_commit(session)  # reload after the new key commits
     return _issued(raw, pid, expires_at, role=req.role)
 
 
@@ -318,7 +322,7 @@ def add_binding(
     record_audit(session, ident.name, "binding.add", "principal", pid,
                  after={"role": req.role, "project_id": req.project_id,
                         "environment_id": req.environment_id})
-    app.invalidate_auth()
+    app.invalidate_auth_after_commit(session)
     return {"ok": True}
 
 
@@ -337,7 +341,7 @@ def remove_binding(
                  before={"role": b.role, "project_id": b.project_id,
                          "environment_id": b.environment_id})
     session.delete(b)
-    app.invalidate_auth()
+    app.invalidate_auth_after_commit(session)
     return {"ok": True}
 
 
@@ -375,7 +379,7 @@ def issue_key(
     expires_at = _expiry(req.expires_in_days)
     raw, _ = issue_api_key(session, principal_id=pid, name=p.name, expires_at=expires_at)
     record_audit(session, ident.name, "key.issue", "principal", pid)
-    app.invalidate_auth()
+    app.invalidate_auth_after_commit(session)
     return _issued(raw, pid, expires_at)
 
 
@@ -402,7 +406,7 @@ def rotate_key(
     record_audit(session, ident.name, "key.rotate", "principal", old.principal_id,
                  before={"key_id": key_id, "prefix": old.prefix},
                  after={"key_id": new_key.id, "prefix": new_key.prefix})
-    app.invalidate_auth()
+    app.invalidate_auth_after_commit(session)
     return _issued(raw, old.principal_id, expires_at, key_id=new_key.id,
                    revoked_key_id=key_id)
 
@@ -421,5 +425,5 @@ def revoke_key(
     k.revoked = True
     record_audit(session, ident.name, "key.revoke", "principal", k.principal_id,
                  after={"key_id": key_id, "prefix": k.prefix})
-    app.invalidate_auth()
+    app.invalidate_auth_after_commit(session)
     return {"ok": True, "key_id": key_id}

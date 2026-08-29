@@ -1,4 +1,4 @@
-"""Review uniqueness under concurrency (uq_review on draft_id, reviewer).
+"""Review uniqueness under concurrency (draft_id, reviewer principal ID).
 
 A concurrent double-submit must not create duplicate rows (which would later make every
 scalar_one_or_none read raise MultipleResultsFound). add_review retries the lost insert
@@ -43,10 +43,13 @@ def test_duplicate_review_insert_hits_unique_constraint(app):
     # The constraint itself: two raw rows for the same (draft, reviewer) can't coexist.
     draft_id = _open_draft(app)
     with session_scope() as s:
-        s.add(models.Review(draft_id=draft_id, reviewer="bob", state="approved"))
+        s.add(models.Review(draft_id=draft_id, reviewer="bob",
+                            reviewer_principal_id="legacy:bob", state="approved"))
     with pytest.raises(IntegrityError):
         with session_scope() as s:
-            s.add(models.Review(draft_id=draft_id, reviewer="bob", state="changes_requested"))
+            s.add(models.Review(draft_id=draft_id, reviewer="bob",
+                                reviewer_principal_id="legacy:bob",
+                                state="changes_requested"))
 
 
 def test_add_review_retries_race_as_update(app):
@@ -56,6 +59,7 @@ def test_add_review_retries_race_as_update(app):
     draft_id = _open_draft(app)
     with session_scope() as s:
         s.add(models.Review(draft_id=draft_id, reviewer="bob",
+                            reviewer_principal_id="legacy:bob",
                             state="changes_requested", reviewed_sha="stale"))
 
     with session_scope() as s:

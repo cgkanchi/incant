@@ -49,11 +49,11 @@ def _servable_sha_for_version(
     version's pointer history is servable.
     """
 
-    if vinfo.live_sha and snap.servable(prompt_id, vinfo.live_sha):
+    if vinfo.live_sha and snap.servable(prompt_id, vinfo.version, vinfo.live_sha):
         return vinfo.live_sha, False
     # §10 within-version fallback: newest previous-live SHA that is still servable.
     for sha in vinfo.previous_live:
-        if snap.servable(prompt_id, sha):
+        if snap.servable(prompt_id, vinfo.version, sha):
             return sha, True
     return None, False
 
@@ -107,7 +107,7 @@ def _resolve_serve(
             return None, f"version {serve.version} does not exist"
         if serve.at == "tip":
             sha = vinfo.tip_sha
-            if not sha or not snap.servable(prompt_id, sha):
+            if not sha or not snap.servable(prompt_id, serve.version, sha):
                 return None, "tip unservable"
             return (
                 Resolution(prompt_id, serve.version, sha, "tip", rule.scope, rule.id, vinfo.label),
@@ -115,7 +115,7 @@ def _resolve_serve(
             )
         if serve.at == "sha":
             sha = serve.sha
-            if not sha or not snap.servable(prompt_id, sha):
+            if not sha or not snap.servable(prompt_id, serve.version, sha):
                 return None, "pinned sha unservable"
             return (
                 Resolution(prompt_id, serve.version, sha, "sha", rule.scope, rule.id, vinfo.label),

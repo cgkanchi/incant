@@ -12,13 +12,17 @@ import datetime as dt
 import secrets
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import models
 from .auth import hash_key
 
 INVITE_TTL = dt.timedelta(days=7)
+
+# A stable, application-owned bigint key for the singleton initial-setup operation.
+# Transaction-scoped advisory locks release automatically on commit or rollback.
+_INITIAL_SETUP_LOCK_ID = 0x496E63616E74  # ASCII "Incant"
 
 
 def _now() -> dt.datetime:
@@ -43,6 +47,17 @@ def user_by_email(session: Session, email: str) -> models.User | None:
 
 def user_count(session: Session) -> int:
     return len(session.execute(select(models.User.id)).scalars().all())
+
+
+def begin_initial_setup(session: Session) -> bool:
+    """Serialize first-user creation and report whether setup is still available.
+
+    The caller must create the initial user in this same transaction.  The lock is
+    held until that transaction commits or rolls back, so a competing setup waits
+    and then observes the user created by the winner.
+    """
+    session.execute(select(func.pg_advisory_xact_lock(_INITIAL_SETUP_LOCK_ID)))
+    return user_count(session) == 0
 
 
 def create_user(session: Session, *, email: str, name: str) -> models.User:
@@ -70,11 +85,18 @@ def issue_invite(user: models.User) -> str:
 
 def redeem_invite(session: Session, token: str) -> models.User | None:
     """The user a live (unexpired, un-superseded) invite token belongs to, or None.
-    Disabled accounts can hold a token but never redeem it."""
+    Disabled accounts can hold a token but never redeem it.
+
+    The matching row is locked until the caller's transaction ends.  Callers that
+    accept the invite must clear its hash in that same transaction; a competing
+    redemption then wakes, re-checks the predicate, and finds no matching row.
+    """
     if not token:
         return None
     user = session.execute(
-        select(models.User).where(models.User.invite_token_hash == hash_key(token))
+        select(models.User)
+        .where(models.User.invite_token_hash == hash_key(token))
+        .with_for_update()
     ).scalar_one_or_none()
     if user is None or user.status == "disabled":
         return None

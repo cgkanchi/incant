@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import subprocess
+import logging
 
 import pytest
+from sqlalchemy import select
 
 from incant import db, models
 from incant.config import Settings, set_settings
 from incant.db import session_scope
-from incant.gitstore import GitStore, redact_url
+from incant.gitstore import GitError, GitStore, redact_url
 from incant.service import AppContext, reset_app
 
 from .conftest import db_url_for, reset_schema
@@ -219,6 +221,37 @@ def test_remote_list_redacts_credentials(tmp_path):
         listing = client.get("/mgmt/remotes", headers=auth())
         assert "s3cret" not in listing.text
         assert "***" in listing.json()["remotes"][0]["url"]
+
+
+def test_failed_remote_never_leaks_credentials_to_logs_response_or_audit(
+    tmp_path, monkeypatch, caplog,
+):
+    secret = "super-secret-token"
+    raw_url = f"https://backup:{secret}@git.example.com/missing.git"
+
+    def fail_with_echo(self, url, **kwargs):
+        # Simulate git echoing the exact credential-bearing URL in stderr.
+        raise GitError(f"fatal: unable to access {url}: authentication failed for {secret}")
+
+    monkeypatch.setattr(GitStore, "push_mirror", fail_with_echo)
+    caplog.set_level(logging.WARNING, logger="incant.backup")
+
+    with make_client(tmp_path) as client:
+        remote_id = client.post(
+            "/mgmt/remotes", json={"url": raw_url}, headers=auth()
+        ).json()["id"]
+        response = client.post(f"/mgmt/remotes/{remote_id}/push", headers=auth())
+        assert response.status_code == 200
+        assert response.json()["error"]
+        assert secret not in response.text
+        assert secret not in caplog.text
+
+        with session_scope() as s:
+            audit = s.execute(select(models.AuditLog).where(
+                models.AuditLog.action == "remote.push"
+            ).order_by(models.AuditLog.id.desc())).scalars().first()
+            assert audit is not None
+            assert secret not in str(audit.after)
 
 
 def test_changing_remote_url_resets_push_history(tmp_path):

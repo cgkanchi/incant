@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .backup import BackupPusher, RemoteStatus, redact_url
 from .content import ContentStore
-from .store import CommitInfo, GitError, GitStore
+from .store import CommitInfo, GitError, GitStore, RemoteGitError
 from .validation import ValidationResult, validate_source
 
 __all__ = [
@@ -13,6 +13,7 @@ __all__ = [
     "ContentStore",
     "GitError",
     "GitStore",
+    "RemoteGitError",
     "RemoteStatus",
     "ValidationResult",
     "redact_url",

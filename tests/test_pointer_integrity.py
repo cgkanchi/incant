@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import pytest
 
+from incant import models
 from incant.db import session_scope
+from incant.service import ServingError
 from incant.targeting import build_snapshot
 from incant.targeting.service import TargetingError
 
@@ -75,8 +77,36 @@ def test_snapshot_servable_is_prompt_aware(app):
     with session_scope() as s:
         snap = build_snapshot(s, "prod")
     # beta's SHA is servable for beta, but NOT for alpha (cross-prompt is rejected).
-    assert snap.servable("support/beta", b.sha) is True
-    assert snap.servable("support/alpha", b.sha) is False
+    assert snap.servable("support/beta", 1, b.sha) is True
+    assert snap.servable("support/alpha", 1, b.sha) is False
     # ...and symmetrically for alpha's SHA.
-    assert snap.servable("support/alpha", a.sha) is True
-    assert snap.servable("support/beta", a.sha) is False
+    assert snap.servable("support/alpha", 1, a.sha) is True
+    assert snap.servable("support/beta", 1, a.sha) is False
+
+
+def test_snapshot_servable_is_version_aware_for_same_prompt(app):
+    v1 = _author_version(app, "support/system", 1, "v1", make_live=False)
+    v2 = _author_version(app, "support/system", 2, "v2", make_live=False)
+    with session_scope() as s:
+        snap = build_snapshot(s, "prod")
+    assert snap.servable("support/system", 1, v1.sha) is True
+    assert snap.servable("support/system", 2, v2.sha) is True
+    assert snap.servable("support/system", 1, v2.sha) is False
+    assert snap.servable("support/system", 2, v1.sha) is False
+
+
+def test_corrupt_pointer_to_wrong_version_fails_closed(app):
+    v1 = _author_version(app, "support/system", 1, "v1", make_live=False)
+    v2 = _author_version(app, "support/system", 2, "v2", make_live=False)
+    assert v1.sha != v2.sha
+    # Simulate corruption/import bypassing TargetingService's write guard.
+    with session_scope() as s:
+        s.add(models.PointerMove(
+            environment_id="prod", prompt_id="support/system", version_number=1,
+            to_sha=v2.sha, moved_by="corrupt-import",
+        ))
+    app.invalidate("prod")
+    with session_scope() as s:
+        with pytest.raises(ServingError) as exc:
+            app.serve(s, "prod", "support/system", {}, {})
+    assert exc.value.status == 409

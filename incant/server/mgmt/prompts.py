@@ -19,6 +19,7 @@ from ..schemas import (
     RefinementRequest,
     RenderRequest,
     TestContextRequest,
+    VersionUpdateRequest,
 )
 from .helpers import (
     _current_live,
@@ -203,6 +204,34 @@ def get_versions(
     }
 
 
+@router.patch("/prompts/{prompt_id:path}/versions/{version_number}")
+def update_version(
+    prompt_id: str,
+    version_number: int,
+    req: VersionUpdateRequest,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    """Edit version metadata or archive/reactivate a version explicitly."""
+    _require(ident, "editor", project=_project_of(prompt_id))
+    try:
+        version = app.registry(session, ident.name).update_version(
+            prompt_id, version_number,
+            label=req.label, notes=req.notes, status=req.status,
+        )
+    except RegistryError as exc:
+        raise HTTPException(404, str(exc))
+    app.invalidate_after_commit(session)
+    return {
+        "prompt_id": prompt_id,
+        "version": version.number,
+        "label": version.label,
+        "notes": version.notes,
+        "status": version.status,
+    }
+
+
 # ── authoring ────────────────────────────────────────────────────────
 
 @router.post("/prompts")
@@ -273,7 +302,7 @@ def put_variable(
     reg = app.registry(session, ident.name)
     reg.set_refinement(prompt_id, version, req.name, type=req.type,
                        required=req.required, default=req.default, description=req.description)
-    app.invalidate()  # optional-var defaults are folded into snapshots
+    app.invalidate_after_commit(session)  # optional-var defaults are folded into snapshots
     return {"ok": True, "variables": _effective_variables(app, session, prompt_id, version)}
 
 

@@ -3,12 +3,20 @@ resets, disable, password change. API keys stay the machine door throughout."""
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import datetime as dt
+import threading
 
 from sqlalchemy import select
 
 from incant import models
 from incant.db import session_scope
+from incant.server.accounts import (
+    begin_initial_setup,
+    create_user,
+    issue_invite,
+    redeem_invite,
+)
 
 from .test_server import ADMIN, auth, make_client
 
@@ -54,6 +62,46 @@ def test_setup_validation(tmp_path):
         assert client.post("/auth/setup", json={
             "name": "Pat", "email": EMAIL, "password": "short"}).status_code == 422
         assert client.get("/auth/setup").json()["needs_setup"] is True  # nothing landed
+
+
+def test_concurrent_setup_allows_exactly_one_initial_admin(tmp_path):
+    with make_client(tmp_path):
+        start = threading.Barrier(2)
+        winner_has_lock = threading.Event()
+        release_winner = threading.Event()
+
+        def attempt_setup(index: int) -> bool:
+            with session_scope() as s:
+                start.wait(timeout=5)
+                if not begin_initial_setup(s):
+                    return False
+
+                # Keep the database empty while the other transaction attempts
+                # setup.  It must block on the advisory lock, not also see zero.
+                winner_has_lock.set()
+                assert release_winner.wait(timeout=5)
+                user = create_user(
+                    s, email=f"admin-{index}@example.com", name=f"Admin {index}"
+                )
+                user.status = "active"
+                s.add(models.RoleBinding(principal_id=user.principal_id, role="admin"))
+                return True
+
+        with cf.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(attempt_setup, index) for index in range(2)]
+            try:
+                assert winner_has_lock.wait(timeout=5)
+            finally:
+                release_winner.set()
+            results = [future.result(timeout=5) for future in futures]
+
+        assert sorted(results) == [False, True]
+        with session_scope() as s:
+            user = s.execute(select(models.User)).scalar_one()
+            assert len(s.execute(select(models.RoleBinding).where(
+                models.RoleBinding.role == "admin",
+                models.RoleBinding.principal_id == user.principal_id,
+            )).scalars().all()) == 1
 
 
 # ── password sign-in ─────────────────────────────────────────────────
@@ -128,6 +176,48 @@ def test_invite_lifecycle(tmp_path):
         # Duplicate invite for an existing email is refused.
         assert client.post("/mgmt/users", json={"email": "Sam@example.com"},
                            headers=auth()).status_code == 409
+
+
+def test_concurrent_invite_redemption_has_one_winner(tmp_path):
+    with make_client(tmp_path):
+        with session_scope() as s:
+            user = create_user(s, email="race@example.com", name="Race")
+            token = issue_invite(user)
+
+        start = threading.Barrier(2)
+        winner_has_lock = threading.Event()
+        release_winner = threading.Event()
+
+        def redeem() -> bool:
+            with session_scope() as s:
+                start.wait(timeout=5)
+                user = redeem_invite(s, token)
+                if user is None:
+                    return False
+
+                # Hold the matching row lock while the competing SELECT runs.
+                winner_has_lock.set()
+                assert release_winner.wait(timeout=5)
+                user.invite_token_hash = None
+                user.invite_expires_at = None
+                user.status = "active"
+                return True
+
+        with cf.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(redeem) for _ in range(2)]
+            try:
+                assert winner_has_lock.wait(timeout=5)
+            finally:
+                release_winner.set()
+            results = [future.result(timeout=5) for future in futures]
+
+        assert sorted(results) == [False, True]
+        with session_scope() as s:
+            user = s.execute(select(models.User).where(
+                models.User.email == "race@example.com"
+            )).scalar_one()
+            assert user.status == "active"
+            assert user.invite_token_hash is None
 
 
 def test_reset_link_replaces_old_token_and_password(tmp_path):

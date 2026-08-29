@@ -30,8 +30,7 @@ def _seed_env_rows(env: str) -> None:
         s.add(models.KillSwitch(environment_id=env, prompt_id="support/system", engaged=True))
         s.add(models.PointerMove(environment_id=env, prompt_id="support/system",
                                  version_number=2, to_sha="deadbeefdeadbeef"))
-        s.add(models.RuleRevision(environment_id=env, kind="rule", rules_version=1,
-                                  snapshot={}))
+        # Environment creation installs the exact rules_version=1 baseline revision.
 
 
 def _env_row_counts(env: str) -> dict:

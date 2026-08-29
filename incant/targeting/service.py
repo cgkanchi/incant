@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..core.parse import parse_rule as parse_core_rule
+from ..core.parse import parse_condition, parse_rule as parse_core_rule
 from .audit import record_audit
 
 
@@ -133,20 +133,51 @@ class TargetingService:
     # ── helpers ──────────────────────────────────────────────────────
 
     def _env(self, env_id: str) -> models.Environment:
-        env = self.s.get(models.Environment, env_id)
+        # Serialize the COMPLETE mutation before touching any targeting child row.
+        # Locking only while incrementing the counter lets two writers capture
+        # mutually-incomplete states even though their version numbers are unique.
+        env = self.s.execute(
+            select(models.Environment)
+            .where(models.Environment.id == env_id)
+            .with_for_update()
+        ).scalar_one_or_none()
         if env is None:
             raise TargetingError(f"unknown environment {env_id!r}")
+        # Environments created before state revisions existed (and direct model
+        # creations in integrations) get an exact baseline lazily, before their
+        # first serialized mutation.
+        has_revision = self.s.execute(
+            select(models.RuleRevision.id).where(
+                models.RuleRevision.environment_id == env_id
+            ).limit(1)
+        ).first()
+        if has_revision is None:
+            self.s.add(models.RuleRevision(
+                environment_id=env.id,
+                kind="baseline",
+                rules_version=env.rules_version,
+                snapshot={"environment_id": env.id},
+                state=capture_state(self.s, env.id),
+                actor=self.actor,
+                comment="initial targeting state",
+            ))
+            self.s.flush()
         return env
+
+    def ensure_baseline(self, env_id: str) -> int:
+        """Materialize an environment's exact initial revision under its row lock."""
+        return self._env(env_id).rules_version
 
     def _bump(self, env: models.Environment, kind: str, snapshot: dict,
               rule_id: str | None = None, comment: str = "") -> int:
-        # Atomic increment at the database, not a Python read-modify-write: two
-        # operators mutating targeting concurrently must both advance the counter.
-        # Assigning a SQL expression emits `SET rules_version = rules_version + 1`,
-        # which Postgres serializes under the row lock (no lost update).
-        env.rules_version = models.Environment.rules_version + 1
+        # ``_env`` holds the environment row lock from before the mutation, so this
+        # Python increment and the captured post-change state are one serial history
+        # point.  The unique constraint is the database backstop.
+        env.rules_version += 1
+        self.s.flush()
         rev = models.RuleRevision(
             environment_id=env.id, rule_id=rule_id, kind=kind,
+            rules_version=env.rules_version,
             snapshot=snapshot, actor=self.actor, comment=comment,
             # The complete post-change state (mutation already flushed by the
             # caller) — what total rollback and pin.rules_version replay read.
@@ -154,16 +185,14 @@ class TargetingService:
         )
         self.s.add(rev)
         self.s.flush()
-        self.s.refresh(env)  # load the DB-computed value back onto the instance
-        rev.rules_version = env.rules_version  # stamp the revision with its version
-        self.s.flush()
         return env.rules_version
 
     def _version_exists(self, prompt_id: str, version_number: int) -> bool:
         return self.s.execute(
-            select(models.Version).where(
+            select(models.Version.id).where(
                 models.Version.prompt_id == prompt_id,
                 models.Version.number == version_number,
+                models.Version.status == "active",
             )
         ).first() is not None
 
@@ -195,7 +224,8 @@ class TargetingService:
         for version_number, at, sha in targets:
             if not self._version_exists(prompt_id, version_number):
                 raise TargetingError(
-                    f"version {version_number} does not exist for prompt {prompt_id!r}")
+                    f"version {version_number} does not exist or is archived for "
+                    f"prompt {prompt_id!r}")
             if at == "sha":
                 if not sha:
                     raise TargetingError(
@@ -217,7 +247,10 @@ class TargetingService:
     def upsert_rule(self, env_id: str, rule: dict) -> models.Rule:
         env = self._env(env_id)
         # Validate serve/when shape early via the core parser.
-        parse_core_rule({**rule, "id": rule.get("id", "tmp")})
+        try:
+            parse_core_rule({**rule, "id": rule.get("id", "tmp")})
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TargetingError(f"invalid rule: {exc}") from exc
         rid = rule["id"]
         existing = self.s.get(models.Rule, rid)
         if existing is not None and existing.environment_id != env_id:
@@ -230,6 +263,14 @@ class TargetingService:
             self.s.add(existing)
         existing.scope = rule.get("scope", existing.scope or "prompt")
         existing.prompt_id = rule.get("prompt_id", existing.prompt_id)
+        if existing.scope == "global":
+            # The MERGED row must satisfy the global⇒no-prompt invariant even when a
+            # service-level caller omits prompt_id while rescoping (the HTTP layer
+            # always sends it explicitly; plain dicts may not). Without this, the
+            # stale prompt_id survives the merge, the DB check rejects the flush,
+            # and — had it landed — the next snapshot rebuild's strict parse would
+            # take the whole environment down.
+            existing.prompt_id = None
         existing.priority = int(rule.get("priority", existing.priority or 10))
         existing.clauses = rule.get("when", rule.get("clauses"))
         existing.serve = rule["serve"]
@@ -246,6 +287,8 @@ class TargetingService:
 
     def set_rule_status(self, env_id: str, rule_id: str, status: str) -> models.Rule:
         env = self._env(env_id)
+        if status not in ("active", "paused", "archived"):
+            raise TargetingError(f"invalid rule status {status!r}")
         r = self.s.get(models.Rule, rule_id)
         if r is None or r.environment_id != env_id:
             raise TargetingError(f"unknown rule {rule_id!r} in {env_id!r}")
@@ -266,6 +309,13 @@ class TargetingService:
 
     def upsert_segment(self, env_id: str, name: str, clauses: dict) -> models.Segment:
         env = self._env(env_id)
+        if not isinstance(name, str) or not name.strip() or len(name) > 255:
+            raise TargetingError("segment name must be 1-255 non-whitespace characters")
+        try:
+            parse_condition(clauses)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TargetingError(f"invalid segment condition: {exc}") from exc
+        name = name.strip()
         existing = self.s.execute(
             select(models.Segment).where(
                 models.Segment.environment_id == env_id, models.Segment.name == name
@@ -319,7 +369,8 @@ class TargetingService:
         # a commit validated only for prompt B or a different version of A.
         if not self._version_exists(prompt_id, version_number):
             raise TargetingError(
-                f"version {version_number} does not exist for prompt {prompt_id!r}")
+                f"version {version_number} does not exist or is archived for "
+                f"prompt {prompt_id!r}")
         if not self._is_validated_for(prompt_id, version_number, to_sha):
             raise TargetingError(
                 f"SHA {to_sha} is not a validated commit for {prompt_id!r} "
@@ -354,31 +405,29 @@ class TargetingService:
         ).scalars())
 
     def state_at(self, env_id: str, rules_version: int) -> dict | None:
-        """The environment's complete targeting state as of ``rules_version``: the
-        newest state-carrying revision at or before it. ``None`` when the target
-        predates state-tracked revisions (pre-upgrade history)."""
+        """Return the exact captured state named by ``rules_version``, if any."""
+        if rules_version < 1:
+            return None
         rev = self.s.execute(
             select(models.RuleRevision).where(
                 models.RuleRevision.environment_id == env_id,
-                models.RuleRevision.rules_version <= rules_version,
+                models.RuleRevision.rules_version == rules_version,
                 models.RuleRevision.state.isnot(None),
-            ).order_by(models.RuleRevision.rules_version.desc(),
-                       models.RuleRevision.id.desc())
-        ).scalars().first()
+            )
+        ).scalar_one_or_none()
         return rev.state if rev is not None else None
 
     def _rollback_rules(self, env_id: str, target: dict[str, dict]) -> int:
         """Restore the rule set to ``target`` ({rule_id -> rule snapshot}); rules
-        created after the target are archived (never deleted — ids are immutable
-        and history must keep resolving). Returns rules changed."""
+        created after the target are removed while their revision history remains.
+        Returns rules changed."""
         changed = 0
         existing = {r.id: r for r in self.list_rules(env_id)}
         for rid, rule in existing.items():
             snap = target.get(rid)
             if snap is None:
-                if rule.status != "archived":
-                    rule.status = "archived"  # created after target -> stop serving
-                    changed += 1
+                self.s.delete(rule)
+                changed += 1
             else:
                 rule.scope = snap.get("scope", rule.scope)
                 rule.prompt_id = snap.get("prompt_id")
@@ -406,129 +455,122 @@ class TargetingService:
         pointers — from the revision's captured state (§7 "one-click rollback of …
         the whole environment's targeting state").
 
-        Pointer restoration preserves the append-only model: a pointer whose
-        current live SHA differs from the recorded one gets a NEW move back to it
-        (history intact, §7), and a pointer that did not exist at the target simply
-        keeps its current value — there is no "un-make-live"; it only serves if the
-        restored rules/defaults reference it, which they by construction don't.
-
-        Falls back to the legacy rules-only reconstruction (per-rule revisions) for
-        targets that predate state-carrying revisions; the response says which.
-        The rollback is itself a change and bumps ``rules_version``.
+        Pointer restoration preserves the append-only model: a changed pointer gets
+        a new move, while one absent at the target gets a ``None`` tombstone.  The
+        rollback is itself a change and bumps ``rules_version``.
         """
         env = self._env(env_id)
         state = self.state_at(env_id, to_rules_version)
-
         if state is None:
-            # Legacy fallback: replay per-rule revisions only (pre-upgrade history).
-            revs = self.s.execute(
-                select(models.RuleRevision).where(
-                    models.RuleRevision.environment_id == env_id,
-                    models.RuleRevision.kind == "rule",
-                    models.RuleRevision.rules_version <= to_rules_version,
-                ).order_by(models.RuleRevision.rules_version, models.RuleRevision.id)
-            ).scalars().all()
-            target = {r.rule_id: r.snapshot for r in revs if r.rule_id}
-            changed = {"rules": self._rollback_rules(env_id, target)}
-            scope = "rules"
-        else:
-            changed = {"rules": self._rollback_rules(
-                env_id, {r["id"]: r for r in state.get("rules", [])})}
+            raise TargetingError(
+                f"rules_version {to_rules_version} has no exact captured state for {env_id!r}"
+            )
 
-            # Segments: restore recorded clause sets. Extra segments (created after
-            # the target) are left in place — the restored rules don't reference
-            # them, and deleting a named object an operator may still want is worse.
-            changed["segments"] = 0
-            existing_segments = {s.name: s for s in self.list_segments(env_id)}
-            for snap in state.get("segments", []):
-                seg = existing_segments.get(snap["name"])
-                if seg is None:
-                    self.s.add(models.Segment(
-                        environment_id=env_id, name=snap["name"],
-                        clauses=snap["clauses"], version=snap.get("version", 1)))
-                    changed["segments"] += 1
-                elif seg.clauses != snap["clauses"]:
-                    seg.clauses = snap["clauses"]
-                    seg.version += 1
-                    changed["segments"] += 1
+        changed = {"rules": self._rollback_rules(
+            env_id, {r["id"]: r for r in state.get("rules", [])})}
 
-            # Defaults: exactly the recorded map — updates, inserts, AND removals
-            # (a default added after the target is part of what's being undone).
-            changed["defaults"] = 0
-            recorded = state.get("defaults", {})
-            existing_defaults = {
-                d.prompt_id: d for d in self.s.execute(
-                    select(models.EnvDefault).where(
-                        models.EnvDefault.environment_id == env_id)
-                ).scalars()
-            }
-            for pid, ver in recorded.items():
-                d = existing_defaults.get(pid)
-                if d is None:
-                    self.s.add(models.EnvDefault(
-                        environment_id=env_id, prompt_id=pid, version_number=ver))
-                    changed["defaults"] += 1
-                elif d.version_number != ver:
-                    d.version_number = ver
-                    changed["defaults"] += 1
-            for pid, d in existing_defaults.items():
-                if pid not in recorded:
-                    self.s.delete(d)
-                    changed["defaults"] += 1
+        # Segments: restore the exact recorded set, including removals.
+        changed["segments"] = 0
+        existing_segments = {s.name: s for s in self.list_segments(env_id)}
+        recorded_segments = {s["name"]: s for s in state.get("segments", [])}
+        for name, seg in existing_segments.items():
+            if name not in recorded_segments:
+                self.s.delete(seg)
+                changed["segments"] += 1
+        for name, snap in recorded_segments.items():
+            seg = existing_segments.get(name)
+            if seg is None:
+                self.s.add(models.Segment(
+                    environment_id=env_id, name=name,
+                    clauses=snap["clauses"], version=snap.get("version", 1)))
+                changed["segments"] += 1
+            elif seg.clauses != snap["clauses"] or seg.version != snap.get("version", 1):
+                seg.clauses = snap["clauses"]
+                seg.version = snap.get("version", 1)
+                changed["segments"] += 1
 
-            # Kill switches: engaged set exactly as recorded.
-            changed["kills"] = 0
-            recorded_kills = set(state.get("kills", []))
-            existing_kills = {
-                k.prompt_id: k for k in self.s.execute(
-                    select(models.KillSwitch).where(
-                        models.KillSwitch.environment_id == env_id)
-                ).scalars()
-            }
-            for pid in recorded_kills - {p for p, k in existing_kills.items() if k.engaged}:
-                k = existing_kills.get(pid)
-                if k is None:
-                    self.s.add(models.KillSwitch(
-                        environment_id=env_id, prompt_id=pid, engaged=True,
-                        by=self.actor))
-                else:
-                    k.engaged = True
-                    k.by = self.actor
+        # Defaults: exactly the recorded map — updates, inserts, AND removals
+        # (a default added after the target is part of what's being undone).
+        changed["defaults"] = 0
+        recorded = state.get("defaults", {})
+        existing_defaults = {
+            d.prompt_id: d for d in self.s.execute(
+                select(models.EnvDefault).where(
+                    models.EnvDefault.environment_id == env_id)
+            ).scalars()
+        }
+        for pid, ver in recorded.items():
+            d = existing_defaults.get(pid)
+            if d is None:
+                self.s.add(models.EnvDefault(
+                    environment_id=env_id, prompt_id=pid, version_number=ver))
+                changed["defaults"] += 1
+            elif d.version_number != ver:
+                d.version_number = ver
+                changed["defaults"] += 1
+        for pid, d in existing_defaults.items():
+            if pid not in recorded:
+                self.s.delete(d)
+                changed["defaults"] += 1
+
+        # Kill switches: engaged set exactly as recorded.
+        changed["kills"] = 0
+        recorded_kills = set(state.get("kills", []))
+        existing_kills = {
+            k.prompt_id: k for k in self.s.execute(
+                select(models.KillSwitch).where(
+                    models.KillSwitch.environment_id == env_id)
+            ).scalars()
+        }
+        for pid in recorded_kills - {p for p, k in existing_kills.items() if k.engaged}:
+            k = existing_kills.get(pid)
+            if k is None:
+                self.s.add(models.KillSwitch(
+                    environment_id=env_id, prompt_id=pid, engaged=True,
+                    by=self.actor))
+            else:
+                k.engaged = True
+                k.by = self.actor
+            changed["kills"] += 1
+        for pid, k in existing_kills.items():
+            if k.engaged and pid not in recorded_kills:
+                k.engaged = False
+                k.by = self.actor
                 changed["kills"] += 1
-            for pid, k in existing_kills.items():
-                if k.engaged and pid not in recorded_kills:
-                    k.engaged = False
-                    k.by = self.actor
-                    changed["kills"] += 1
 
-            # Live pointers: append a move back to the recorded SHA wherever the
-            # current live differs (append-only history preserved). Skip — and
-            # count — anything no longer validated (CommitValidation rows are never
-            # deleted, so this is belt-and-braces, not an expected path).
-            changed["pointers"] = 0
-            skipped_pointers = 0
-            for key, vinfo in state.get("versions", {}).items():
-                recorded_sha = vinfo.get("live")
-                if not recorded_sha:
-                    continue
-                pid, _, vpart = key.rpartition("@v")
-                version_number = int(vpart)
-                if self.current_live(env_id, pid, version_number) == recorded_sha:
-                    continue
-                if not self._is_validated_for(pid, version_number, recorded_sha):
-                    skipped_pointers += 1
-                    continue
-                from_sha = self.current_live(env_id, pid, version_number)
-                self.s.add(models.PointerMove(
-                    environment_id=env_id, prompt_id=pid,
-                    version_number=version_number, from_sha=from_sha,
-                    to_sha=recorded_sha, moved_by=self.actor,
-                    comment=f"rollback to rules_version {to_rules_version}",
-                ))
-                changed["pointers"] += 1
-            if skipped_pointers:
-                changed["pointers_skipped"] = skipped_pointers
-            scope = "full"
+        # Live pointers: restore every registered key. ``None`` is an append-only
+        # tombstone for a pointer that did not exist at the target.
+        changed["pointers"] = 0
+        skipped_pointers = 0
+        recorded_versions = state.get("versions", {})
+        current_keys = {
+            _version_key(pid, version)
+            for pid, version in self.s.execute(
+                select(models.PointerMove.prompt_id, models.PointerMove.version_number)
+                .where(models.PointerMove.environment_id == env_id)
+                .distinct()
+            )
+        }
+        for key in set(recorded_versions) | current_keys:
+            recorded_sha = recorded_versions.get(key, {}).get("live")
+            pid, _, vpart = key.rpartition("@v")
+            version_number = int(vpart)
+            current_sha = self.current_live(env_id, pid, version_number)
+            if current_sha == recorded_sha:
+                continue
+            if recorded_sha and not self._is_validated_for(pid, version_number, recorded_sha):
+                skipped_pointers += 1
+                continue
+            self.s.add(models.PointerMove(
+                environment_id=env_id, prompt_id=pid,
+                version_number=version_number, from_sha=current_sha,
+                to_sha=recorded_sha, moved_by=self.actor,
+                comment=f"rollback to rules_version {to_rules_version}",
+            ))
+            changed["pointers"] += 1
+        if skipped_pointers:
+            changed["pointers_skipped"] = skipped_pointers
+        scope = "full"
 
         self.s.flush()
         rv = self._bump(env, "rollback",
@@ -549,7 +591,8 @@ class TargetingService:
         env = self._env(env_id)
         if not self._version_exists(prompt_id, version_number):
             raise TargetingError(
-                f"version {version_number} does not exist for prompt {prompt_id!r}")
+                f"version {version_number} does not exist or is archived for "
+                f"prompt {prompt_id!r}")
         existing = self.s.execute(
             select(models.EnvDefault).where(
                 models.EnvDefault.environment_id == env_id,

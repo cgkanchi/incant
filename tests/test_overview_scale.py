@@ -304,9 +304,9 @@ def test_snapshot_servable_complete_despite_validation_window(client):
 
     vinfo = snap.versions[pid][ver]
     assert vinfo.tip_sha == newest_first[0]              # tip from the windowed ordering head
-    assert snap.servable(pid, ancient) is True           # COMPLETE set: still servable
-    assert snap.servable(pid, newest_first[0]) is True
-    assert snap.servable(pid, "never-validated") is False
+    assert snap.servable(pid, 1, ancient) is True        # COMPLETE set: still servable
+    assert snap.servable(pid, 1, newest_first[0]) is True
+    assert snap.servable(pid, 1, "never-validated") is False
 
 
 def test_snapshot_previous_live_recent_distinct(client):

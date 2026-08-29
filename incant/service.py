@@ -31,7 +31,7 @@ from .core import (
     render_source,
     resolve,
 )
-from .db import init_db, session_scope
+from .db import after_commit, init_db, session_scope
 from .gitstore import BackupPusher, ContentStore, GitStore
 from .registry import MainReconcileResult, RegistryService
 from .targeting import TargetingService, build_snapshot, snapshot_from_state
@@ -119,6 +119,20 @@ class AppContext:
 
     def invalidate_auth(self) -> None:
         self.auth.invalidate()
+
+    def invalidate_after_commit(self, session: Session, env_id: str | None = None) -> None:
+        after_commit(
+            session,
+            ("snapshot", id(self), env_id),
+            lambda: self.invalidate(env_id),
+        )
+
+    def invalidate_auth_after_commit(self, session: Session) -> None:
+        after_commit(
+            session,
+            ("auth", id(self)),
+            self.invalidate_auth,
+        )
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -283,8 +297,12 @@ class AppContext:
         *existing* live pointer for (prompt, version) to the new tip. Returns the
         list of environments advanced."""
         advanced: list[str] = []
+        # Deterministic id order: make_live now takes each environment's row lock, so
+        # any transaction locking SEVERAL environments must do so in one global order
+        # or two concurrent multi-env lockers can deadlock.
         envs = session.execute(
             select(models.Environment).where(models.Environment.track_tip.is_(True))
+            .order_by(models.Environment.id)
         ).scalars().all()
         for env in envs:
             tgt = self.targeting(session, actor)
@@ -292,7 +310,7 @@ class AppContext:
                 continue  # nothing live to follow
             tgt.make_live(env.id, prompt_id, version, sha,
                           comment="track_tip auto-advance")
-            self.invalidate(env.id)
+            self.invalidate_after_commit(session, env.id)
             advanced.append(env.id)
         return advanced
 
@@ -448,33 +466,19 @@ class AppContext:
         # could resolve a validation-FAILED commit (those land on main by design) or a
         # draft-ref commit (same object store), serving broken or unreviewed content.
         # The check is memory-only: `servable` closes over the snapshot's validated
-        # (prompt, sha) pair set, so the hot path stays DB-free (§8).
-        for pid, (_pin_version, pin_sha) in (pin or {}).items():
-            if not snap.servable(pid, pin_sha):
+        # (prompt, version, sha) index, so the hot path stays DB-free (§8).
+        for pid, (pin_version, pin_sha) in (pin or {}).items():
+            if not snap.servable(pid, pin_version, pin_sha):
                 raise ServingError(
                     409,
                     f"pinned commit {pin_sha} is not a validated commit for {pid!r}; "
                     "only validated content can serve (§5)",
                 )
 
-        # Determine the root version — for defaults lookup — honouring a pin (§9).
-        pinned = (pin or {}).get(prompt_id)
-        if pinned is not None:
-            root_version = pinned[0]
-        else:
-            try:
-                root_version = resolve(snap, prompt_id, flags).version
-            except UnresolvedPrompt:
-                raise self._unresolved_error(snap, env_id, prompt_id)
-            except Unservable:
-                raise ServingError(409, f"resolved content for {prompt_id!r} is unservable")
-
-        # Optional-variable defaults come from the snapshot (no per-request DB read).
-        defaults = snap.refinement_defaults.get((prompt_id, root_version), {})
-
         try:
-            result = render(snap, prompt_id, flags, variables, self.content,
-                            defaults=defaults, pin=pin)
+            result = render(snap, prompt_id, flags, variables, self.content, pin=pin)
+        except UnresolvedPrompt:
+            raise self._unresolved_error(snap, env_id, prompt_id)
         except MissingVariable as exc:
             raise ServingError(422, str(exc), variable=exc.name)
         except RenderError as exc:

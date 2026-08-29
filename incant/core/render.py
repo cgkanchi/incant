@@ -86,7 +86,9 @@ def _fetch(ctx: _RenderCtx, prompt_id: str, res: Resolution):
             if row.version != res.version:
                 continue
             for sha in row.previous_live:
-                if sha == res.commit or not ctx.snapshot.servable(prompt_id, sha):
+                if sha == res.commit or not ctx.snapshot.servable(
+                    prompt_id, res.version, sha
+                ):
                     continue
                 try:
                     blob = ctx.content.get(prompt_id, res.version, sha)
@@ -156,35 +158,52 @@ def _extract_cached(blob_sha: str, source: str):
     return ev
 
 
-def _closure_optionals(ctx: "_RenderCtx", prompt_id: str, source: str, blob_sha: str) -> set[str]:
-    """Names that are optional across the whole include closure (and required
-    nowhere) — the set to render leniently. Required-anywhere wins over optional.
+def _closure_inputs(
+    ctx: "_RenderCtx", prompt_id: str, source: str, blob_sha: str, root: Resolution,
+) -> tuple[set[str], dict[str, Any]]:
+    """Return closure-wide optional names and refinement defaults.
 
-    Walking the closure mirrors the render's own targeting-resolved includes, so
-    a fragment's guarded-optional variable is treated leniently too.
+    The walk mirrors render-time targeting (including deep pins), so defaults are
+    taken from the versions that will actually contribute to this response.  Jinja
+    includes share their parent's namespace, therefore two contributors cannot
+    safely assign different defaults to the same name: reject that ambiguity rather
+    than let traversal order silently select behavior.
     """
 
     required: set[str] = set()
     optional: set[str] = set()
     seen: set[str] = set()
+    defaults: dict[str, Any] = {}
+    default_owner: dict[str, tuple[str, int]] = {}
 
-    def walk(pid: str, src: str, bsha: str) -> None:
+    def walk(pid: str, res: Resolution, src: str, bsha: str) -> None:
         if pid in seen:
             return
         seen.add(pid)
+        owner = (pid, res.version)
+        for name, value in ctx.snapshot.refinement_defaults.get(owner, {}).items():
+            if name in defaults and defaults[name] != value:
+                previous = default_owner[name]
+                raise RenderError(
+                    f"conflicting refinement default for {name!r}: "
+                    f"{previous[0]} v{previous[1]} and {pid} v{res.version}",
+                    prompt_id=prompt_id,
+                )
+            defaults[name] = value
+            default_owner[name] = owner
         ev = _extract_cached(bsha, src)
         required.update(ev.required)
         optional.update(ev.optional)
         for inc in ev.includes:
             try:
-                res = resolve(ctx.snapshot, inc, ctx.flags)
-                blob = ctx.content.get(inc, res.version, res.commit)
+                child = _pinned(ctx, inc) or resolve(ctx.snapshot, inc, ctx.flags)
+                blob, child = _fetch(ctx, inc, child)
             except Exception:
                 continue  # unresolved/unservable include — the render will surface it
-            walk(inc, blob.source, blob.blob_sha)
+            walk(inc, child, blob.source, blob.blob_sha)
 
-    walk(prompt_id, source, blob_sha)
-    return optional - required
+    walk(prompt_id, root, source, blob_sha)
+    return optional - required, defaults
 
 
 def _compile(env: SandboxedEnvironment, blob_sha: str, source: str, name: str) -> Template:
@@ -311,7 +330,12 @@ def _render_compiled(
     base = _compile(_ENV, blob_sha, source, prompt_id)
     tmpl = _stack_wrapped(base, prompt_id)
 
-    render_vars: dict[str, Any] = {}
+    optional_names, closure_defaults = _closure_inputs(
+        ctx, prompt_id, source, blob_sha, root,
+    )
+    render_vars: dict[str, Any] = dict(closure_defaults)
+    # Explicit caller defaults remain supported for source previews and core users;
+    # request variables below retain final precedence.
     if defaults:
         render_vars.update(defaults)
     render_vars.update(variables)
@@ -319,7 +343,7 @@ def _render_compiled(
     # Inject a lenient (base) Undefined for every closure-optional variable that
     # wasn't supplied, so guards (`{% if x %}`, `{% for m in x %}`) render while
     # any *required* missing variable still raises under StrictUndefined (→ 422).
-    for name in _closure_optionals(ctx, prompt_id, source, blob_sha):
+    for name in optional_names:
         if name not in render_vars:
             render_vars[name] = Undefined(name=name)
 

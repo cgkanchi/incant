@@ -126,8 +126,21 @@ def test_everything_present_returns_head():
     no-ops. This is the only state the old blanket stamp-head handled correctly."""
     ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
     insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users"],
-                         unique_constraints=ucs)
+                         unique_constraints=ucs,
+                         columns={"rule_revisions": [{"name": "state"}],
+                                  "reviews": [{"name": "reviewer_principal_id"}]})
     assert _adoption_revision(insp) == "head"
+
+
+def test_users_present_but_principal_review_identity_adopts_at_d7f3():
+    ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
+    insp = FakeInspector(
+        tables=_CORE_TABLES + ["sessions", "users"],
+        unique_constraints=ucs,
+        columns={"rule_revisions": [{"name": "state"}],
+                 "reviews": [{"name": "reviewer"}]},
+    )
+    assert _adoption_revision(insp) == "d7f3b92e6a41"
 
 
 # --- constraint-vs-index duality ---------------------------------------------------
@@ -153,6 +166,8 @@ def test_review_uniqueness_detected_via_unique_index():
         unique_constraints=ucs,
         indexes={"reviews": [{"name": "some_unique_ix",
                               "column_names": ["draft_id", "reviewer"], "unique": True}]},
+        columns={"rule_revisions": [{"name": "state"}],
+                 "reviews": [{"name": "reviewer_principal_id"}]},
     )
     assert _adoption_revision(insp) == "head"
 
@@ -224,9 +239,14 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         insp = inspect(db.engine())
         with db.engine().connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "d7f3b92e6a41"
+        assert version == "e9a1c4f27b63"
         assert _has_unique_columns(insp, "api_keys", ["prefix"])
-        assert _has_unique_columns(insp, "reviews", ["draft_id", "reviewer"])
+        assert _has_unique_columns(
+            insp, "reviews", ["draft_id", "reviewer_principal_id"]
+        )
+        assert "reviewer_principal_id" in {
+            c["name"] for c in insp.get_columns("reviews")
+        }
         assert "state" in {c["name"] for c in insp.get_columns("rule_revisions")}
         assert "users" in insp.get_table_names()
     finally:

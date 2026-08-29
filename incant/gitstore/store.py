@@ -15,10 +15,50 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 
 class GitError(RuntimeError):
     pass
+
+
+def redact_remote_url(url: str) -> str:
+    """Return a display-safe remote URL with embedded credentials masked."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<invalid remote URL>"
+    if not (parts.username or parts.password):
+        return url
+    host = parts.hostname or ""
+    if parts.port:
+        host += f":{parts.port}"
+    user = parts.username or ""
+    netloc = f"{user}:***@{host}" if parts.password else f"{user}@{host}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def sanitize_remote_error(text: str, url: str) -> str:
+    """Remove both a credential-bearing URL and its password from git output."""
+    safe = redact_remote_url(url)
+    cleaned = (text or "remote operation failed").replace(url, safe)
+    try:
+        password = urlsplit(url).password
+    except ValueError:
+        password = None
+    if password:
+        cleaned = cleaned.replace(password, "***")
+    return cleaned.strip()
+
+
+class RemoteGitError(GitError):
+    """A remote-operation failure whose string form is always credential-safe."""
+
+    def __init__(self, operation: str, url: str, detail: str = "") -> None:
+        self.operation = operation
+        self.display_url = redact_remote_url(url)
+        self.detail = sanitize_remote_error(detail, url)
+        super().__init__(f"{operation} for {self.display_url} failed: {self.detail}")
 
 
 def _ssh_env(ssh_key_path: str | None, known_hosts_path: str | None) -> dict[str, str]:
@@ -278,14 +318,17 @@ class GitStore:
         push-only deploy key; ``known_hosts_path`` pins host keys so a container
         with no ~/.ssh still verifies the remote host.
         """
-        proc = subprocess.run(
-            ["git", "--git-dir", str(self.repo), "push", "--mirror", "--quiet", url],
-            capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
-                 **_ssh_env(ssh_key_path, known_hosts_path)},
-        )
+        try:
+            proc = subprocess.run(
+                ["git", "--git-dir", str(self.repo), "push", "--mirror", "--quiet", url],
+                capture_output=True, text=True, timeout=timeout,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                     **_ssh_env(ssh_key_path, known_hosts_path)},
+            )
+        except subprocess.TimeoutExpired:
+            raise RemoteGitError("push --mirror", url, "operation timed out") from None
         if proc.returncode != 0:
-            raise GitError(f"push --mirror to {url} failed: {proc.stderr.strip()}")
+            raise RemoteGitError("push --mirror", url, proc.stderr)
 
     def commits_ahead(self, last_pushed: str | None) -> int:
         """How many commits on main are not yet at ``last_pushed`` (the backup queue
@@ -333,15 +376,18 @@ class GitStore:
         """Fetch ``url``'s complete ref set into this repo, forced + pruned — the
         read-side mirror of :meth:`push_mirror`. The remote (fed by the full node)
         is authoritative; local refs move to match it."""
-        proc = subprocess.run(
-            ["git", "--git-dir", str(self.repo), "fetch", "--prune", "--quiet",
-             url, "+refs/*:refs/*"],
-            capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
-                 **_ssh_env(ssh_key_path, known_hosts_path)},
-        )
+        try:
+            proc = subprocess.run(
+                ["git", "--git-dir", str(self.repo), "fetch", "--prune", "--quiet",
+                 url, "+refs/*:refs/*"],
+                capture_output=True, text=True, timeout=timeout,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                     **_ssh_env(ssh_key_path, known_hosts_path)},
+            )
+        except subprocess.TimeoutExpired:
+            raise RemoteGitError("mirror fetch", url, "operation timed out") from None
         if proc.returncode != 0:
-            raise GitError(f"mirror fetch from {url} failed: {proc.stderr.strip()}")
+            raise RemoteGitError("mirror fetch", url, proc.stderr)
 
     def clone_mirror(
         self, url: str, *,
@@ -354,14 +400,17 @@ class GitStore:
         if self.exists():
             raise GitError(f"refusing to clone over existing repo at {self.repo}")
         self.repo.parent.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
-            ["git", "clone", "--mirror", "--quiet", url, str(self.repo)],
-            capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
-                 **_ssh_env(ssh_key_path, known_hosts_path)},
-        )
+        try:
+            proc = subprocess.run(
+                ["git", "clone", "--mirror", "--quiet", url, str(self.repo)],
+                capture_output=True, text=True, timeout=timeout,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                     **_ssh_env(ssh_key_path, known_hosts_path)},
+            )
+        except subprocess.TimeoutExpired:
+            raise RemoteGitError("mirror clone", url, "operation timed out") from None
         if proc.returncode != 0:
-            raise GitError(f"mirror clone from {url} failed: {proc.stderr.strip()}")
+            raise RemoteGitError("mirror clone", url, proc.stderr)
 
     # ── writes ───────────────────────────────────────────────────────
 

@@ -134,7 +134,10 @@ def _boot_prime(ctx) -> tuple[bool, dict[str, bool]]:
     env_warm = _warm_all(ctx)
     primed = _prime_auth(ctx)
     default_env = ctx.settings.default_environment
-    ready = primed and env_warm.get(default_env, True)
+    # A missing configured default environment is not servable and therefore cannot
+    # be ready.  Treat absence as failure instead of allowing an empty database to
+    # advertise green readiness.
+    ready = primed and env_warm.get(default_env, False)
     return ready, env_warm
 
 

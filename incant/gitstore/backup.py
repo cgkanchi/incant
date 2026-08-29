@@ -18,31 +18,19 @@ import datetime as dt
 import logging
 import time
 from dataclasses import dataclass
-from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
-from .store import GitError, GitStore
+from .store import GitError, GitStore, redact_remote_url, sanitize_remote_error
 
 log = logging.getLogger("incant.backup")
 
 
 def redact_url(url: str) -> str:
-    """A remote URL safe for responses/logs: credentials embedded in an https URL
-    (``https://user:token@host/…``) are masked; everything else passes through."""
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return url
-    if parts.username or parts.password:
-        host = parts.hostname or ""
-        if parts.port:
-            host += f":{parts.port}"
-        netloc = f"{parts.username or ''}:***@{host}" if parts.password else f"{parts.username}@{host}"
-        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-    return url
+    """Backward-compatible public name for the shared URL sanitizer."""
+    return redact_remote_url(url)
 
 
 @dataclass
@@ -140,9 +128,10 @@ class BackupPusher:
                 known_hosts_path=self.known_hosts_path, timeout=self.timeout,
             )
         except Exception as exc:  # GitError, subprocess.TimeoutExpired
+            safe_error = sanitize_remote_error(str(exc), remote.url)
             log.warning("backup push to remote %d (%s) failed: %s",
-                        remote.id, redact_url(remote.url), exc)
-            return self._status_of(remote, error=str(exc))
+                        remote.id, redact_url(remote.url), safe_error)
+            return self._status_of(remote, error=safe_error)
         remote.last_pushed_sha = head
         remote.last_push_at = dt.datetime.now(dt.timezone.utc)
         session.flush()
@@ -176,8 +165,9 @@ class BackupPusher:
                 )
                 return True
             except Exception as exc:
+                safe_error = sanitize_remote_error(str(exc), r.url)
                 log.warning("content fetch from remote %d (%s) failed: %s",
-                            r.id, redact_url(r.url), exc)
+                            r.id, redact_url(r.url), safe_error)
         return False
 
     def hydrate(self, session: Session) -> bool:
@@ -195,6 +185,7 @@ class BackupPusher:
                          r.id, redact_url(r.url))
                 return True
             except Exception as exc:
+                safe_error = sanitize_remote_error(str(exc), r.url)
                 log.warning("hydration clone from remote %d (%s) failed: %s",
-                            r.id, redact_url(r.url), exc)
+                            r.id, redact_url(r.url), safe_error)
         return False

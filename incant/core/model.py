@@ -163,8 +163,8 @@ class EnvSnapshot:
     stale: bool = False  # true iff serving frozen at last-known-good (DB outage)
     # Prompts whose kill switch is engaged: force the environment default, bypass rules.
     killed: set[str] = field(default_factory=set)
-    # (prompt_id, sha) -> bool; default: everything is servable.
-    servable: Callable[[str, str], bool] = lambda _p, _s: True
+    # (prompt_id, version_number, sha) -> bool; default: everything is servable.
+    servable: Callable[[str, int, str], bool] = lambda _p, _v, _s: True
 
     # -- convenience accessors --------------------------------------------
 

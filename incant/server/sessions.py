@@ -21,6 +21,7 @@ from ..service import get_app
 from ..targeting.audit import record_audit
 from . import passwords
 from .accounts import (
+    begin_initial_setup,
     create_user,
     redeem_invite,
     user_by_email,
@@ -180,8 +181,6 @@ def initial_setup(
     """First boot: create the initial admin ACCOUNT (no API key involved) and sign
     them in. Works exactly once — refused the moment any user exists. Run it right
     after bringing an instance up; machine access stays on API keys (§11)."""
-    if user_count(session) > 0:
-        raise HTTPException(409, "setup already completed — sign in instead")
     if not req.name.strip():
         raise HTTPException(422, "name is required")
     if not valid_email(req.email):
@@ -189,6 +188,8 @@ def initial_setup(
     problem = passwords.validate_password(req.password)
     if problem:
         raise HTTPException(422, problem)
+    if not begin_initial_setup(session):
+        raise HTTPException(409, "setup already completed — sign in instead")
 
     user = create_user(session, email=req.email, name=req.name.strip())
     user.password_hash = passwords.hash_password(req.password)
@@ -197,7 +198,7 @@ def initial_setup(
     session.add(models.RoleBinding(principal_id=user.principal_id, role="admin"))
     record_audit(session, user.email, "auth.setup", "user", user.id,
                  after={"email": user.email, "role": "admin"})
-    get_app().invalidate_auth()
+    get_app().invalidate_auth_after_commit(session)
     return _mint_session(request, response, session,
                          _ident_for_user(session, user), remember=False)
 
@@ -233,7 +234,7 @@ def accept_invite(
     user.last_login_at = dt.datetime.now(dt.timezone.utc)
     record_audit(session, user.email, "user.accept_invite", "user", user.id,
                  after={"email": user.email})
-    get_app().invalidate_auth()
+    get_app().invalidate_auth_after_commit(session)
     return _mint_session(request, response, session,
                          _ident_for_user(session, user), remember=False)
 

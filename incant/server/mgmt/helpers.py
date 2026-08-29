@@ -74,13 +74,14 @@ def _tip_ahead(session, env_id, prompt_id, version, live_sha) -> int:
 
 
 def _current_live(session, env_id, prompt_id, version) -> models.PointerMove | None:
-    return session.execute(
+    row = session.execute(
         select(models.PointerMove).where(
             models.PointerMove.environment_id == env_id,
             models.PointerMove.prompt_id == prompt_id,
             models.PointerMove.version_number == version,
         ).order_by(models.PointerMove.moved_at.desc(), models.PointerMove.id.desc())
     ).scalars().first()
+    return row if row is not None and row.to_sha is not None else None
 
 
 # ── bulk read helpers (overview) ─────────────────────────────────────
@@ -155,7 +156,7 @@ def _current_live_bulk(session, env_id) -> dict[tuple[str, int], models.PointerM
     )
     live = aliased(models.PointerMove, ranked)
     rows = session.execute(select(live).where(ranked.c.rn == 1)).scalars().all()
-    return {(r.prompt_id, r.version_number): r for r in rows}
+    return {(r.prompt_id, r.version_number): r for r in rows if r.to_sha is not None}
 
 
 def _open_draft_counts(session) -> dict[str, int]:

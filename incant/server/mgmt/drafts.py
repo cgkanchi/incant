@@ -48,7 +48,8 @@ def create_draft(
         d = reg.create_draft(
             prompt_id, version_number=req.version_number,
             seed_from_version=req.seed_from_version,
-            author=ident.name, title=req.title, content=req.content,
+            author=ident.name, author_principal_id=ident.principal_id,
+            title=req.title, content=req.content,
         )
     except RegistryError as exc:
         raise HTTPException(400, str(exc))
@@ -95,6 +96,8 @@ def put_draft_content(
         # current tip + content so it can recover instead of clobbering (Finding 2).
         raise HTTPException(409, {"error": "stale_write", "current_sha": exc.current_sha,
                                   "current_content": exc.current_content})
+    except RegistryError as exc:
+        raise HTTPException(409, str(exc))
     return _draft_payload(app, reg, d)
 
 
@@ -213,7 +216,13 @@ def review_draft(
     _require(ident, "editor", project=_project_of(d.prompt_id))
     # "approved" counts toward the review policy; "changes_requested" is recorded and
     # visible but does not, and it clears this principal's earlier approval (and v.v.).
-    reg.add_review(draft_id, reviewer=ident.name, state=req.state)
+    try:
+        reg.add_review(
+            draft_id, reviewer=ident.name, reviewer_principal_id=ident.principal_id,
+            state=req.state,
+        )
+    except RegistryError as exc:
+        raise HTTPException(409, str(exc))
     d = reg.get_draft(draft_id)
     return {"draft_id": draft_id, "status": d.status,
             "approvals": [r.reviewer for r in reg.approvals(draft_id)],
@@ -259,11 +268,14 @@ def create_comment(
     # env-scoped viewer can read the thread but not add to it. Widening writes to env-scoped
     # principals is a policy call left untouched here.
     _require(ident, "viewer", project=_project_of(d.prompt_id))
-    # A committed/discarded draft is settled — no further review conversation on it.
-    if d.status in ("committed", "discarded", "abandoned"):
-        raise HTTPException(409, f"cannot comment on a {d.status} draft")
     # Author is always the authenticated principal, never body-supplied.
-    c = reg.add_comment(draft_id, author=ident.name, body=req.body, anchor=req.anchor)
+    try:
+        c = reg.add_comment(
+            draft_id, author=ident.name, author_principal_id=ident.principal_id,
+            body=req.body, anchor=req.anchor,
+        )
+    except RegistryError as exc:
+        raise HTTPException(409, str(exc))
     return _comment_payload(c)
 
 
@@ -300,13 +312,15 @@ def commit_draft(
         ))
         raise HTTPException(409, {"detail": str(exc), "base_sha": exc.base_sha[:7],
                                   "current_sha": exc.current_sha[:7], "diff": diff})
+    except RegistryError as exc:
+        raise HTTPException(409, str(exc))
     metrics.commits_total.labels(_project_of(d.prompt_id)).inc()
     if outcome.validation["status"] != "valid":
         metrics.validation_failures_total.inc()
     else:
         # §7 track_tip: environments that follow tips auto-advance their live pointer.
         app.auto_advance_tips(session, ident.name, d.prompt_id, d.version_number, outcome.sha)
-    app.invalidate()
+    app.invalidate_after_commit(session)
     # §4's drift lint at the moment it happens: this commit changed the variable set
     # out from under existing refinements. The refinements survive (never deleted
     # behind the author's back) — the warning names them so the author decides.

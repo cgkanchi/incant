@@ -109,13 +109,13 @@ def test_rollout_missing_bucket_by_falls_through():
 
 def test_within_version_fallback_when_live_unservable():
     dead = {"c_v2_live"}
-    snap = base_snapshot(servable=lambda p, s: s not in dead)
+    snap = base_snapshot(servable=lambda p, v, s: s not in dead)
     res = resolve(snap, PID, {})
     assert res.commit == "c_v2_old" and res.content_fallback is True
 
 
 def test_unservable_raises_when_no_history_servable():
-    snap = base_snapshot(servable=lambda p, s: False)
+    snap = base_snapshot(servable=lambda p, v, s: False)
     with pytest.raises(Unservable):
         resolve(snap, PID, {})
 
@@ -130,7 +130,7 @@ def test_paused_rule_ignored():
 
 def test_skip_recorded_for_unservable_rule_target():
     dead = {"c_v3_live", "c_v3_tip"}
-    snap = base_snapshot(servable=lambda p, s: s not in dead, rules=[
+    snap = base_snapshot(servable=lambda p, v, s: s not in dead, rules=[
         parse_rule({"id": "g", "scope": "global", "priority": 1, "when": None,
                     "serve": {"label": "voice-v2"}}),
     ])

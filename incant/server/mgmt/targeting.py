@@ -125,10 +125,10 @@ def get_rules(
                 if vinfo.tip_sha is None:
                     return f"v{version} has no validated tip"
             elif at == "sha":
-                if not sha or not snap.servable(pid, sha):
+                if not sha or not snap.servable(pid, version, sha):
                     return f"pinned SHA for v{version} is not servable"
-            elif vinfo.live_sha is None or not snap.servable(pid, vinfo.live_sha):
-                if not any(snap.servable(pid, s) for s in vinfo.previous_live):
+            elif vinfo.live_sha is None or not snap.servable(pid, version, vinfo.live_sha):
+                if not any(snap.servable(pid, version, s) for s in vinfo.previous_live):
                     return f"v{version} has no servable live content"
         return None
 
@@ -181,7 +181,7 @@ def upsert_rule(
         r = tgt.upsert_rule(env, req.model_dump())
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return {"id": r.id, "rules_version": session.get(models.Environment, env).rules_version}
 
 
@@ -230,7 +230,7 @@ def upsert_rules_batch(
             ids.append(tgt.upsert_rule(env, r.model_dump()).id)
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return {"ids": ids, "count": len(ids),
             "rules_version": session.get(models.Environment, env).rules_version}
 
@@ -254,7 +254,7 @@ def patch_rule(
         tgt.set_rule_status(env, rule_id, req.status)
     except TargetingError as exc:
         raise HTTPException(404, str(exc))
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return {"id": rule_id, "status": req.status}
 
 
@@ -314,7 +314,7 @@ def rollback_targeting(
         result = tgt.rollback(env, req.to_rules_version)
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return result
 
 
@@ -348,8 +348,11 @@ def upsert_segment(
 ):
     _require(ident, "operator", environment=env)
     tgt = app.targeting(session, ident.name)
-    tgt.upsert_segment(env, req.name, req.when)
-    app.invalidate(env)
+    try:
+        tgt.upsert_segment(env, req.name, req.when)
+    except TargetingError as exc:
+        raise HTTPException(400, str(exc))
+    app.invalidate_after_commit(session, env)
     return {"ok": True}
 
 
@@ -369,7 +372,8 @@ def pointer_timeline(
     hist = tgt.pointer_history(env, prompt_id, version)
     current = hist[0].to_sha if hist else None
     return {"environment": env, "prompt_id": prompt_id, "version": version, "moves": [
-        {"sha": m.to_sha[:7], "full_sha": m.to_sha, "from_sha": (m.from_sha[:7] if m.from_sha else None),
+        {"sha": (m.to_sha[:7] if m.to_sha else None), "full_sha": m.to_sha,
+         "from_sha": (m.from_sha[:7] if m.from_sha else None),
          "by": m.moved_by, "at": m.moved_at.isoformat(), "comment": m.comment,
          "current": m.to_sha == current}
         for m in hist
@@ -393,7 +397,7 @@ def make_live(
         )
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return {"status": outcome.status, "move_id": outcome.move_id,
             "rules_version": outcome.rules_version}
 
@@ -445,7 +449,7 @@ def publish(
             archived += 1
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return {"status": outcome.status, "move_id": outcome.move_id,
             "archived": archived,
             "rules_version": session.get(models.Environment, env).rules_version}
@@ -468,7 +472,7 @@ def set_default(
         tgt.set_default(env, req.prompt_id, req.version_number)
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return {"ok": True}
 
 
@@ -482,5 +486,5 @@ def kill_switch(
     _require(ident, "operator", project=_project_of(prompt_id), environment=env)
     tgt = app.targeting(session, ident.name)
     tgt.set_kill(env, prompt_id, req.engaged)
-    app.invalidate(env)
+    app.invalidate_after_commit(session, env)
     return {"ok": True, "engaged": req.engaged}

@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from incant import db, models
 from incant.config import Settings, set_settings
 from incant.db import session_scope
-from incant.server.app import _warm_all
+from incant.server.app import _boot_prime, _warm_all
 from incant.service import AppContext, WarmError, reset_app
 
 from .conftest import db_url_for, reset_schema
@@ -131,10 +131,17 @@ def test_warm_all_reports_per_environment(app):
     assert _warm_all(app) == {"prod": True}              # content available
 
 
+def test_missing_default_environment_is_not_ready(app):
+    with session_scope() as s:
+        s.delete(s.get(models.Environment, "prod"))
+    ready, env_warm = _boot_prime(app)
+    assert ready is False
+    assert env_warm == {}
+
+
 def test_broken_scratch_env_does_not_block_readiness(app):
     # Per-environment readiness: a scratch env whose live pointer has NO servable
     # content must not hold the node out of rotation for a healthy default env.
-    from incant.server.app import _boot_prime
     with session_scope() as s:
         _version(s)
         _pointer(s, "sha_live", _T0)                     # prod: healthy

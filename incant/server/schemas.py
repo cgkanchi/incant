@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from ..core.parse import parse_condition, parse_serve
 
 
 # ── serving ──────────────────────────────────────────────────────────
@@ -73,6 +75,12 @@ class UserStatusRequest(BaseModel):
 class CreatePromptRequest(BaseModel):
     prompt_id: str
     description: str = ""
+
+
+class VersionUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    notes: Optional[str] = None
+    status: Optional[Literal["active", "archived"]] = None
 
 
 class CreateDraftRequest(BaseModel):
@@ -144,14 +152,34 @@ class TestContextRequest(BaseModel):
 # ── targeting ────────────────────────────────────────────────────────
 
 class RuleRequest(BaseModel):
-    id: str
-    scope: str = "prompt"
+    id: str = Field(min_length=1, max_length=255)
+    scope: Literal["global", "prompt"] = "prompt"
     prompt_id: Optional[str] = None
-    priority: int = 10
-    when: Any = None
+    priority: int = Field(default=10, ge=0, le=1_000_000)
+    when: Optional[dict[str, Any]] = None
     serve: dict[str, Any]
-    status: str = "active"
+    status: Literal["active", "paused", "archived"] = "active"
     comment: str = ""
+
+    @field_validator("when")
+    @classmethod
+    def _valid_when(cls, value):
+        parse_condition(value)
+        return value
+
+    @field_validator("serve")
+    @classmethod
+    def _valid_serve(cls, value):
+        parse_serve(value)
+        return value
+
+    @model_validator(mode="after")
+    def _valid_scope(self):
+        if self.scope == "prompt" and not (self.prompt_id or "").strip():
+            raise ValueError("prompt-scoped rules require prompt_id")
+        if self.scope == "global" and self.prompt_id is not None:
+            raise ValueError("global rules must not set prompt_id")
+        return self
 
 
 class RuleBatchRequest(BaseModel):
@@ -163,23 +191,29 @@ class RuleBatchRequest(BaseModel):
 
 
 class RuleStatusRequest(BaseModel):
-    status: str
+    status: Literal["active", "paused", "archived"]
 
 
 class SegmentRequest(BaseModel):
-    name: str
-    when: Any = None
+    name: str = Field(min_length=1, max_length=255)
+    when: Optional[dict[str, Any]] = None
+
+    @field_validator("when")
+    @classmethod
+    def _valid_when(cls, value):
+        parse_condition(value)
+        return value
 
 
 class RollbackRequest(BaseModel):
-    to_rules_version: int
+    to_rules_version: int = Field(ge=1)
     confirm: Optional[str] = None  # locked env: must echo the env name
 
 
 class PointerRequest(BaseModel):
     prompt_id: str
-    version_number: int
-    to_sha: str
+    version_number: int = Field(ge=1)
+    to_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     comment: str = ""
     confirm: Optional[str] = None  # locked env: must echo the prompt id
 
@@ -190,8 +224,8 @@ class PublishRequest(BaseModel):
     # archives fail (DESIGN.md §7). `confirm` echoes the prompt id on a locked env, exactly
     # as the pointer endpoint requires; `archive_rule_ids` may be empty (a plain publish).
     prompt_id: str
-    version_number: int
-    to_sha: str
+    version_number: int = Field(ge=1)
+    to_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     comment: str = ""
     confirm: Optional[str] = None  # locked env: must echo the prompt id
     archive_rule_ids: list[str] = Field(default_factory=list)
@@ -199,7 +233,7 @@ class PublishRequest(BaseModel):
 
 class DefaultRequest(BaseModel):
     prompt_id: str
-    version_number: int
+    version_number: int = Field(ge=1)
     confirm: Optional[str] = None  # locked env: must echo the prompt id
 
 

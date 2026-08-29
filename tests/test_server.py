@@ -108,6 +108,47 @@ def test_unlocked_env_needs_no_confirmation(client):
     assert r.status_code == 200 and r.json()["status"] == "live", r.text
 
 
+def test_invalid_targeting_payloads_are_rejected_before_persistence(client):
+    bad_segment = client.post(
+        "/mgmt/envs/prod/segments",
+        json={"name": "poison", "when": {"unknown": []}},
+        headers=auth(),
+    )
+    assert bad_segment.status_code == 422
+
+    bad_operator = client.post(
+        "/mgmt/envs/prod/rules",
+        json={
+            "id": "bad-op", "scope": "prompt", "prompt_id": "support/system",
+            "when": {"flag": "tier", "op": "approximately", "value": "pro"},
+            "serve": {"version": 2},
+        },
+        headers=auth(),
+    )
+    assert bad_operator.status_code == 422
+
+    bad_rollout = client.post(
+        "/mgmt/envs/prod/rules",
+        json={
+            "id": "bad-rollout", "scope": "prompt", "prompt_id": "support/system",
+            "when": None,
+            "serve": {"rollout": {"bucket_by": "user_id", "weights": [
+                {"version": 2, "weight": 70}, {"default": True, "weight": 20},
+            ]}},
+        },
+        headers=auth(),
+    )
+    assert bad_rollout.status_code == 422
+
+    with session_scope() as s:
+        assert s.get(models.Rule, "bad-op") is None
+        assert s.get(models.Rule, "bad-rollout") is None
+        assert s.execute(select(models.Segment).where(
+            models.Segment.environment_id == "prod",
+            models.Segment.name == "poison",
+        )).scalar_one_or_none() is None
+
+
 def test_operator_cannot_move_pointer(client):
     sha = _tip_sha(client)
     op = make_key(client, "operator", project="support")
@@ -215,6 +256,33 @@ def test_mgmt_overview_and_versions(client):
     assert versions[2]["live_by"] == "Dana"
     names = {v["name"] for v in data["variables"]}
     assert "customer_name" in names
+
+
+def test_version_metadata_and_archive_lifecycle_endpoint(client):
+    r = client.patch(
+        "/mgmt/prompts/support/system/versions/2",
+        json={"label": "stable", "notes": "supported baseline", "status": "archived"},
+        headers=auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "prompt_id": "support/system", "version": 2, "label": "stable",
+        "notes": "supported baseline", "status": "archived",
+    }
+    versions = client.get(
+        "/mgmt/prompts/support/system/versions?environment=prod", headers=auth()
+    ).json()["versions"]
+    assert next(v for v in versions if v["version"] == 2)["status"] == "archived"
+
+    # Archived content remains reproducible/live, but cannot receive new traffic.
+    r = client.post(
+        "/mgmt/envs/prod/rules",
+        json={"id": "archived-target", "scope": "prompt",
+              "prompt_id": "support/system", "priority": 1,
+              "serve": {"version": 2}},
+        headers=auth(),
+    )
+    assert r.status_code == 400
 
 
 def test_overview_flags_unpublished_newer_version(client):

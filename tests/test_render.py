@@ -4,6 +4,7 @@ from incant.core import (
     IncludeCycle,
     IncludeDepthExceeded,
     MissingVariable,
+    RenderError,
     parse_rule,
     render,
 )
@@ -124,6 +125,67 @@ def test_include_follows_flag_targeting():
     assert render(snap, SYS, {"tier": "free"}, {}, content).text == "[v1-rules]"
 
 
+def test_nested_fragment_defaults_follow_resolved_versions():
+    leaf = "shared/leaf"
+    content = DictContent({
+        (SYS, "c1"): '{% include "shared/style/language-rules" %}',
+        (FRAG, "f1"): 'style={% include "shared/leaf" %}',
+        (leaf, "l1"): "{{ tone }}-{{ audience }}",
+    })
+    snap = snapshot(
+        versions={SYS: {1: vinfo(1, live="c1")}, FRAG: {1: vinfo(1, live="f1")},
+                  leaf: {1: vinfo(1, live="l1")}},
+        defaults={SYS: 1, FRAG: 1, leaf: 1},
+    )
+    snap.refinement_defaults = {
+        (FRAG, 1): {"tone": "warm"},
+        (leaf, 1): {"audience": "developers"},
+    }
+    assert render(snap, SYS, {}, {}, content).text == "style=warm-developers"
+    # Request variables always beat configured defaults from any contributor.
+    assert render(snap, SYS, {}, {"tone": "direct"}, content).text == \
+        "style=direct-developers"
+
+
+def test_fragment_default_follows_flag_targeted_version():
+    content = DictContent({
+        (SYS, "c1"): '{% include "shared/style/language-rules" %}',
+        (FRAG, "f1"): "{{ voice }}", (FRAG, "f2"): "{{ voice }}",
+    })
+    snap = snapshot(
+        versions={SYS: {1: vinfo(1, live="c1")},
+                  FRAG: {1: vinfo(1, live="f1"), 2: vinfo(2, live="f2")}},
+        defaults={SYS: 1, FRAG: 1},
+        rules=[parse_rule({"id": "ent", "scope": "prompt", "prompt_id": FRAG,
+                           "priority": 1,
+                           "when": {"flag": "tier", "op": "eq", "value": "enterprise"},
+                           "serve": {"version": 2}})],
+    )
+    snap.refinement_defaults = {
+        (FRAG, 1): {"voice": "plain"},
+        (FRAG, 2): {"voice": "formal"},
+    }
+    assert render(snap, SYS, {"tier": "free"}, {}, content).text == "plain"
+    assert render(snap, SYS, {"tier": "enterprise"}, {}, content).text == "formal"
+
+
+def test_conflicting_contributor_defaults_are_rejected():
+    content = DictContent({
+        (SYS, "c1"): '{% include "shared/style/language-rules" %}',
+        (FRAG, "f1"): "{{ tone }}",
+    })
+    snap = snapshot(
+        versions={SYS: {1: vinfo(1, live="c1")}, FRAG: {1: vinfo(1, live="f1")}},
+        defaults={SYS: 1, FRAG: 1},
+    )
+    snap.refinement_defaults = {
+        (SYS, 1): {"tone": "warm"},
+        (FRAG, 1): {"tone": "formal"},
+    }
+    with pytest.raises(RenderError, match="conflicting refinement default"):
+        render(snap, SYS, {}, {}, content)
+
+
 def test_cycle_detected_at_render():
     content = DictContent({
         ("a", "ca"): '{% include "b" %}',
@@ -208,12 +270,14 @@ def test_within_version_fallback_on_unfetchable_live_content():
 def test_pinned_sha_does_not_fall_back_on_missing_content():
     # A pinned-SHA resolution must NOT degrade to a previous SHA — it 409s (KeyError).
     import pytest as _pytest
+    live_sha = "a" * 40
     content = DictContent({(SYS, "old"): "old"})
     snap = snapshot(
-        versions={SYS: {1: vinfo(1, live="live", previous=("old",))}},
+        versions={SYS: {1: vinfo(1, live=live_sha, previous=("old",))}},
         defaults={SYS: 1},
         rules=[parse_rule({"id": "pin", "scope": "prompt", "prompt_id": SYS, "priority": 1,
-                           "when": None, "serve": {"version": 1, "at": "sha", "sha": "live"}})],
+                           "when": None,
+                           "serve": {"version": 1, "at": "sha", "sha": live_sha}})],
     )
     with _pytest.raises(KeyError):
         render(snap, SYS, {}, {}, content)
@@ -225,7 +289,7 @@ def test_content_fallback_flag_propagates():
     snap = snapshot(
         versions={SYS: {1: vinfo(1, live="live", previous=("old",))}},
         defaults={SYS: 1},
-        servable=lambda p, s: s not in dead,
+        servable=lambda p, v, s: s not in dead,
     )
     r = render(snap, SYS, {}, {}, content)
     assert r.text == "old-content" and r.content_fallback is True

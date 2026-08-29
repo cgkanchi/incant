@@ -152,3 +152,44 @@ def test_on_miss_reload_picks_up_a_freshly_issued_key(app):
     with session_scope() as s:
         ident = app.authenticate(s, f"Bearer {raw}")
     assert ident.principal_id == "p_svc" and ident.has("viewer")
+
+
+def test_snapshot_invalidation_runs_only_after_commit(app):
+    _author_version(app, "support/system", 1, "v1")
+    with session_scope() as s:
+        cached = app.get_snapshot(s, "prod")
+
+    s = db.session_factory()()
+    try:
+        app.invalidate_after_commit(s, "prod")
+        assert app._snapshots["prod"].snapshot is cached
+        s.rollback()
+        assert app._snapshots["prod"].snapshot is cached
+
+        app.invalidate_after_commit(s, "prod")
+        assert app._snapshots["prod"].snapshot is cached
+        s.commit()
+        assert "prod" not in app._snapshots
+    finally:
+        s.close()
+
+
+def test_auth_invalidation_runs_only_after_commit(app):
+    with session_scope() as s:
+        ensure_bootstrap_admin(s, DEV_ADMIN_KEY)
+    with session_scope() as s:
+        app.authenticate(s, f"Bearer {DEV_ADMIN_KEY}")
+    assert app.auth._loaded is True
+
+    s = db.session_factory()()
+    try:
+        app.invalidate_auth_after_commit(s)
+        assert app.auth._loaded is True
+        s.rollback()
+        assert app.auth._loaded is True
+
+        app.invalidate_auth_after_commit(s)
+        s.commit()
+        assert app.auth._loaded is False
+    finally:
+        s.close()

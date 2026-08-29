@@ -118,7 +118,38 @@ class RegistryService:
             v = models.Version(prompt_id=prompt_id, number=number, created_by=created_by)
             self.s.add(v)
             self.s.flush()
+        elif v.status == "archived":
+            raise RegistryError(
+                f"version {number} of {prompt_id!r} is archived and accepts no new commits"
+            )
         return v
+
+    def update_version(
+        self, prompt_id: str, number: int, *, label: str | None = None,
+        notes: str | None = None, status: str | None = None,
+    ) -> models.Version:
+        v = self.s.execute(select(models.Version).where(
+            models.Version.prompt_id == prompt_id,
+            models.Version.number == number,
+        ).with_for_update()).scalar_one_or_none()
+        if v is None:
+            raise RegistryError(f"unknown version {number} for prompt {prompt_id!r}")
+        if label is not None:
+            v.label = label.strip() or None
+        if notes is not None:
+            v.notes = notes
+        if status is not None:
+            if status not in ("active", "archived"):
+                raise RegistryError(f"invalid version status {status!r}")
+            v.status = status
+        self.s.flush()
+        return v
+
+    @staticmethod
+    def _principal_key(principal_id: str | None, display_name: str) -> str:
+        # Direct library callers predate authenticated identities. Keep them
+        # deterministic without confusing a display name for a real principal ID.
+        return principal_id or f"legacy:{display_name}"
 
     # ── drafts ───────────────────────────────────────────────────────
 
@@ -129,6 +160,7 @@ class RegistryService:
         version_number: int | None = None,
         seed_from_version: int | None = None,
         author: str = "",
+        author_principal_id: str | None = None,
         title: str = "",
         content: str | None = None,
     ) -> models.Draft:
@@ -144,6 +176,15 @@ class RegistryService:
         new_version = version_number is None
         if new_version:
             version_number = self.next_version_number(prompt_id)
+        else:
+            version = self.s.execute(select(models.Version).where(
+                models.Version.prompt_id == prompt_id,
+                models.Version.number == version_number,
+            )).scalar_one_or_none()
+            if version is not None and version.status == "archived":
+                raise RegistryError(
+                    f"version {version_number} of {prompt_id!r} is archived and accepts no drafts"
+                )
 
         if content is None:
             if seed_from_version is not None:
@@ -165,6 +206,7 @@ class RegistryService:
             version_number=version_number,
             base_sha=base_sha, git_ref=self.git.draft_ref(draft_id),
             draft_sha=None, title=title, author=author, status="open",
+            author_principal_id=self._principal_key(author_principal_id, author),
         )
         self.s.add(d)
         self.s.flush()
@@ -186,13 +228,27 @@ class RegistryService:
             raise RegistryError(f"unknown draft {draft_id!r}")
         return d
 
+    def _locked_draft(self, draft_id: str) -> models.Draft:
+        d = self.s.execute(
+            select(models.Draft).where(models.Draft.id == draft_id).with_for_update()
+        ).scalar_one_or_none()
+        if d is None:
+            raise RegistryError(f"unknown draft {draft_id!r}")
+        return d
+
+    @staticmethod
+    def _require_draft_status(d: models.Draft, allowed: tuple[str, ...], action: str) -> None:
+        if d.status not in allowed:
+            raise RegistryError(f"cannot {action} a {d.status} draft")
+
     def draft_content(self, draft_id: str) -> str:
         d = self.get_draft(draft_id)
         return self.git.read_draft(draft_id, d.prompt_id, d.version_number) or ""
 
     def put_draft_content(self, draft_id: str, content: str, author: str = "",
                           base_revision: str | None = None) -> ExtractedVars:
-        d = self.get_draft(draft_id)
+        d = self._locked_draft(draft_id)
+        self._require_draft_status(d, ("open", "approved"), "edit")
         # Optimistic concurrency (Finding 2): when the client tells us which revision
         # its editor state was based on, the write is compare-and-swapped at the draft
         # ref — two in-flight autosaves can't finish out of order and let the older text
@@ -215,8 +271,7 @@ class RegistryService:
         # and is no longer current (Finding 1). Re-sync status: an "approved" draft that
         # no longer meets policy drops back to "open". Stale review rows are kept as
         # history (approvals()/the commit gate simply stop counting them).
-        if d.status not in ("committed", "discarded", "abandoned"):
-            d.status = "approved" if self._policy_met(d) else "open"
+        d.status = "approved" if self._policy_met(d) else "open"
         self.s.flush()
         return extract(content)
 
@@ -255,37 +310,44 @@ class RegistryService:
             .order_by(models.Review.id)
         ).scalars())
 
-    def _find_review(self, draft_id: str, reviewer: str) -> models.Review | None:
+    def _find_review(self, draft_id: str, reviewer_principal_id: str) -> models.Review | None:
         # scalar_one_or_none is safe: uq_review makes (draft_id, reviewer) unique, so
         # there is never more than one row to pick (no MultipleResultsFound window).
         return self.s.execute(
             select(models.Review).where(
-                models.Review.draft_id == draft_id, models.Review.reviewer == reviewer
+                models.Review.draft_id == draft_id,
+                models.Review.reviewer_principal_id == reviewer_principal_id,
             )
         ).scalar_one_or_none()
 
-    def add_review(self, draft_id: str, reviewer: str, state: str = "approved") -> models.Review:
-        d = self.get_draft(draft_id)
+    def add_review(
+        self, draft_id: str, reviewer: str, state: str = "approved",
+        reviewer_principal_id: str | None = None,
+    ) -> models.Review:
+        d = self._locked_draft(draft_id)
+        self._require_draft_status(d, ("open", "approved"), "review")
+        reviewer_key = self._principal_key(reviewer_principal_id, reviewer)
         # A principal holds a single, current review state: a later verdict replaces
         # the earlier one. So "changes_requested" clears a prior "approved" (and vice
         # versa) — only "approved" rows count toward the review policy (see approvals()).
         # Bind the verdict to the exact revision it reviewed (Finding 1): it counts only
         # while draft.draft_sha is unchanged. A re-review of edited content re-stamps it.
-        r = self._find_review(draft_id, reviewer)
+        r = self._find_review(draft_id, reviewer_key)
         if r is None:
             try:
                 # Insert under a SAVEPOINT (add + flush both inside, so the rollback
                 # cleanly discards the pending row and leaves the outer transaction
                 # usable).
                 with self.s.begin_nested():
-                    r = models.Review(draft_id=draft_id, reviewer=reviewer, state=state,
+                    r = models.Review(draft_id=draft_id, reviewer=reviewer,
+                                      reviewer_principal_id=reviewer_key, state=state,
                                       reviewed_sha=d.draft_sha)
                     self.s.add(r)
                     self.s.flush()
             except IntegrityError:
                 # A concurrent double-submit inserted the (draft, reviewer) row first —
                 # re-read the winner and update it instead of duplicating.
-                r = self._find_review(draft_id, reviewer)
+                r = self._find_review(draft_id, reviewer_key)
                 if r is None:  # pragma: no cover - the constraint fired, so it exists
                     raise
                 r.state = state
@@ -296,8 +358,7 @@ class RegistryService:
         self.s.flush()
         # Keep the draft's status in sync with the (possibly changed) approval count,
         # so a withdrawn approval re-locks the draft. commit re-checks _policy_met too.
-        if d.status not in ("committed", "discarded", "abandoned"):
-            d.status = "approved" if self._policy_met(d) else "open"
+        d.status = "approved" if self._policy_met(d) else "open"
         self.s.flush()
         return r
 
@@ -309,9 +370,17 @@ class RegistryService:
             .order_by(models.ReviewComment.created_at, models.ReviewComment.id)
         ).scalars())
 
-    def add_comment(self, draft_id: str, author: str, body: str,
-                    anchor: str = "") -> models.ReviewComment:
-        c = models.ReviewComment(draft_id=draft_id, author=author, anchor=anchor, body=body)
+    def add_comment(
+        self, draft_id: str, author: str, body: str, anchor: str = "",
+        author_principal_id: str | None = None,
+    ) -> models.ReviewComment:
+        d = self._locked_draft(draft_id)
+        self._require_draft_status(d, ("open", "approved"), "comment on")
+        c = models.ReviewComment(
+            draft_id=draft_id, author=author,
+            author_principal_id=self._principal_key(author_principal_id, author),
+            anchor=anchor, body=body,
+        )
         self.s.add(c)
         self.s.flush()
         return c
@@ -324,8 +393,8 @@ class RegistryService:
             return True
         # Self-review is opt-out: when allowed, the author's own approval counts.
         allow_self = project.allow_self_review if project else True
-        reviewers = {r.reviewer for r in self.approvals(draft.id)
-                     if allow_self or r.reviewer != draft.author}
+        reviewers = {r.reviewer_principal_id for r in self.approvals(draft.id)
+                     if allow_self or r.reviewer_principal_id != draft.author_principal_id}
         return len(reviewers) >= need
 
     # ── validation & commit ──────────────────────────────────────────
@@ -376,7 +445,16 @@ class RegistryService:
         self, draft_id: str, *, author: str, email: str = "", message: str = "",
         force: bool = False,
     ) -> CommitOutcome:
-        d = self.get_draft(draft_id)
+        d = self._locked_draft(draft_id)
+        self._require_draft_status(d, ("open", "approved"), "commit")
+        version = self.s.execute(select(models.Version).where(
+            models.Version.prompt_id == d.prompt_id,
+            models.Version.number == d.version_number,
+        )).scalar_one_or_none()
+        if version is not None and version.status == "archived":
+            raise RegistryError(
+                f"version {d.version_number} of {d.prompt_id!r} is archived and accepts no commits"
+            )
         if not self._policy_met(d):
             need = self._required_approvals(d)
             raise ReviewRequired(f"{need} approval(s) required before commit")

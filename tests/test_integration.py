@@ -8,8 +8,9 @@ from sqlalchemy import select
 from incant import db, models
 from incant.config import Settings, set_settings
 from incant.db import session_scope
-from incant.registry import ReviewRequired
+from incant.registry import RegistryError, ReviewRequired
 from incant.service import AppContext, ServingError, reset_app
+from incant.targeting.service import TargetingError
 
 from .conftest import db_url_for, reset_schema
 
@@ -186,15 +187,84 @@ def test_targeting_revisions_and_rollback(app):
         revs = app.targeting(s, "op").list_revisions("prod")
         assert any(r.rule_id == "r2" for r in revs) and any(r.rule_id == "r1" for r in revs)
 
-    # Roll back to just after r1 was first created: r2 gone (archived), r1 restored.
+    # Roll back to just after r1 was first created: r2 gone, r1 restored.
     with session_scope() as s:
         result = app.targeting(s, "op").rollback("prod", rv_after_r1)
         assert result["rules_changed"] >= 1
     with session_scope() as s:
         r1 = s.get(models.Rule, "r1")
-        r2 = s.get(models.Rule, "r2")
         assert r1.priority == 5 and r1.serve == {"version": 1}  # restored to original
-        assert r2.status == "archived"                           # created after target
+        assert s.get(models.Rule, "r2") is None                  # absent at target
+
+
+@pytest.mark.parametrize("status", ["committed", "discarded", "abandoned"])
+def test_terminal_drafts_reject_every_mutation(app, status):
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        reg.create_prompt("support/terminal")
+        draft = reg.create_draft(
+            "support/terminal", version_number=1, author="sam", content="original"
+        )
+        draft.status = status
+        draft_id = draft.id
+
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        with pytest.raises(RegistryError):
+            reg.put_draft_content(draft_id, "changed")
+        with pytest.raises(RegistryError):
+            reg.add_review(draft_id, "rae")
+        with pytest.raises(RegistryError):
+            reg.add_comment(draft_id, "rae", "too late")
+        with pytest.raises(RegistryError):
+            reg.commit_draft(draft_id, author="sam")
+
+
+def test_review_policy_uses_principal_ids_not_display_names(app):
+    with session_scope() as s:
+        reg = app.registry(s, "Alex")
+        reg.create_prompt("support/identity")
+        project = s.get(models.Project, "support")
+        project.review_policy = 1
+        project.allow_self_review = False
+        draft = reg.create_draft(
+            "support/identity", version_number=1, author="Alex",
+            author_principal_id="p_author", content="hello",
+        )
+        reg.add_review(
+            draft.id, reviewer="Alex", reviewer_principal_id="p_reviewer",
+            state="approved",
+        )
+        assert draft.status == "approved"
+        assert reg._policy_met(draft) is True
+
+
+def test_archived_version_rejects_new_work_but_keeps_existing_pointer(app):
+    outcome = _author_version(app, "support/archive", 1, "still live")
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        existing = reg.create_draft(
+            "support/archive", version_number=1, author="sam", content="not publishable"
+        )
+        reg.update_version("support/archive", 1, status="archived", notes="retired")
+        with pytest.raises(RegistryError):
+            reg.create_draft(
+                "support/archive", version_number=1, author="sam", content="blocked"
+            )
+        with pytest.raises(RegistryError):
+            reg.commit_draft(existing.id, author="sam")
+        with pytest.raises(TargetingError):
+            app.targeting(s, "sam").upsert_rule("prod", {
+                "id": "archived-target", "scope": "prompt",
+                "prompt_id": "support/archive", "priority": 1,
+                "when": None, "serve": {"version": 1},
+            })
+
+    app.invalidate("prod")
+    with session_scope() as s:
+        response = app.serve(s, "prod", "support/archive", {}, {})
+        assert response["prompt"] == "still live"
+        assert response["versions"]["support/archive"]["commit"] == outcome.sha
 
 
 def test_total_rollback_restores_pointers_defaults_and_kills(app):
@@ -217,7 +287,7 @@ def test_total_rollback_restores_pointers_defaults_and_kills(app):
         tgt.upsert_rule("prod", {"id": "late-rule", "scope": "prompt",
                                  "prompt_id": "support/system", "priority": 1,
                                  "when": None, "serve": {"version": 2}})
-        tgt.upsert_segment("prod", "late-segment", {"flag": "x", "op": "eq", "values": [1]})
+        tgt.upsert_segment("prod", "late-segment", {"flag": "x", "op": "eq", "value": 1})
 
     with session_scope() as s:
         result = app.targeting(s, "op").rollback("prod", target_rv)
@@ -237,17 +307,20 @@ def test_total_rollback_restores_pointers_defaults_and_kills(app):
         assert tgt.current_live("prod", "support/system", 1) == out1.sha
         moves = tgt.pointer_history("prod", "support/system", 1)
         assert len(moves) == 3 and moves[0].comment.startswith("rollback")
-        # Kill disengaged; late rule archived.
+        # Kill disengaged; late rule and segment removed exactly.
         kill = s.execute(select(models.KillSwitch).where(
             models.KillSwitch.environment_id == "prod",
             models.KillSwitch.prompt_id == "support/system")).scalar_one()
         assert kill.engaged is False
-        assert s.get(models.Rule, "late-rule").status == "archived"
+        assert s.get(models.Rule, "late-rule") is None
+        assert s.execute(select(models.Segment).where(
+            models.Segment.environment_id == "prod",
+            models.Segment.name == "late-segment",
+        )).scalar_one_or_none() is None
 
 
-def test_rollback_falls_back_to_rules_only_for_legacy_revisions(app):
-    # Pre-upgrade revisions carry no state; rollback degrades to the legacy
-    # rules-only reconstruction and SAYS so.
+def test_rollback_rejects_legacy_or_nonexistent_revisions(app):
+    # Approximate reconstruction is unsafe: an exact state row is required.
     _author_version(app, "support/system", 1, "v1 {{ x }}")
     with session_scope() as s:
         tgt = app.targeting(s, "op")
@@ -262,18 +335,42 @@ def test_rollback_falls_back_to_rules_only_for_legacy_revisions(app):
         for rev in s.execute(select(models.RuleRevision)).scalars():
             rev.state = None
     with session_scope() as s:
-        result = app.targeting(s, "op").rollback("prod", target_rv)
-        assert result["scope"] == "rules"
+        with pytest.raises(TargetingError):
+            app.targeting(s, "op").rollback("prod", target_rv)
+        with pytest.raises(TargetingError):
+            app.targeting(s, "op").rollback("prod", -1)
+        with pytest.raises(TargetingError):
+            app.targeting(s, "op").rollback("prod", 999999)
     with session_scope() as s:
-        assert s.get(models.Rule, "r2").status == "archived"
-        assert s.get(models.Rule, "r1").serve == {"version": 1}
+        assert s.get(models.Rule, "r2") is not None
 
 
-def test_old_validated_pin_serves_via_db_fallback(app, monkeypatch):
-    # The snapshot's servable set is bounded to what targeting REFERENCES; a pin
-    # reaching past the windowed history must still serve, via the memoized one-row
-    # DB fallback (§8's cache-miss exception applied to validation). Shrink the
-    # window to 1 so the older validated SHA is provably outside the referenced set.
+def test_rescoping_a_rule_to_global_drops_its_prompt_id(app):
+    # A service-level caller (plain dict, no pydantic defaults) rescoping a prompt
+    # rule to global while OMITTING prompt_id must not leave the stale prompt_id on
+    # the merged row — the DB check would reject it, and a row that slipped through
+    # would crash every later snapshot build for the environment.
+    _author_version(app, "support/system", 1, "v1 {{ x }}")
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.upsert_rule("prod", {"id": "r-scope", "scope": "prompt",
+                                 "prompt_id": "support/system", "priority": 5,
+                                 "when": None, "serve": {"version": 1}})
+    with session_scope() as s:
+        app.targeting(s, "op").upsert_rule("prod", {
+            "id": "r-scope", "scope": "global", "priority": 5,
+            "when": None, "serve": {"label": "voice-v2"}})
+    with session_scope() as s:
+        r = s.get(models.Rule, "r-scope")
+        assert r.scope == "global" and r.prompt_id is None
+        from incant.targeting import build_snapshot
+        build_snapshot(s, "prod")  # must not raise
+
+
+def test_old_validated_pin_serves_from_snapshot_validation_index(app, monkeypatch):
+    # Ordering history is bounded, but the snapshot's separate validation index is
+    # complete. An old pin therefore remains servable without request-path DB I/O.
+    # Shrink ordering history to prove the pin is outside that unrelated window.
     from incant.targeting import snapshot as snapmod
     monkeypatch.setattr(snapmod, "_VALIDATED_ORDER_CAP", 1)
 
@@ -288,7 +385,7 @@ def test_old_validated_pin_serves_via_db_fallback(app, monkeypatch):
     assert resp["versions"]["support/system"]["commit"] == out_old.sha
     assert resp["prompt"] == "old 1"
 
-    # A never-validated SHA still 409s — the fallback answers from the DB, not hope.
+    # A never-validated SHA still fails closed from the same in-memory index.
     with session_scope() as s:
         with pytest.raises(ServingError) as exc:
             app.serve(s, "prod", "support/system", {}, {"x": "1"},
