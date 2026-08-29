@@ -190,6 +190,7 @@ def test_remotes_crud_push_and_rbac(tmp_path):
         # Admin registers a remote; the kick endpoint pushes it synchronously.
         r = client.post("/mgmt/remotes", json={"url": remote}, headers=auth())
         assert r.status_code == 200, r.text
+        assert "warning" not in r.json()  # plain path: nothing to warn about
         rid = r.json()["id"]
         r = client.post(f"/mgmt/remotes/{rid}/push", headers=auth())
         assert r.status_code == 200 and r.json()["error"] is None, r.text
@@ -218,6 +219,8 @@ def test_remote_list_redacts_credentials(tmp_path):
                         json={"url": "https://bob:s3cret@git.example.com/backup.git"},
                         headers=auth())
         assert r.status_code == 200 and "s3cret" not in r.text
+        # Embedded credentials are allowed but discouraged: the response says so.
+        assert "auth_ref" in r.json().get("warning", "")
         listing = client.get("/mgmt/remotes", headers=auth())
         assert "s3cret" not in listing.text
         assert "***" in listing.json()["remotes"][0]["url"]
@@ -266,3 +269,24 @@ def test_changing_remote_url_resets_push_history(tmp_path):
         # A different repository has its own empty push history — the queue reopens.
         assert listing[0]["last_pushed_sha"] is None
         assert listing[0]["pending_commits"] >= 1
+
+
+def test_remote_auth_by_scheme(tmp_path):
+    # auth_ref is a PATH, interpreted by URL scheme: ssh → deploy key via
+    # GIT_SSH_COMMAND; https → git credential-store file via credential.helper —
+    # the secret itself never enters the DB or a process argument.
+    from incant.gitstore.store import _remote_auth
+
+    argv, env = _remote_auth("git@github.com:org/x.git", "/secrets/key", "/etc/kh")
+    assert argv == []
+    assert env["GIT_SSH_COMMAND"] == \
+        "ssh -i /secrets/key -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/kh"
+
+    argv, env = _remote_auth("https://github.com/org/x.git", "/secrets/creds", None)
+    assert env == {}
+    assert argv == ["-c", "credential.helper=store --file=/secrets/creds"]
+
+    argv, env = _remote_auth("https://github.com/org/x.git", None, None)
+    assert (argv, env) == ([], {})
+    argv, env = _remote_auth(str(tmp_path / "bare.git"), None, None)
+    assert (argv, env) == ([], {})

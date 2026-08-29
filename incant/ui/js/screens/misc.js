@@ -216,13 +216,49 @@ async function screenAccess() {
       <button class="btn primary sm" data-act="inviteUser">＋ Invite person</button></div>
     ${peopleRows}</div>`;
 
+  // ── Backup remotes: where the content repo mirrors to. Admin-only screen, so
+  // no extra gating. Degrades to nothing on pre-remote servers (catch → skip).
+  let remotesCard = "";
+  try {
+    const remotes = (await GET("/mgmt/remotes")).remotes || [];
+    const rows = remotes.map((r) => {
+      const health = r.error
+        ? `<span class="pill danger" title="${esc(r.error)}">push failing</span>`
+        : r.pending_commits > 0
+          ? `<span class="pill warn">${r.pending_commits} ${plural(r.pending_commits, "commit")} queued</span>`
+          : r.last_pushed_sha ? '<span class="pill live">in sync</span>' : '<span class="pill warn">never pushed</span>';
+      const pushed = r.last_push_at
+        ? `<span class="faint" style="font-size:11px">pushed ${ago(r.last_push_at)}</span>` : "";
+      const toggle = r.enabled
+        ? `<button type="button" class="link btn-bare" data-act="remoteToggle" data-rid="${r.id}" data-on="">Disable</button>`
+        : `<button type="button" class="link btn-bare" data-act="remoteToggle" data-rid="${r.id}" data-on="1">Enable</button>`;
+      return `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:9px 0;border-top:1px solid var(--line2)">
+        <span class="mono" style="font-size:12px;${r.enabled ? "" : "opacity:.55"}">${esc(r.url)}</span>
+        ${r.enabled ? "" : '<span class="pill warn">disabled</span>'}
+        ${health}${pushed}
+        <div class="grow"></div>
+        <button type="button" class="link btn-bare" data-act="remotePush" data-rid="${r.id}">Push now</button>
+        ${toggle}
+        <button type="button" class="link btn-bare" data-act="remoteDelete" data-rid="${r.id}" data-url="${esc(r.url)}" style="color:var(--danger)">Remove</button></div>`;
+    }).join("") ||
+      `<div class="faint" style="font-size:12px;padding:8px 0">No backup remote yet — without one, this container's disk is the only copy of your prompt history. Register a bare git repo (GitHub, GitLab, an internal server) and Incant mirrors every commit to it.</div>`;
+    remotesCard = `<div class="card pad" style="margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="font-size:13px;font-weight:700">Backup remotes</div>
+        <span class="faint" style="font-size:11.5px">git mirrors of the content repo — your durability story</span>
+        <div class="grow"></div>
+        <button class="btn sm" data-act="remoteAdd">＋ Add remote</button></div>
+      ${rows}</div>`;
+  } catch (_) { /* endpoint unavailable — hide the section */ }
+
   main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Access</span>
-      <span class="sub">people, roles, and API keys</span>
+      <span class="sub">people, roles, API keys, and backup remotes</span>
       <div class="grow"></div>
       <button class="btn" data-act="newUser">+ Service key</button></div>
     ${yourKey}
     ${peopleCard}
+    ${remotesCard}
     <div style="display:flex;flex-direction:column;gap:12px">${cards}</div>
     <div style="font-size:11px;color:var(--faint);margin-top:14px">Roles: renderer &lt; viewer &lt; editor &lt; operator &lt; releaser &lt; admin. A role can be scoped instance-wide, to a project, to an environment, or to both. Keys are for machines and are shown once at creation; people sign in with email &amp; password.</div></div>`;
 }

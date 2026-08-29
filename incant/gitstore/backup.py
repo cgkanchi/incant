@@ -124,7 +124,7 @@ class BackupPusher:
         head = self.git.head()
         try:
             self.git.push_mirror(
-                remote.url, ssh_key_path=remote.auth_ref,
+                remote.url, auth_ref=remote.auth_ref,
                 known_hosts_path=self.known_hosts_path, timeout=self.timeout,
             )
         except Exception as exc:  # GitError, subprocess.TimeoutExpired
@@ -160,7 +160,7 @@ class BackupPusher:
         for r in self._remotes(session, enabled_only=True):
             try:
                 self.git.mirror_fetch(
-                    r.url, ssh_key_path=r.auth_ref,
+                    r.url, auth_ref=r.auth_ref,
                     known_hosts_path=self.known_hosts_path, timeout=self.timeout,
                 )
                 return True
@@ -178,7 +178,7 @@ class BackupPusher:
         for r in self._remotes(session, enabled_only=True):
             try:
                 self.git.clone_mirror(
-                    r.url, ssh_key_path=r.auth_ref,
+                    r.url, auth_ref=r.auth_ref,
                     known_hosts_path=self.known_hosts_path, timeout=self.timeout,
                 )
                 log.info("hydrated content repo from remote %d (%s)",

@@ -21,6 +21,19 @@ from .helpers import _require
 router = APIRouter()
 
 
+def _credential_warning(url: str) -> str | None:
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.password or parts.username:
+        return ("credentials embedded in this URL are stored in the database; "
+                "prefer an ssh deploy key or an https credential-store file "
+                "(auth_ref) so the URL stays secret-free")
+    return None
+
+
 def _get_remote(session: Session, remote_id: int) -> models.Remote:
     r = session.get(models.Remote, remote_id)
     if r is None:
@@ -57,7 +70,11 @@ def create_remote(
     session.flush()
     record_audit(session, ident.name, "remote.create", "remote", str(r.id),
                  after={"url": redact_url(r.url), "enabled": r.enabled})
-    return {"ok": True, "id": r.id, "url": redact_url(r.url), "enabled": r.enabled}
+    out = {"ok": True, "id": r.id, "url": redact_url(r.url), "enabled": r.enabled}
+    warning = _credential_warning(r.url)
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 @router.patch("/remotes/{remote_id}")

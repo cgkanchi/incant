@@ -7,7 +7,7 @@ import re
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from ... import models
@@ -263,6 +263,49 @@ def rename_env(
     app.invalidate_auth_after_commit(session)  # env-scoped role bindings moved to the new id
     return {"id": new_id, "protected": protected, "track_tip": track_tip,
             "rules_version": rules_version}
+
+
+@router.get("/setup-status")
+def setup_status(
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    """The first-run checklist's live state (admin): what this deployment still
+    lacks. Cheap counts only — the UI's 'Get set up' card renders from this."""
+    _require(ident, "admin")
+    def _count(q) -> int:
+        return session.execute(select(func.count()).select_from(q)).scalar() or 0
+    return {
+        "prompts": _count(models.Prompt),
+        "people": _count(models.User),
+        "remotes": _count(models.Remote),
+        "service_keys": session.execute(
+            select(func.count()).select_from(models.ApiKey)
+            .where(models.ApiKey.revoked.is_(False))
+        ).scalar() or 0,
+    }
+
+
+@router.post("/seed-example")
+def seed_example(
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    """Load the design's example dataset into an EMPTY library — the fastest way
+    to see the product. One-shot and gated: refused the moment any prompt exists,
+    so it can never pollute a real instance."""
+    _require(ident, "admin")
+    if session.execute(select(models.Prompt.id).limit(1)).first() is not None:
+        raise HTTPException(409, "the library already has prompts — the example "
+                                 "dataset only loads into an empty deployment")
+    from ...seed import seed as run_seed
+    renderer_key = run_seed(app)
+    record_audit(session, ident.name, "seed.example", "project", "support")
+    app.invalidate()
+    app.invalidate_auth_after_commit(session)
+    return {"ok": True, "renderer_key": renderer_key,
+            "note": "store the renderer key now; it is not shown again"}
 
 
 @router.post("/keys")

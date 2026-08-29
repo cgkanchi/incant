@@ -55,9 +55,12 @@ def _author(ctx: AppContext, s, prompt_id, version, content, author, message, *,
     return out
 
 
-def seed() -> str:
-    ctx = AppContext()
-    ctx.initialize()
+def seed(ctx: AppContext | None = None) -> str:
+    """Plant the design's example dataset. Callable from the CLI (fresh context)
+    or in-process from the mgmt seed-example endpoint (the running app's context)."""
+    if ctx is None:
+        ctx = AppContext()
+        ctx.initialize()
 
     with session_scope() as s:
         ensure_bootstrap_admin(s, ctx.settings.bootstrap_admin_key)

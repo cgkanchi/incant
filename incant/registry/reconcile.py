@@ -120,6 +120,102 @@ def sweep_expired_sessions(session: Session) -> int:
     return deleted
 
 
+# ── content adoption (bootstrap-from-remote / manual restore) ────────────────
+
+@dataclass
+class AdoptResult:
+    project: str | None
+    prompts: int
+    versions: int
+    valid_tips: int
+    invalid_tips: int
+
+    def summary(self) -> str:
+        return (f"adopt: project {self.project!r}, {self.prompts} prompt(s), "
+                f"{self.versions} version(s), {self.valid_tips} valid / "
+                f"{self.invalid_tips} invalid tip(s)")
+
+
+def adopt_content_tree(session: Session, git: GitStore) -> AdoptResult | None:
+    """Rebuild the content registry from a populated repo into an EMPTY database —
+    the §6 promise ("the version registry rebuilds from the tree + trailers") made
+    executable. This is bootstrap-from-remote and manual volume restore, NOT drift
+    repair: it runs only when the prompts table is empty (a live system's git↔DB
+    drift stays detect-only in ``reconcile_main_commits``). Returns None when it
+    did not apply.
+
+    Rebuilds: the single project (from the tree's top directory — a repo with
+    several top directories predates one-project-per-deployment and is refused),
+    prompt and version rows, and a fresh ``CommitValidation`` for each version's
+    TIP (validation is a pure function of content: compile + include resolution +
+    cycle check; test contexts don't exist yet, so no render check). Targeting,
+    users, RBAC, and audit live in Postgres — restoring those needs the DB backup.
+    """
+    from ..gitstore import validate_source
+
+    has_prompts = session.execute(select(models.Prompt.id).limit(1)).first()
+    if has_prompts is not None:
+        return None
+    files: dict[tuple[str, int], str] = {}
+    for path in git.list_files(ref="main", suffix=".j2"):
+        parsed = _parse_version_path(path)
+        if parsed is not None:
+            files[parsed] = path
+    if not files:
+        return None
+
+    projects = sorted({pid.split("/", 1)[0] for pid, _ in files})
+    if len(projects) > 1:
+        raise RuntimeError(
+            f"cannot adopt: the repo contains several top-level projects {projects} "
+            "— this deployment hosts exactly one. Split the repo (one deployment "
+            "each) or consolidate under a single top directory first."
+        )
+    project_id = projects[0]
+    session.add(models.Project(id=project_id, name=project_id))
+    session.flush()
+
+    prompt_ids = sorted({pid for pid, _ in files})
+    newest = {pid: max(v for p, v in files if p == pid) for pid in prompt_ids}
+    for pid in prompt_ids:
+        session.add(models.Prompt(id=pid, project_id=project_id))
+    session.flush()
+
+    known = set(prompt_ids)
+
+    def include_source(target: str) -> str | None:
+        top = newest.get(target)
+        return git.read(f"{target}/v{top}.j2") if top else None
+
+    valid = invalid = versions = 0
+    for (pid, number), path in sorted(files.items()):
+        session.add(models.Version(prompt_id=pid, number=number, created_by="adopted"))
+        versions += 1
+        source = git.read(path) or ""
+        hist = git.history(path, limit=1, ref="main")
+        tip_sha = hist[0].sha if hist else None
+        if tip_sha is None:  # pragma: no cover - a listed file always has a commit
+            continue
+        result = validate_source(source, pid, is_known_prompt=lambda p: p in known,
+                                 include_source=include_source, test_render=None)
+        session.add(models.CommitValidation(
+            sha=tip_sha, blob_sha=git.blob_sha(path, ref="main") or "", path=path,
+            prompt_id=pid, version_number=number,
+            status=result.status, error=result.error,
+            extracted_variables=result.extracted_variables,
+        ))
+        valid += int(result.ok)
+        invalid += int(not result.ok)
+    session.flush()
+
+    out = AdoptResult(project=project_id, prompts=len(prompt_ids), versions=versions,
+                      valid_tips=valid, invalid_tips=invalid)
+    log.warning("adopted content from the repo tree — %s. Targeting, users, and "
+                "RBAC are NOT in git; restore the Postgres backup for those.",
+                out.summary())
+    return out
+
+
 # ── pending-promotion recovery (staged publishes interrupted by a crash) ─────
 
 @dataclass

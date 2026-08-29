@@ -151,6 +151,66 @@ async function screenPrompts() {
       ? `<div style="font-size:11.5px;color:var(--faint);margin:-10px 0 16px">Testing status hidden — your access is limited to specific projects.</div>`
       : "";
 
+  // ── "Get set up" card: an admin's first-run checklist, live-checked from the
+  // server and dismissible for good (localStorage). Auto-retires itself once
+  // every item is done, so it never nags a finished deployment.
+  let setupCard = "";
+  if (canRole("admin") && localStorage.getItem("incant_setup_done") !== "1") {
+    try {
+      const st = await GET("/mgmt/setup-status");
+      const items = [
+        [st.prompts > 0, "Add your first prompt",
+         "write one, or load the example dataset to explore with real data", null],
+        [st.remotes > 0, "Register a backup remote",
+         "a git mirror — without one this container's disk is the only copy", "#/access"],
+        [st.people >= 2, "Invite your team",
+         "PMs and engineers sign in with email &amp; password", "#/access"],
+        [st.service_keys > 0, "Issue a service key",
+         "your app renders prompts with a scoped renderer key", "#/access"],
+      ];
+      if (items.every(([done]) => done)) {
+        localStorage.setItem("incant_setup_done", "1");
+      } else {
+        const rows = items.map(([done, label, hint, hash]) => {
+          const mark = done
+            ? '<span style="color:var(--live);font-weight:700" aria-hidden="true">✓</span>'
+            : '<span class="faint" aria-hidden="true">○</span>';
+          const text = done ? `<s class="faint">${label}</s>` : (hash
+            ? `<a class="link" href="${hash}">${label}</a>` : `<b>${label}</b>`);
+          return `<div style="display:flex;gap:8px;align-items:baseline;font-size:12.5px;padding:3px 0">
+            ${mark}<span>${text}${done ? "" : ` <span class="faint" style="font-size:11.5px">— ${hint}</span>`}</span></div>`;
+        }).join("");
+        setupCard = `<div class="card pad" style="margin-bottom:18px">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div style="font-size:13px;font-weight:700">Get set up</div>
+            <span class="faint" style="font-size:11.5px">what this deployment still needs</span>
+            <div class="grow"></div>
+            <button type="button" class="link btn-bare faint" data-act="dismissSetup" style="font-size:11.5px">Dismiss</button></div>
+          <div style="margin-top:8px">${rows}</div></div>`;
+      }
+    } catch (_) { /* endpoint unavailable — no card */ }
+  }
+
+  // A truly empty library gets a welcome, not filter chips over an empty list.
+  if (nPrompts === 0) {
+    const actions = [
+      canRole("editor") ? `<button class="btn primary" data-act="newPrompt">Create your first prompt</button>` : "",
+      canRole("admin") ? `<button class="btn" data-act="seedExample">Load the example dataset</button>` : "",
+    ].filter(Boolean).join("");
+    main.innerHTML = `<div class="screen">
+      <div class="h1row"><div><div class="page-h1">Prompts</div>
+        <div class="page-sub">your library, once there's something in it</div></div></div>
+      ${setupCard}
+      <div class="empty" style="padding:44px 24px">
+        <div style="font-size:15px;font-weight:700;margin-bottom:6px">Nothing here yet</div>
+        <div style="font-size:12.5px;max-width:56ch;margin:0 auto 4px">A prompt is a versioned template your app renders by id — edit and test it here, publish when ready, and the API serves the new text with no deploy.</div>
+        ${actions
+          ? `<div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap">${actions}</div>`
+          : `<div class="faint" style="font-size:12px;margin-top:12px">Ask an editor to create the first prompt.</div>`}
+      </div></div>`;
+    return;
+  }
+
   main.innerHTML = `<div class="screen">
     <div class="h1row">
       <div><div class="page-h1">Prompts</div>
@@ -158,6 +218,7 @@ async function screenPrompts() {
       <div class="grow"></div>
       <input class="search" id="promptSearch" placeholder="Search id or description…" data-act="search" spellcheck="false" value="${esc(_promptsFilter.q)}">
       ${canRole("editor") ? `<button class="btn primary" data-act="newPrompt">New prompt</button>` : ""}</div>
+    ${setupCard}
     <div id="promptFilters" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px">${chips}</div>
     ${accessNote}
     <div id="promptList">${promptListHtml()}</div>

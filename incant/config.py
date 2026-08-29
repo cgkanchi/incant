@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Secrets may arrive as files (k8s/docker secrets mounts) instead of env values:
+# INCANT_<NAME>_FILE points at a file whose stripped contents become the value.
+# The direct env var wins when both are set.
+_FILE_BACKED = ("DATABASE_URL", "KEY_PEPPER", "BOOTSTRAP_ADMIN_KEY")
+
+
+def _load_file_secrets() -> None:
+    for name in _FILE_BACKED:
+        env = f"INCANT_{name}"
+        path = os.environ.get(f"{env}_FILE")
+        if path and env not in os.environ:
+            try:
+                os.environ[env] = Path(path).read_text().strip()
+            except OSError as exc:
+                raise RuntimeError(f"{env}_FILE points at an unreadable file: {exc}") from exc
 
 
 class Settings(BaseSettings):
@@ -82,6 +99,17 @@ class Settings(BaseSettings):
     # Empty ⇒ ssh's default resolution.
     known_hosts_path: str = ""
 
+    # First-boot content bootstrap (§6): a git URL the full node clones from when its
+    # repo volume is EMPTY. A populated Incant repo is ADOPTED (registry rebuilt from
+    # the tree + trailers, tips re-validated); a blank repo means "start fresh and
+    # push here". Either way the remote is registered as an enabled backup target.
+    # Unreachable while set ⇒ boot FAILS (a mistyped remote must not silently create
+    # a fresh lineage that later force-pushes over the real one). Empty ⇒ off.
+    bootstrap_remote: str = ""
+    # Credential for the bootstrap remote: path to an ssh private key (ssh URLs) or
+    # to a git credential-store file (https URLs) — becomes the remote's auth_ref.
+    bootstrap_remote_key: str = ""
+
     # Targeting-revision checkpointing (§7): a FULL environment state is materialized
     # every this-many revisions (plus always on baseline and rollback revisions); the
     # revisions in between carry only their per-object change. Replay/rollback to a
@@ -134,6 +162,7 @@ _settings: Settings | None = None
 def get_settings() -> Settings:
     global _settings
     if _settings is None:
+        _load_file_secrets()
         _settings = Settings()
     return _settings
 

@@ -61,17 +61,34 @@ class RemoteGitError(GitError):
         super().__init__(f"{operation} for {self.display_url} failed: {self.detail}")
 
 
-def _ssh_env(ssh_key_path: str | None, known_hosts_path: str | None) -> dict[str, str]:
-    """GIT_SSH_COMMAND for a remote operation: a push-only deploy key (a remote's
-    ``auth_ref``) and/or a pinned known_hosts file, so a container with no ~/.ssh
-    still authenticates and verifies the host. Empty when neither is set (https
-    remotes, file:// test remotes)."""
+def _remote_auth(url: str, auth_ref: str | None,
+                 known_hosts_path: str | None) -> tuple[list[str], dict[str, str]]:
+    """(extra git argv, extra env) for a remote operation, by URL scheme.
+
+    ``auth_ref`` is always a filesystem PATH — the secret itself never enters the
+    database or a process argument:
+
+    * ssh URLs — path to a private deploy key, wired via GIT_SSH_COMMAND (with the
+      optional pinned known_hosts so a container with no ~/.ssh still verifies
+      hosts);
+    * http(s) URLs — path to a git *credential-store* file (one line:
+      ``https://user:token@host``), wired via ``credential.helper=store`` so the
+      remote URL in the DB stays credential-free.
+    """
+    argv: list[str] = []
+    env: dict[str, str] = {}
+    if url.startswith(("http://", "https://")):
+        if auth_ref:
+            argv += ["-c", f"credential.helper=store --file={auth_ref}"]
+        return argv, env
     parts = ["ssh"]
-    if ssh_key_path:
-        parts += ["-i", ssh_key_path, "-o", "IdentitiesOnly=yes"]
+    if auth_ref:
+        parts += ["-i", auth_ref, "-o", "IdentitiesOnly=yes"]
     if known_hosts_path:
         parts += ["-o", f"UserKnownHostsFile={known_hosts_path}"]
-    return {"GIT_SSH_COMMAND": " ".join(parts)} if len(parts) > 1 else {}
+    if len(parts) > 1:
+        env["GIT_SSH_COMMAND"] = " ".join(parts)
+    return argv, env
 
 
 class ConcurrentUpdate(GitError):
@@ -130,16 +147,19 @@ class GitStore:
     def exists(self) -> bool:
         return (self.repo / "HEAD").exists()
 
-    def init(self) -> None:
-        """Create a bare repo with an initial empty commit on main."""
-        if self.exists():
-            return
-        self.repo.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "init", "--bare", "--initial-branch=main", str(self.repo)],
-            capture_output=True, check=True,
+    def has_main(self) -> bool:
+        """True iff refs/heads/main resolves — a mirror-clone of a BLANK remote
+        yields a repo with no refs at all."""
+        proc = subprocess.run(
+            ["git", "--git-dir", str(self.repo), "rev-parse", "--verify", "--quiet",
+             "refs/heads/main"],
+            capture_output=True,
         )
-        # Seed an empty root commit so `main` exists.
+        return proc.returncode == 0
+
+    def seed_main(self) -> None:
+        """Create the initial empty commit on main (fresh repo, or one mirror-cloned
+        from a blank remote)."""
         empty_tree = self._git("hash-object", "-t", "tree", "--stdin", "-w", input="").strip()
         env = self._author_env("Incant", "incant@localhost")
         commit = self._git(
@@ -147,6 +167,20 @@ class GitStore:
             env=env,
         ).strip()
         self._git("update-ref", "refs/heads/main", commit)
+
+    def init(self) -> None:
+        """Create a bare repo with an initial empty commit on main. A repo that
+        already exists but lacks main (cloned from a blank remote) is seeded too."""
+        if self.exists():
+            if not self.has_main():
+                self.seed_main()
+            return
+        self.repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(self.repo)],
+            capture_output=True, check=True,
+        )
+        self.seed_main()
 
     def _author_env(self, name: str, email: str) -> dict:
         # The acting user is the author; Incant is the committer. Dates are real
@@ -305,7 +339,7 @@ class GitStore:
 
     def push_mirror(
         self, url: str, *,
-        ssh_key_path: str | None = None,
+        auth_ref: str | None = None,
         known_hosts_path: str | None = None,
         timeout: float | None = None,
     ) -> None:
@@ -314,16 +348,18 @@ class GitStore:
         Remotes are write-only backup targets: Incant force-pushes its own lineage,
         and anything anyone else pushed there is overwritten/pruned (§6). ``--mirror``
         carries main AND the draft refs, so a clone of the remote is the complete
-        content history. ``ssh_key_path`` (the remote's ``auth_ref``) selects a
-        push-only deploy key; ``known_hosts_path`` pins host keys so a container
-        with no ~/.ssh still verifies the remote host.
+        content history. ``auth_ref`` is the remote's credential PATH (ssh deploy
+        key, or an https credential-store file — see ``_remote_auth``);
+        ``known_hosts_path`` pins host keys so a container with no ~/.ssh still
+        verifies the remote host.
         """
         try:
+            auth_argv, auth_env = _remote_auth(url, auth_ref, known_hosts_path)
             proc = subprocess.run(
-                ["git", "--git-dir", str(self.repo), "push", "--mirror", "--quiet", url],
+                ["git", *auth_argv, "--git-dir", str(self.repo),
+                 "push", "--mirror", "--quiet", url],
                 capture_output=True, text=True, timeout=timeout,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
-                     **_ssh_env(ssh_key_path, known_hosts_path)},
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **auth_env},
             )
         except subprocess.TimeoutExpired:
             raise RemoteGitError("push --mirror", url, "operation timed out") from None
@@ -369,7 +405,7 @@ class GitStore:
 
     def mirror_fetch(
         self, url: str, *,
-        ssh_key_path: str | None = None,
+        auth_ref: str | None = None,
         known_hosts_path: str | None = None,
         timeout: float | None = None,
     ) -> None:
@@ -377,12 +413,12 @@ class GitStore:
         read-side mirror of :meth:`push_mirror`. The remote (fed by the full node)
         is authoritative; local refs move to match it."""
         try:
+            auth_argv, auth_env = _remote_auth(url, auth_ref, known_hosts_path)
             proc = subprocess.run(
-                ["git", "--git-dir", str(self.repo), "fetch", "--prune", "--quiet",
-                 url, "+refs/*:refs/*"],
+                ["git", *auth_argv, "--git-dir", str(self.repo),
+                 "fetch", "--prune", "--quiet", url, "+refs/*:refs/*"],
                 capture_output=True, text=True, timeout=timeout,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
-                     **_ssh_env(ssh_key_path, known_hosts_path)},
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **auth_env},
             )
         except subprocess.TimeoutExpired:
             raise RemoteGitError("mirror fetch", url, "operation timed out") from None
@@ -391,7 +427,7 @@ class GitStore:
 
     def clone_mirror(
         self, url: str, *,
-        ssh_key_path: str | None = None,
+        auth_ref: str | None = None,
         known_hosts_path: str | None = None,
         timeout: float | None = None,
     ) -> None:
@@ -401,11 +437,11 @@ class GitStore:
             raise GitError(f"refusing to clone over existing repo at {self.repo}")
         self.repo.parent.mkdir(parents=True, exist_ok=True)
         try:
+            auth_argv, auth_env = _remote_auth(url, auth_ref, known_hosts_path)
             proc = subprocess.run(
-                ["git", "clone", "--mirror", "--quiet", url, str(self.repo)],
+                ["git", *auth_argv, "clone", "--mirror", "--quiet", url, str(self.repo)],
                 capture_output=True, text=True, timeout=timeout,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
-                     **_ssh_env(ssh_key_path, known_hosts_path)},
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **auth_env},
             )
         except subprocess.TimeoutExpired:
             raise RemoteGitError("mirror clone", url, "operation timed out") from None

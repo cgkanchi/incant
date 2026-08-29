@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from .reconcile import (
+    AdoptResult,
     MainReconcileResult,
     PendingRecoveryResult,
     ReconcileResult,
+    adopt_content_tree,
     reconcile_drafts,
     reconcile_main_commits,
     recover_pending_promotions,
@@ -21,6 +23,7 @@ from .service import (
 )
 
 __all__ = [
+    "AdoptResult",
     "CommitOutcome",
     "ConcurrencyError",
     "MainReconcileResult",
@@ -30,6 +33,7 @@ __all__ = [
     "RegistryService",
     "ReviewRequired",
     "StaleDraftWrite",
+    "adopt_content_tree",
     "reconcile_drafts",
     "reconcile_main_commits",
     "recover_pending_promotions",

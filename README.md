@@ -172,6 +172,9 @@ Chrome/Chromium binary if yours lives elsewhere.
 | `INCANT_CONTENT_FETCH_SECONDS` | `30.0` | serve-replica content mirror-fetch interval; `0` disables (shared-volume deployments) |
 | `INCANT_BACKUP_TIMEOUT_SECONDS` | `60.0` | timeout for one remote git operation (push/fetch/clone) |
 | `INCANT_KNOWN_HOSTS_PATH` | *(empty)* | pinned known_hosts file for ssh remotes; empty ⇒ ssh defaults |
+| `INCANT_BOOTSTRAP_REMOTE` | *(empty)* | git URL cloned on first boot when the repo volume is empty (blank remote ⇒ fresh start pushed there; populated Incant repo ⇒ content adopted; unreachable ⇒ boot fails). Auto-registered as a backup remote |
+| `INCANT_BOOTSTRAP_REMOTE_KEY` | *(empty)* | credential **path** for the bootstrap remote — an ssh private key or an https credential-store file mounted into the container |
+| `INCANT_DATABASE_URL_FILE`, `INCANT_KEY_PEPPER_FILE`, `INCANT_BOOTSTRAP_ADMIN_KEY_FILE` | *(empty)* | read the corresponding value from a file (Docker/K8s secrets) instead of the environment |
 | `INCANT_AUTH_TTL` | `5.0` | in-memory key-cache TTL (s); bounds revocation propagation across replicas |
 | `INCANT_AUTH_THROTTLE_LIMIT` | `20` | failed bearer auths per IP per window before `429`; `0` disables |
 | `INCANT_AUTH_THROTTLE_WINDOW` | `60.0` | sliding window (s) for the failed-auth throttle |

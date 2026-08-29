@@ -24,5 +24,12 @@ and publish; services render with full reproducibility (`versions` map +
 - One project per deployment; environment-scoped RBAC
   (renderer < viewer < editor < operator < releaser < admin); audit log for every
   mutation.
+- Deployment: `INCANT_BOOTSTRAP_REMOTE` first-boot clone (blank ⇒ fresh start,
+  populated ⇒ content adoption, unreachable ⇒ refuse to boot), `_FILE`-suffixed
+  secret envs, scheme-aware remote credentials (`auth_ref` is always a mounted
+  file path — ssh key or https credential store; never a secret in the DB).
+- First run: the default environment exists from boot; admin "Get set up"
+  checklist; one-click example dataset on an empty library; backup-remote
+  management in the UI (add/push/disable with live sync state).
 
 See DESIGN.md for the architecture and §17 for deliberate divergences.

@@ -954,6 +954,104 @@ const Actions = {
       render();
     } catch (e) { toast(errText(e), true); }
   },
+  // ── first-run: setup checklist + example dataset ───────────────────
+  dismissSetup() {
+    localStorage.setItem("incant_setup_done", "1");
+    render();
+  },
+  seedExample() {
+    openModal(`
+      <h3>Load the example dataset?</h3>
+      <p class="hint">Fills the empty library with a small support project — prompts with real version history, targeting rules, segments and test contexts — so every screen has something to show. It also issues a renderer service key (shown once) so you can try the render API. Only works while the library is empty.</p>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button id="seedBtn" class="btn primary" data-act="seedExampleConfirm">Load example data</button></div>`);
+  },
+  async seedExampleConfirm() {
+    const b = el("seedBtn");
+    if (b) { b.disabled = true; b.textContent = "Loading…"; }
+    try {
+      const r = await POST("/mgmt/seed-example");
+      closeModal();
+      openModal(`
+        <h3>Example data loaded</h3>
+        <p class="hint">A renderer service key was issued for the example project (scope: support · prod). Copy it now if you want to try the render API — it is <b>not recoverable</b>.</p>
+        <input readonly data-act="selectAll" value="${esc(r.renderer_key)}"
+          style="width:100%;font-family:'IBM Plex Mono',monospace;font-size:12px">
+        <div class="modal-actions"><button class="btn primary" data-act="closeModal">Done</button></div>`);
+      render();
+    } catch (e) {
+      closeModal();
+      toast(e && e.status === 409
+        ? "The library already has prompts — example data only loads into an empty library"
+        : errText(e), true);
+    }
+  },
+  // ── backup remotes (Access screen, admin) ──────────────────────────
+  remoteAdd() {
+    openModal(`
+      <h3>Add a backup remote</h3>
+      <p class="hint">A bare git repo Incant mirrors every commit to. Best practice: a dedicated repo with a write deploy key that only this deployment holds — use an <span class="mono">ssh://</span> URL and point the credential path at the mounted private key. Don't put tokens in the URL.</p>
+      <div class="field"><label>Git URL</label>
+        <input id="remUrl" placeholder="git@github.com:acme/incant-backup.git" spellcheck="false" data-enter="remBtn"></div>
+      <div class="field"><label>Credential path <span style="text-transform:none;font-weight:400">· optional — a file mounted into the container</span></label>
+        <input id="remAuth" placeholder="/run/secrets/incant_deploy_key" spellcheck="false" data-enter="remBtn"></div>
+      <div class="err" id="remErr"></div>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button id="remBtn" class="btn primary" data-act="remoteAddConfirm">Add &amp; push</button></div>`);
+  },
+  async remoteAddConfirm() {
+    const errEl = el("remErr");
+    if (errEl) errEl.textContent = "";
+    const url = (el("remUrl")?.value || "").trim();
+    if (!url) { if (errEl) errEl.textContent = "Enter the remote's git URL."; return; }
+    try {
+      const r = await POST("/mgmt/remotes", {
+        url, auth_ref: (el("remAuth")?.value || "").trim() || null, enabled: true,
+      });
+      closeModal();
+      if (r.warning) toast(r.warning, true);
+      // First push immediately: the operator learns right now whether the
+      // remote is reachable, not at the next background flush.
+      try {
+        const p = await POST(`/mgmt/remotes/${r.id}/push`);
+        toast(p.error ? `Remote added, but the first push failed: ${p.error}` : "Remote added and pushed", !!p.error);
+      } catch (e) { toast(`Remote added, but the first push failed: ${errText(e)}`, true); }
+      render();
+    } catch (e) {
+      const msg = e && e.status === 409 ? "That remote is already registered" : errText(e);
+      if (errEl) errEl.textContent = msg; else toast(msg, true);
+    }
+  },
+  async remotePush(ds) {
+    try {
+      const p = await POST(`/mgmt/remotes/${ds.rid}/push`);
+      toast(p.error ? `Push failed: ${p.error}` : "Pushed", !!p.error);
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  async remoteToggle(ds) {
+    try {
+      await PATCH(`/mgmt/remotes/${ds.rid}`, { enabled: !!ds.on });
+      toast(ds.on ? "Remote enabled" : "Remote disabled — commits will queue but not push");
+      render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  remoteDelete(ds) {
+    openModal(`
+      <h3>Remove this remote?</h3>
+      <p class="hint">Incant stops mirroring to <span class="mono">${esc(ds.url)}</span>. The repo itself isn't touched — it just stops receiving new commits, so it slowly goes stale as a backup.</p>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn danger" data-act="remoteDeleteConfirm" data-rid="${esc(ds.rid)}">Remove remote</button></div>`);
+  },
+  async remoteDeleteConfirm(ds) {
+    try {
+      await api("DELETE", `/mgmt/remotes/${ds.rid}`);
+      closeModal(); toast("Remote removed"); render();
+    } catch (e) { toast(errText(e), true); }
+  },
   issueKey(ds) {
     openModal(`
       <h3>Issue key</h3>

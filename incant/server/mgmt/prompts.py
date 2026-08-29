@@ -83,7 +83,10 @@ def overview(
         raise HTTPException(403, "your account doesn't have viewing access yet — ask "
                                  "an admin to grant you a role in Access (service "
                                  "render keys can't browse the library)")
-    snap = build_snapshot(session, environment)
+    try:
+        snap = build_snapshot(session, environment)
+    except KeyError:
+        raise HTTPException(404, f"unknown environment {environment!r}")
     # Bulk-load everything the per-prompt loop needs BEFORE the loop, so the landing
     # screen stays flat as the library grows. It used to fan out — per prompt — into a
     # validation SELECT (_tip_ahead), a pointer SELECT (_current_live), a draft-count
@@ -161,7 +164,10 @@ def get_versions(
     reg = app.registry(session)
     if not reg.prompt_exists(prompt_id):
         raise HTTPException(404, f"unknown prompt {prompt_id!r}")
-    snap = build_snapshot(session, environment)
+    try:
+        snap = build_snapshot(session, environment)
+    except KeyError:
+        raise HTTPException(404, f"unknown environment {environment!r}")
     vers = snap.versions.get(prompt_id, {})
     default_v = snap.defaults.get(prompt_id)
     version_rows = reg.get_versions(prompt_id)

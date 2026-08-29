@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..db import claim_full_writer_role, engine, release_full_writer_role, session_scope
 from ..registry import (
+    adopt_content_tree,
     reconcile_drafts,
     reconcile_main_commits,
     recover_pending_promotions,
@@ -277,6 +278,28 @@ async def lifespan(app: FastAPI):
         # Exactly one full writer per deployment: claim the role before touching
         # anything (a second full node fails fast here, not mid-double-reconcile).
         claim_full_writer_role()
+        # First-boot content bootstrap (§6): with INCANT_BOOTSTRAP_REMOTE set and an
+        # EMPTY repo volume, clone the remote — a populated Incant repo gets adopted
+        # below; a blank one means "start fresh and push here" (initialize() seeds
+        # main into the empty clone). Unreachable ⇒ fail the boot: a mistyped remote
+        # must not silently mint a fresh lineage that later force-pushes over the
+        # real one.
+        if settings.bootstrap_remote and not ctx.git.exists():
+            try:
+                ctx.git.clone_mirror(
+                    settings.bootstrap_remote,
+                    auth_ref=settings.bootstrap_remote_key or None,
+                    known_hosts_path=settings.known_hosts_path or None,
+                    timeout=settings.backup_timeout_seconds,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"INCANT_BOOTSTRAP_REMOTE is set but could not be cloned: {exc}. "
+                    "Refusing to initialize a fresh repository while a bootstrap "
+                    "remote is configured — fix the URL/credentials or unset it."
+                ) from exc
+            log.info("bootstrap: cloned content repo from %s",
+                     settings.bootstrap_remote)
         ctx.initialize()  # git init + schema (Alembic migrations)
         with session_scope() as s:
             ensure_bootstrap_admin(s, settings.bootstrap_admin_key)
@@ -285,9 +308,35 @@ async def lifespan(app: FastAPI):
         # main-reconcile result is recorded on the ctx so /healthz + the incant_reconcile_*
         # gauges reflect drift from the very first boot, not just after the first interval.
         with session_scope() as s:
-            # Pending recovery FIRST: a staged publish whose DB transaction committed
-            # must reach main before the draft sweep would clean up its (now orphan)
-            # draft ref, and before the main sweep takes its drift census.
+            # The configured serving default must always exist — a fresh database
+            # would otherwise boot into a UI that 404s on its own default env (and
+            # delete_env already refuses to remove it). Idempotent by lookup.
+            from .. import models
+            if s.get(models.Environment, settings.default_environment) is None:
+                s.add(models.Environment(id=settings.default_environment,
+                                         name=settings.default_environment))
+                s.flush()
+                ctx.targeting(s, "system").ensure_baseline(settings.default_environment)
+                log.info("boot: created default environment %r",
+                         settings.default_environment)
+            # Bootstrap-remote registration (idempotent) + content ADOPTION: a
+            # populated repo meeting an empty database rebuilds the registry from
+            # the tree + trailers (bootstrap-from-remote AND manual volume restore
+            # both land here). Runs before the sweeps so adopted content is never
+            # censused as drift. Targeting/users/RBAC still need the PG backup.
+            if settings.bootstrap_remote:
+                exists = s.execute(
+                    select(models.Remote).where(
+                        models.Remote.url == settings.bootstrap_remote)
+                ).scalar_one_or_none()
+                if exists is None:
+                    s.add(models.Remote(url=settings.bootstrap_remote, enabled=True,
+                                        auth_ref=settings.bootstrap_remote_key or None))
+            adopt_content_tree(s, ctx.git)
+            # Pending recovery FIRST among the sweeps: a staged publish whose DB
+            # transaction committed must reach main before the draft sweep would
+            # clean up its (now orphan) draft ref, and before the main sweep takes
+            # its drift census.
             recover_pending_promotions(s, ctx.git)
             reconcile_drafts(s, ctx.git)
             sweep_expired_sessions(s)
