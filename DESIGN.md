@@ -670,7 +670,7 @@ GET /mgmt/audit?…
 | Models/validation | pydantic v2 | one definition → API docs + validation + UI forms |
 | Templates | jinja2 (`SandboxedEnvironment`, `jinja2.meta`) | the requirement; AST access for variable inference |
 | Content | `git` CLI via subprocess | the content store; battle-tested ssh/https transport for backup pushes |
-| Database | Postgres + SQLAlchemy core + Alembic | control plane; LISTEN/NOTIFY. SQLite for dev/single-node (poll fallback) |
+| Database | Postgres + SQLAlchemy core + Alembic | control plane — everywhere, dev and tests included (no SQLite path: it hid FK, migration, and concurrency differences) |
 | Config | pydantic-settings | bootstrap only: DB URL, OIDC, bind, repo path |
 | Metrics | prometheus-client | |
 
@@ -835,9 +835,8 @@ scattered through code comments — so a reader knows which promises are live.
   happened at commit time; a second ceremony added friction without adding safety.
   Draft review (N approvals, self-review configurable per project) IS enforced.
 - **No Postgres LISTEN/NOTIFY (§7, §13).** Propagation is the 2-second poll alone
-  (`INCANT_CONTROL_POLL_SECONDS`), which already meets the <2s target and works
-  identically on SQLite. NOTIFY remains an optimization to layer in when poll load
-  matters.
+  (`INCANT_CONTROL_POLL_SECONDS`), which already meets the <2s target. NOTIFY
+  remains an optimization to layer in when poll load matters.
 - **No OIDC/SSO (§11).** Principals are API keys plus browser sessions minted from a
   key (`POST /auth/session`, HttpOnly + CSRF). OIDC would mint the same server-side
   sessions and is additive.

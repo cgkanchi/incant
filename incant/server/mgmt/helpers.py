@@ -103,9 +103,9 @@ def _validated_by_version(session) -> dict[tuple[str, int], list[str]]:
     returns K for a live_sha that has fallen off the window, which the UI shows as the
     "50+ edits waiting" territory.
 
-    A window function (``row_number() OVER (PARTITION BY prompt,version ORDER BY newest)``,
-    supported on SQLite ≥3.25 and Postgres) bounds the per-version work to K rows rather
-    than scanning the entire validation history on every overview call."""
+    A window function (``row_number() OVER (PARTITION BY prompt,version ORDER BY newest)``)
+    bounds the per-version work to K rows rather than scanning the entire validation
+    history on every overview call."""
     rn = func.row_number().over(
         partition_by=(models.CommitValidation.prompt_id, models.CommitValidation.version_number),
         order_by=(models.CommitValidation.validated_at.desc(), models.CommitValidation.id.desc()),

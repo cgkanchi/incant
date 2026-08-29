@@ -276,7 +276,7 @@ class RegistryService:
             try:
                 # Insert under a SAVEPOINT (add + flush both inside, so the rollback
                 # cleanly discards the pending row and leaves the outer transaction
-                # usable on both Postgres and SQLite).
+                # usable).
                 with self.s.begin_nested():
                     r = models.Review(draft_id=draft_id, reviewer=reviewer, state=state,
                                       reviewed_sha=d.draft_sha)

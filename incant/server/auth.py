@@ -258,7 +258,7 @@ def touch_last_seen(row: "models.Session") -> None:
     """Bump ``last_seen_at`` at most once per 5 minutes (cheap write suppression)."""
     now = dt.datetime.now(dt.timezone.utc)
     last = row.last_seen_at
-    if last is not None and last.tzinfo is None:  # SQLite returns naive UTC
+    if last is not None and last.tzinfo is None:  # defensive: treat naive as UTC
         last = last.replace(tzinfo=dt.timezone.utc)
     if last is None or (now - last).total_seconds() >= _LAST_SEEN_MIN_INTERVAL:
         row.last_seen_at = now
@@ -295,7 +295,7 @@ def _expired(expires_at, now: dt.datetime) -> bool:
     if expires_at is None:
         return False
     exp = expires_at
-    if exp.tzinfo is None:  # SQLite returns naive datetimes; treat as UTC
+    if exp.tzinfo is None:  # defensive: treat naive as UTC
         exp = exp.replace(tzinfo=dt.timezone.utc)
     return exp <= now
 

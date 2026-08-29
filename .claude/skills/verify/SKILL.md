@@ -5,15 +5,21 @@ description: Build, launch, and drive Incant locally to verify a change end-to-e
 
 # Verifying Incant changes
 
-## Launch (no Postgres/Docker needed)
+## Launch (Postgres via the bundled compose db)
 
-The app runs fine on SQLite for verification. From a scratch dir:
+The control plane is Postgres-only (no SQLite path — it hid FK/migration/concurrency
+differences). Use the compose `db` with a scratch database so verification never
+touches the app's `incant` DB. From a scratch dir:
 
 ```bash
-export INCANT_DATABASE_URL="sqlite:///$(pwd)/incant.db"
+docker compose -f /home/cgkanchi/code/incant/docker-compose.yaml up -d db
+docker compose -f /home/cgkanchi/code/incant/docker-compose.yaml exec -T db \
+  psql -U incant -d postgres -c 'DROP DATABASE IF EXISTS incant_verify' \
+       -c 'CREATE DATABASE incant_verify'
+export INCANT_DATABASE_URL="postgresql+psycopg://incant:incant@localhost:5432/incant_verify"
 export INCANT_REPO_PATH="$(pwd)/repo"
 export INCANT_ALLOW_DEV_KEY=1 INCANT_BOOTSTRAP_ADMIN_KEY=incant_sk_dev_admin  # dev key needs explicit opt-in
-uv run --project /home/cgkanchi/code/incant incant init
+uv run --project /home/cgkanchi/code/incant incant init     # builds the schema via Alembic
 uv run --project /home/cgkanchi/code/incant incant seed     # example dataset; prints a renderer key
 uv run --project /home/cgkanchi/code/incant incant serve --host 127.0.0.1 --port 8765  # background
 ```
@@ -46,11 +52,13 @@ Gotchas:
 curl -s -H "Authorization: Bearer incant_sk_dev_admin" "http://127.0.0.1:8765/mgmt/overview?environment=prod"
 ```
 
-Tests (`uv run pytest`, ~1 min, SQLite) are CI's job — verification is driving the running app.
+Tests (`uv run pytest`, needs the compose `db` up) are CI's job — verification is
+driving the running app.
 
 The proven flows here are now a committed, repeatable suite: `tests/browser/` (opt-in,
 Playwright over system Chrome). Run it with
 `INCANT_BROWSER_TESTS=1 uv run --group browser pytest tests/browser -q` — it boots its
-own seeded SQLite server, so it's a fast way to re-confirm the big UI flows (sign-in,
+own seeded server on a dedicated `incant_browser_test` Postgres database (wiped and
+rebuilt through the real migrations), so it's a fast way to re-confirm the big UI flows (sign-in,
 CSRF, drafts/autosave conflict, review invalidation, targeting, publish, sign-out,
 mobile/reduced-motion) after a change.

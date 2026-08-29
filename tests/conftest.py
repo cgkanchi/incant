@@ -20,15 +20,19 @@ from sqlalchemy.engine import make_url
 
 from incant.core import ContentBlob, EnvSnapshot, VersionInfo
 
-# DB-touching tests run against whatever INCANT_TEST_DATABASE_URL points at (a real
-# Postgres in CI/Docker), falling back to a throwaway SQLite file only for quick
-# local unit runs. Serving always uses Postgres.
+# DB-touching tests run against Postgres — always. INCANT_TEST_DATABASE_URL points at
+# your server; unset, it defaults to the compose `db` service (`docker compose up -d
+# db`). There is deliberately no SQLite fallback: it enforced no FKs, skipped the
+# Alembic path, and serialized writes — three ways a green local run could lie.
 #
 # Tests DROP + recreate all tables, so they must never touch the app's database.
-# For Postgres we always redirect to a dedicated '<db>_test' database on the same
-# server (creating it on demand) — even if the env var points at the app DB — so a
-# test run can never wipe live/demo data.
-TEST_DATABASE_URL = os.environ.get("INCANT_TEST_DATABASE_URL")
+# We always redirect to a dedicated '<db>_test' database on the same server
+# (creating it on demand) — even if the env var points at the app DB — so a test
+# run can never wipe live/demo data.
+TEST_DATABASE_URL = os.environ.get(
+    "INCANT_TEST_DATABASE_URL",
+    "postgresql+psycopg://incant:incant@localhost:5432/incant",
+)
 
 
 def _is_pg(url: str) -> bool:
@@ -44,11 +48,11 @@ def _test_db_url(raw: str) -> str:
 
 
 # The URL every DB-touching test actually uses.
-EFFECTIVE_TEST_URL = _test_db_url(TEST_DATABASE_URL) if TEST_DATABASE_URL else None
+EFFECTIVE_TEST_URL = _test_db_url(TEST_DATABASE_URL)
 
 
-def db_url_for(tmp_path) -> str:
-    return EFFECTIVE_TEST_URL or f"sqlite:///{tmp_path/'incant.db'}"
+def db_url_for(tmp_path) -> str:  # tmp_path kept for call-site compatibility
+    return EFFECTIVE_TEST_URL
 
 
 def _ensure_pg_database(url: str) -> None:
@@ -69,9 +73,18 @@ def _ensure_pg_database(url: str) -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 def _prepare_test_database():
-    """Once per session: make sure the isolated Postgres test DB exists."""
-    if EFFECTIVE_TEST_URL and _is_pg(EFFECTIVE_TEST_URL):
+    """Once per session: make sure the isolated Postgres test DB exists — and fail
+    with the actual fix if the server isn't there, instead of 200 cryptic errors."""
+    try:
         _ensure_pg_database(EFFECTIVE_TEST_URL)
+    except Exception as exc:
+        pytest.exit(
+            f"\nPostgres is required for the test suite and {make_url(EFFECTIVE_TEST_URL).host}:"
+            f"{make_url(EFFECTIVE_TEST_URL).port or 5432} did not answer ({type(exc).__name__}).\n"
+            "Start the bundled server:  docker compose up -d db\n"
+            "or point INCANT_TEST_DATABASE_URL at a Postgres you manage.",
+            returncode=2,
+        )
     yield
 
 

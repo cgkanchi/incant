@@ -22,7 +22,7 @@ from .. import models
 # HEAD of each list is ever read downstream — tip_sha (the newest validated) and the
 # `previous_live` §10 fallback, which never reaches past the most recent few moves — so
 # windowing to K bounds each snapshot rebuild to K rows per (prompt, version) instead of
-# the whole history. (SQLite ≥3.25 / Postgres window functions.)
+# the whole history (window functions).
 _VALIDATED_ORDER_CAP = 50     # tip_sha reads only [0]; K is defensive headroom
 _POINTER_HISTORY_CAP = 100    # previous_live scans distinct recent moves; nothing past ~K
 

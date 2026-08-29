@@ -14,10 +14,13 @@ To run for real::
 
     INCANT_BROWSER_TESTS=1 uv run --group browser pytest tests/browser -q
 
-The server is a real uvicorn subprocess over a throwaway SQLite DB + git repo,
-seeded once per module via the ``incant`` CLI. Browser flows are driven with the
-Playwright *sync* API directly (no pytest-playwright), exactly like the ad-hoc
-verification drives this suite was promoted from.
+The server is a real uvicorn subprocess over a dedicated, wiped-per-module Postgres
+database (``<db>_browser_test`` on the same server the unit tests use) + a throwaway
+git repo, seeded once per module via the ``incant`` CLI. Because the database starts
+empty, every browser run builds its schema through the REAL Alembic migration path —
+the same DDL production boots run. Browser flows are driven with the Playwright
+*sync* API directly (no pytest-playwright), exactly like the ad-hoc verification
+drives this suite was promoted from.
 """
 
 from __future__ import annotations
@@ -32,6 +35,10 @@ import urllib.error
 import urllib.request
 
 import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
+
+from ..conftest import TEST_DATABASE_URL, _ensure_pg_database
 
 # ── collection guard ─────────────────────────────────────────────────────────
 # Without Playwright the browser tests must not even be collected, so the default
@@ -87,9 +94,32 @@ def _tail(path: str, n: int = 60) -> str:
 
 
 # ── server ───────────────────────────────────────────────────────────────────
+
+def _browser_db_url() -> str:
+    """The suite's own isolated database: the unit-test server's `_browser_test`
+    sibling. Ends in `_test`, so the reset safety rail applies to it too."""
+    u = make_url(TEST_DATABASE_URL)
+    base = (u.database or "incant").removesuffix("_test")
+    return u.set(database=f"{base}_browser_test").render_as_string(hide_password=False)
+
+
+def _wipe_database(url: str) -> None:
+    """Create-if-missing, then empty the browser database completely, so `incant
+    init` rebuilds it through the real Alembic migrations from revision zero."""
+    _ensure_pg_database(url)
+    eng = create_engine(url, isolation_level="AUTOCOMMIT", future=True)
+    try:
+        with eng.connect() as c:
+            c.execute(text("DROP SCHEMA public CASCADE"))
+            c.execute(text("CREATE SCHEMA public"))
+    finally:
+        eng.dispose()
+
+
 @pytest.fixture(scope="module")
 def server(tmp_path_factory):
-    """A real uvicorn subprocess on a free port over a throwaway SQLite DB + repo.
+    """A real uvicorn subprocess on a free port over the wiped browser database +
+    a throwaway repo.
 
     ``incant init`` + ``incant seed`` run once (module scope) via the CLI as a
     subprocess (``python -m incant.cli`` — resolves against the installed package,
@@ -97,9 +127,11 @@ def server(tmp_path_factory):
     base URL; the process is terminated on teardown.
     """
     tmp = tmp_path_factory.mktemp("incant-browser")
+    db_url = _browser_db_url()
+    _wipe_database(db_url)
     env = dict(os.environ)
     env.update({
-        "INCANT_DATABASE_URL": f"sqlite:///{tmp}/incant.db",
+        "INCANT_DATABASE_URL": db_url,
         "INCANT_REPO_PATH": f"{tmp}/repo",
         "INCANT_ALLOW_DEV_KEY": "1",
         "INCANT_BOOTSTRAP_ADMIN_KEY": ADMIN_KEY,

@@ -1,9 +1,5 @@
-"""Multi-user concurrency — only meaningful against a real Postgres pool.
-
-SQLite serializes writers, so it cannot exercise the lost-update race the atomic
-`rules_version` bump defends against. These tests are skipped unless
-INCANT_TEST_DATABASE_URL points at Postgres.
-"""
+"""Multi-user concurrency: parallel writers racing the atomic `rules_version` bump
+and the pointer-move log, against a real Postgres pool (the only control plane)."""
 
 from __future__ import annotations
 
@@ -18,11 +14,6 @@ from incant.db import session_scope
 from incant.service import AppContext, reset_app
 
 from .conftest import EFFECTIVE_TEST_URL, reset_schema
-
-pytestmark = pytest.mark.skipif(
-    not (EFFECTIVE_TEST_URL and EFFECTIVE_TEST_URL.startswith("postgres")),
-    reason="concurrency tests require Postgres (set INCANT_TEST_DATABASE_URL)",
-)
 
 
 @pytest.fixture()

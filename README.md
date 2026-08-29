@@ -10,7 +10,7 @@ See [DESIGN.md](./DESIGN.md) for the full design. This repository implements it.
 
 - **Git is the content store.** One canonical bare repo, Incant-owned, one file per
   version (`support/system/v2.j2`). Per-file history, immutable SHAs, diffs.
-- **Postgres/SQLite is the control plane.** Targeting rules, segments, live pointers,
+- **Postgres is the control plane.** Targeting rules, segments, live pointers,
   review state, RBAC, audit — SHAs only, never template text.
 - **Memory is the serving plane.** Compiled templates + rule snapshots; the render
   path is **memory-first** — the common case touches no git, no disk, no DB.
@@ -110,35 +110,32 @@ Sharing the full node's volume works too (set the interval to 0).
 
 ## Testing
 
-Pure-logic tests run anywhere. The DB-touching tests default to a throwaway SQLite
-file for a quick local pass, but the real target is Postgres — point
-`INCANT_TEST_DATABASE_URL` at one (the compose `db` publishes `localhost:5432`) to run
-the full suite, including the concurrency tests that prove no lost `rules_version`
-bumps under parallel writes:
+The suite runs against Postgres — the only control plane there is. There is
+deliberately no SQLite fallback: it enforced no foreign keys, took a `create_all`
+shortcut past the Alembic migrations, and serialized writes — three ways a green
+local run could lie about production. Bring up the bundled `db` once and `pytest`
+finds it by default:
 
 ```bash
-uv run pytest                                    # quick local pass (SQLite)
-
-# Full suite against Postgres — bring up just the bundled db, point the tests at it:
 docker compose up -d db
-INCANT_TEST_DATABASE_URL=postgresql+psycopg://incant:incant@localhost:5432/incant \
-  uv run pytest                                  # full suite incl. the concurrency tests
+uv run pytest                # full suite, incl. the concurrency tests
 ```
 
-The two concurrency tests (`tests/test_concurrency.py` — no lost `rules_version` bumps,
-every pointer move recorded under parallel writes) **only run against Postgres**; they
-are skipped on SQLite, whose serialized writer can't exercise the race. Everything else
-runs on both.
+Point `INCANT_TEST_DATABASE_URL` at a different Postgres if you manage your own.
+If no server answers, the suite exits immediately with that exact instruction
+instead of failing test-by-test.
 
 Tests drop and recreate all tables, so they are **isolated to a dedicated
-`<db>_test` database**: the URL above is redirected to `incant_test` (created on
+`<db>_test` database**: the URL is redirected to `incant_test` (created on
 demand) and the app's `incant` database is never touched. A safety rail refuses to
-reset any Postgres database whose name doesn't end in `_test`.
+reset any database whose name doesn't end in `_test`.
 
 ### Browser end-to-end tests (opt-in)
 
 `tests/browser/` drives the real UI with Playwright over your **system Chrome**
-(headless) against a throwaway SQLite server it spins up itself. It's opt-in — the
+(headless) against a server it boots itself on a dedicated `incant_browser_test`
+database — wiped per run and rebuilt through the real Alembic migrations, so the
+browser suite also exercises the production DDL path. It's opt-in — the
 `browser` dependency group and the `INCANT_BROWSER_TESTS=1` flag are both required, so
 the default `uv run pytest` above is untouched (the suite is skipped, or not collected
 at all when Playwright is absent):

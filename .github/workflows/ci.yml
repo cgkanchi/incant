@@ -7,11 +7,11 @@ on:
     branches: [main]
 
 jobs:
-  # The real target: the full suite against Postgres, including the concurrency
-  # tests (no lost rules_version bumps under parallel writes) that SQLite's
-  # serialized writer cannot exercise. Tests isolate themselves to an
-  # `incant_test` sibling database automatically.
-  test-postgres:
+  # The full suite against Postgres — the only control plane there is. Includes the
+  # concurrency tests (no lost rules_version bumps under parallel writes) and the
+  # live Alembic migration path. Tests isolate themselves to an `incant_test`
+  # sibling database automatically.
+  test:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -35,18 +35,23 @@ jobs:
           INCANT_TEST_DATABASE_URL: postgresql+psycopg://incant:incant@localhost:5432/incant
         run: uv run pytest -q
 
-  # The quick pass most contributors run locally — keeps the SQLite path honest.
-  test-sqlite:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync
-      - run: uv run pytest -q
-
-  # Browser end-to-end suite over the runner's system Chrome (headless).
+  # Browser end-to-end suite over the runner's system Chrome (headless), against a
+  # dedicated Postgres database it wipes and rebuilds through the real migrations.
   test-browser:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: incant
+          POSTGRES_PASSWORD: incant
+          POSTGRES_DB: incant
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U incant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -55,4 +60,5 @@ jobs:
         env:
           INCANT_BROWSER_TESTS: "1"
           INCANT_BROWSER_CHROME: /usr/bin/google-chrome
+          INCANT_TEST_DATABASE_URL: postgresql+psycopg://incant:incant@localhost:5432/incant
         run: uv run --group browser pytest tests/browser -q

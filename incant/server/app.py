@@ -265,7 +265,7 @@ async def lifespan(app: FastAPI):
     if settings.mode == "serve":
         _verify_serve_prerequisites(ctx)  # fail fast; no writes in serve mode
     else:
-        ctx.initialize()  # git init + schema (create_all on SQLite, Alembic on Postgres)
+        ctx.initialize()  # git init + schema (Alembic migrations)
         with session_scope() as s:
             ensure_bootstrap_admin(s, settings.bootstrap_admin_key)
         # Reconcile git draft refs against DB draft rows before serving warms, sweep any

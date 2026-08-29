@@ -1,4 +1,10 @@
-"""Database engine, session, and Base. Postgres in prod, SQLite for dev/single-node."""
+"""Database engine, session, and Base. The control plane is Postgres — everywhere.
+
+There is deliberately no SQLite path: it enforced no foreign keys by default, took a
+create_all shortcut past the Alembic migrations, and its serialized writer masked the
+concurrency this app is built for — three ways for a local green run to lie about
+production. Dev and tests run against the compose ``db`` service instead.
+"""
 
 from __future__ import annotations
 
@@ -28,19 +34,10 @@ _SessionLocal: sessionmaker | None = None
 
 
 def _make_engine():
-    url = get_settings().database_url
-    kwargs: dict = {"future": True, "pool_pre_ping": True}
-    if url.startswith("sqlite"):
-        # SQLite is supported only for isolated single-process unit tests, never
-        # for serving — its serialized writer masks the concurrency this app is
-        # built for. FastAPI runs sync endpoints in a threadpool, so allow the
-        # connection to cross threads.
-        kwargs["connect_args"] = {"check_same_thread": False}
-    else:
-        # Real pool for the multi-user control plane. Sized for a threadpool plus
-        # headroom; pre-ping survives Postgres restarts.
-        kwargs.update(pool_size=10, max_overflow=20, pool_recycle=1800)
-    return create_engine(url, **kwargs)
+    # Real pool for the multi-user control plane. Sized for a threadpool plus
+    # headroom; pre-ping survives Postgres restarts.
+    return create_engine(get_settings().database_url, future=True, pool_pre_ping=True,
+                         pool_size=10, max_overflow=20, pool_recycle=1800)
 
 
 def engine():
@@ -171,10 +168,8 @@ def _adoption_revision(inspector) -> str:
 def ensure_schema() -> None:
     """Bring the database schema up to date for boot / `incant init`.
 
-    SQLite (tests/dev): plain ``create_all`` — no Alembic, no migration history to
-    carry, and the test suite must stay green without invoking Alembic. Postgres
-    (production control plane): drive the schema through Alembic migrations so real
-    deployments get versioned, reviewable DDL:
+    The schema is driven through Alembic migrations everywhere, so every
+    environment gets versioned, reviewable DDL:
 
       * fresh DB (no tables)                      → ``alembic upgrade head`` builds it;
       * already under Alembic (``alembic_version``) → ``alembic upgrade head`` applies
@@ -189,11 +184,6 @@ def ensure_schema() -> None:
         ``stamp head`` used to silently skip.
     """
     from . import models  # noqa: F401 — ensure models are registered
-
-    url = get_settings().database_url
-    if url.startswith("sqlite"):
-        Base.metadata.create_all(engine())
-        return
 
     inspector = inspect(engine())
     tables = set(inspector.get_table_names())

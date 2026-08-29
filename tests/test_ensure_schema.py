@@ -12,8 +12,6 @@ available, exercise the full stamp-then-upgrade path end to end.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from incant.db import _adoption_revision, _has_unique_columns
@@ -164,18 +162,15 @@ def test_has_unique_columns_ignores_wrong_column_set_and_non_unique():
     assert _has_unique_columns(insp, "api_keys", ["id"]) is True
 
 
-# --- Integration: real Postgres round-trip (skipped without a DB) -------------------
+# --- Integration: real Postgres round-trip ------------------------------------------
 #
-# Only runs when INCANT_TEST_DATABASE_URL points at a reachable Postgres. Almost never
-# set in a plain unit run, so this skips cleanly there. It upgrades a scratch schema to
-# the *middle* of the chain (67fb7465ee07), drops alembic_version to simulate a
-# non-Alembic install stuck at that state, then proves ensure_schema adopts + migrates
-# it to head with the later uniqueness objects materialised.
+# Upgrades a scratch schema to the *middle* of the chain (67fb7465ee07), drops
+# alembic_version to simulate a non-Alembic install stuck at that state, then proves
+# ensure_schema adopts + migrates it to head with the later objects materialised.
 
-_PG_URL = os.environ.get("INCANT_TEST_DATABASE_URL")
+from .conftest import TEST_DATABASE_URL as _PG_URL
 
 
-@pytest.mark.skipif(not _PG_URL, reason="INCANT_TEST_DATABASE_URL not set (no Postgres)")
 def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
     from sqlalchemy import create_engine, inspect, text
     from sqlalchemy.engine import make_url
