@@ -113,11 +113,20 @@ def test_review_unique_but_state_column_missing_adopts_at_b7d2():
     assert _adoption_revision(insp) == "b7d2e6f4a1c9"
 
 
+def test_state_present_but_users_missing_adopts_at_c4e8():
+    """rule_revisions.state present but the users table is absent → d7f3b92e6a41
+    hasn't run; adopt at c4e8a17d5b23 so the users migration applies."""
+    ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
+    insp = FakeInspector(tables=_CORE_TABLES + ["sessions"], unique_constraints=ucs)
+    assert _adoption_revision(insp) == "c4e8a17d5b23"
+
+
 def test_everything_present_returns_head():
     """A schema matching the current models (e.g. create_all) → stamp head, upgrade
     no-ops. This is the only state the old blanket stamp-head handled correctly."""
     ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
-    insp = FakeInspector(tables=_CORE_TABLES + ["sessions"], unique_constraints=ucs)
+    insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users"],
+                         unique_constraints=ucs)
     assert _adoption_revision(insp) == "head"
 
 
@@ -140,7 +149,7 @@ def test_prefix_uniqueness_detected_via_unique_index():
 def test_review_uniqueness_detected_via_unique_index():
     ucs = _prefix_unique_via_constraint()
     insp = FakeInspector(
-        tables=_CORE_TABLES + ["sessions"],
+        tables=_CORE_TABLES + ["sessions", "users"],
         unique_constraints=ucs,
         indexes={"reviews": [{"name": "some_unique_ix",
                               "column_names": ["draft_id", "reviewer"], "unique": True}]},
@@ -215,10 +224,11 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         insp = inspect(db.engine())
         with db.engine().connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "c4e8a17d5b23"
+        assert version == "d7f3b92e6a41"
         assert _has_unique_columns(insp, "api_keys", ["prefix"])
         assert _has_unique_columns(insp, "reviews", ["draft_id", "reviewer"])
         assert "state" in {c["name"] for c in insp.get_columns("rule_revisions")}
+        assert "users" in insp.get_table_names()
     finally:
         set_settings(saved)
         db.reset_engine()

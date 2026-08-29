@@ -251,6 +251,30 @@ class Principal(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class User(Base):
+    """A human account: email + password sign-in for the UI (the §11 'Users' door).
+
+    One-to-one with a ``Principal`` (kind ``user``) — roles/bindings/keys stay on the
+    principal, so RBAC is identical for humans and services. The password hash is
+    scrypt with per-user salt and self-describing parameters (see server/passwords.py);
+    invites/resets store only the token's hash, never the token."""
+
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String, primary_key=True)            # u_<hex>
+    principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id"), unique=True)
+    email: Mapped[str] = mapped_column(String, unique=True, index=True)  # stored lowercase
+    name: Mapped[str] = mapped_column(String, default="")
+    # None until the invite is accepted (or after an admin reset that forces a new one).
+    password_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="invited")       # invited | active | disabled
+    invite_token_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    invite_expires_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    last_login_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
+
 class ApiKey(Base):
     __tablename__ = "api_keys"
     # The lookup prefix is UNIQUE: 24 random bits (raw[:16]) collided near ~5k keys, so

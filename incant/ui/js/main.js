@@ -14,6 +14,8 @@ function parseRoute() {
   if (parts[0] === "audit") return { name: "audit", pid: null, q };
   if (parts[0] === "access") return { name: "access", pid: null, q };
   if (parts[0] === "envs") return { name: "envs", pid: null, q };
+  if (parts[0] === "welcome")  // invite/reset redemption — a public, signed-out route
+    return { name: "welcome", pid: null, q, token: decodeURIComponent(parts[1] || "") };
   if (parts[0] === "p") {
     const pid = decodeURIComponent(parts[1] || "");
     let screen = parts[2] || "overview";
@@ -30,6 +32,7 @@ const SCREENS = {
   prompts: screenPrompts, overview: screenOverview, draft: screenDraft, compare: screenCompare,
   rules: screenRules, pointers: screenPointers, segments: screenSegments,
   play: screenPlay, audit: screenAudit, access: screenAccess, envs: screenEnvironments,
+  welcome: screenWelcome,
 };
 
 // Reload the environment list into State.envs after any env mutation, so the sidebar
@@ -90,6 +93,26 @@ async function loadAcctSessions() {
 }
 
 // ── actions ──────────────────────────────────────────────────────────
+// Shared post-sign-in tail for every door (key, password, setup, invite).
+async function _afterSignIn(session, message) {
+  applySession(session);   // caches the CSRF token + identity; never touches storage
+  // Clear credential inputs so nothing lingers in the DOM.
+  for (const id of ["signinKey", "switchKeyIn", "signinPassword", "setupPassword"]) {
+    const e = document.getElementById(id); if (e) e.value = "";
+  }
+  // Re-fetch environments: a prior signed-out boot() left State.envs a bare fallback with
+  // no `protected` flags — stale until re-read, which would hide PROTECTED badges and skip
+  // the type-to-confirm the server still enforces.
+  try {
+    const e = await GET("/mgmt/envs");
+    State.envs = e.environments;
+    if (!State.envs.find((x) => x.id === State.env)) State.env = State.envs[0]?.id || "prod";
+  } catch (_) { /* session may still be bad — the 401 screen will handle it */ }
+  closeModal();
+  toast(message || "Signed in");
+  render();
+}
+
 const Actions = {
   go(ds) { closeModal(); Actions.navClose(); go(ds.hash); },   // navigating dismisses any modal + the drawer
   // Off-canvas nav drawer (mobile). Pure body-class toggles — no re-render needed.
@@ -145,21 +168,50 @@ const Actions = {
       if (errEl) errEl.textContent = msg; else toast(msg, true);
       return;
     }
-    applySession(session);   // caches the CSRF token + identity; never touches storage
-    // Clear the just-used key from the input so it doesn't linger in the DOM.
-    for (const id of ["signinKey", "switchKeyIn"]) { const e = document.getElementById(id); if (e) e.value = ""; }
-    // Re-fetch environments: a prior signed-out boot() left State.envs a bare fallback with
-    // no `protected` flags — stale until re-read, which would hide PROTECTED badges and skip
-    // the type-to-confirm the server still enforces.
-    try {
-      const e = await GET("/mgmt/envs");
-      State.envs = e.environments;
-      if (!State.envs.find((x) => x.id === State.env)) State.env = State.envs[0]?.id || "prod";
-    } catch (_) { /* session may still be bad — the 401 screen will handle it */ }
-    closeModal();
-    toast("Signed in");
-    render();
+    await _afterSignIn(session);
   },
+  // The email + password door (the default sign-in card).
+  async passwordSignIn() {
+    const errEl = el("signinErr");
+    if (errEl) errEl.textContent = "";
+    const email = (el("signinEmail")?.value || "").trim();
+    const password = el("signinPassword")?.value || "";
+    if (!email || !password) { if (errEl) errEl.textContent = "Enter your email and password."; return; }
+    const remember = !!el("signinRemember")?.checked;
+    let session;
+    try {
+      session = await POST("/auth/session", { email, password, remember });
+    } catch (e) {
+      const msg = e && e.status === 429 ? "Too many attempts — wait a minute"
+        : e && e.status === 401 ? "That email and password didn't match — try again"
+        : errText(e);
+      if (errEl) errEl.textContent = msg; else toast(msg, true);
+      return;
+    }
+    const pw = el("signinPassword"); if (pw) pw.value = "";
+    await _afterSignIn(session);
+  },
+  // First-run: create the initial admin account (POST /auth/setup signs them in too).
+  async doSetup() {
+    const errEl = el("signinErr");
+    if (errEl) errEl.textContent = "";
+    const name = (el("setupName")?.value || "").trim();
+    const email = (el("setupEmail")?.value || "").trim();
+    const password = el("setupPassword")?.value || "";
+    if (!name || !email || !password) { if (errEl) errEl.textContent = "Fill in name, email, and a password."; return; }
+    let session;
+    try {
+      session = await POST("/auth/setup", { name, email, password });
+    } catch (e) {
+      const msg = e && e.status === 409 ? "Setup already happened — sign in instead" : errText(e);
+      if (errEl) errEl.textContent = msg; else toast(msg, true);
+      if (e && e.status === 409) { State.needsSetup = false; State.signinMode = "password"; render(); }
+      return;
+    }
+    State.needsSetup = false;
+    await _afterSignIn(session, "Welcome! You're the admin — invite your team from Access.");
+  },
+  signinMode(ds) { State.signinMode = ds.mode; render(); },
   acctMenu() {
     const me = State.me;
     if (!me) { openSwitchKeyModal(); return; }   // not signed in → go straight to key entry
@@ -173,6 +225,7 @@ const Actions = {
       <div style="margin-bottom:14px">${roles}</div>
       <div id="acctSessions" style="border-top:1px solid var(--line2);padding-top:12px;margin-bottom:14px">${acctSessionsInner("loading")}</div>
       <div style="display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line2);padding-top:12px;align-items:flex-start">
+        ${me.email ? `<button type="button" class="link btn-bare" data-act="changePassword">Change password…</button>` : ""}
         <button type="button" class="link btn-bare" data-act="switchKey">Sign in with a different key…</button>
         <button type="button" class="link btn-bare" data-act="signOut" style="color:var(--danger)">Sign out</button>
         <a href="#/access" data-act="go" data-hash="#/access" style="font-weight:600">Manage access →</a></div>
@@ -702,6 +755,125 @@ const Actions = {
   auditObject(ds, ev) { _auditFilter.object = (ev.target.value || "").trim(); render(); },   // change event → re-fetch
   auditClear() { _auditFilter = { actor: "", action: "", object: "" }; render(); },
   // ── access / users ──────────────────────────────────────────────
+  // ── people (human accounts) ──────────────────────────────────────
+  // Redeem an invite/reset link (the public #/welcome/<token> screen).
+  async acceptInvite(ds) {
+    const errEl = el("welcomeErr");
+    if (errEl) errEl.textContent = "";
+    const password = el("welcomePassword")?.value || "";
+    const again = el("welcomePassword2")?.value || "";
+    if (!password) { if (errEl) errEl.textContent = "Pick a password."; return; }
+    if (password !== again) { if (errEl) errEl.textContent = "The two passwords don't match."; return; }
+    let session;
+    try {
+      session = await POST("/auth/accept-invite",
+                           { token: ds.token, password, name: el("welcomeName")?.value || "" });
+    } catch (e) {
+      const msg = e && e.status === 401 ? "This link is invalid or has expired — ask an admin for a fresh one"
+        : e && e.status === 429 ? "Too many attempts — wait a minute" : errText(e);
+      if (errEl) errEl.textContent = msg; else toast(msg, true);
+      return;
+    }
+    const pw = el("welcomePassword"); if (pw) pw.value = "";
+    location.hash = "#/prompts";
+    await _afterSignIn(session, "You're in — welcome!");
+  },
+  inviteUser() {
+    openModal(`
+      <h3>Invite a person</h3>
+      <p class="hint">They'll get a single-use link (shown once, valid 7 days) to pick a password. Add an optional starting role — more can be granted later.</p>
+      <div class="field"><label>Email</label>
+        <input id="invEmail" type="email" placeholder="them@company.com" data-enter="invBtn"></div>
+      <div class="field"><label>Name (optional)</label>
+        <input id="invName" placeholder="Their name" data-enter="invBtn"></div>
+      <div class="field"><label>Starting role (optional)</label>
+        <select id="invRole"><option value="">— no role yet —</option>${_roleOpts("")}</select></div>
+      <div class="field"><label>Scope</label>
+        <div style="display:flex;gap:8px"><select id="invProject" style="flex:1">${_projectOpts()}</select>
+        <select id="invEnv" style="flex:1">${_envOpts()}</select></div></div>
+      <div class="err" id="invErr"></div>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button id="invBtn" class="btn primary" data-act="inviteUserConfirm">Create invite</button></div>`);
+  },
+  async inviteUserConfirm() {
+    const errEl = el("invErr");
+    if (errEl) errEl.textContent = "";
+    const body = {
+      email: (el("invEmail")?.value || "").trim(),
+      name: (el("invName")?.value || "").trim(),
+    };
+    const role = el("invRole")?.value || "";
+    if (role) {
+      body.role = role;
+      body.project_id = el("invProject")?.value || null;
+      body.environment_id = el("invEnv")?.value || null;
+    }
+    try {
+      const r = await POST("/mgmt/users", body);
+      _showInviteModal(r);
+      render();
+    } catch (e) {
+      const msg = e && e.status === 409 ? "Someone with that email already exists" : errText(e);
+      if (errEl) errEl.textContent = msg; else toast(msg, true);
+    }
+  },
+  async resetUserLink(ds) {
+    try {
+      const r = await POST(`/mgmt/users/${enc(ds.uid)}/reset`);
+      _showInviteModal(r, `Reset link for ${ds.email}`);
+    } catch (e) { toast(errText(e), true); }
+  },
+  userDisable(ds) {
+    openModal(`
+      <h3>Disable ${esc(ds.email)}?</h3>
+      <p class="hint">Immediate and total: they're signed out everywhere, their API keys are revoked, and any invite link stops working. You can enable the account again later — keys stay revoked.</p>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button class="btn danger" data-act="userDisableConfirm" data-uid="${esc(ds.uid)}">Disable account</button></div>`);
+  },
+  async userDisableConfirm(ds) {
+    try {
+      await PATCH(`/mgmt/users/${enc(ds.uid)}`, { disabled: true });
+      closeModal(); toast("Account disabled"); render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  async userEnable(ds) {
+    try {
+      await PATCH(`/mgmt/users/${enc(ds.uid)}`, { disabled: false });
+      toast("Account enabled"); render();
+    } catch (e) { toast(errText(e), true); }
+  },
+  // Self-service password change (account menu; shown for password accounts only).
+  changePassword() {
+    openModal(`
+      <h3>Change your password</h3>
+      <p class="hint">Everywhere else you're signed in gets signed out.</p>
+      <div class="field"><label>Current password</label>
+        <input id="cpCurrent" type="password" autocomplete="current-password" data-enter="cpBtn"></div>
+      <div class="field"><label>New password (10+ characters)</label>
+        <input id="cpNew" type="password" autocomplete="new-password" data-enter="cpBtn"></div>
+      <div class="field"><label>Repeat the new password</label>
+        <input id="cpNew2" type="password" autocomplete="new-password" data-enter="cpBtn"></div>
+      <div class="err" id="cpErr"></div>
+      <div class="modal-actions">
+        <button class="btn" data-act="closeModal">Cancel</button>
+        <button id="cpBtn" class="btn primary" data-act="changePasswordConfirm">Change password</button></div>`);
+  },
+  async changePasswordConfirm() {
+    const errEl = el("cpErr");
+    if (errEl) errEl.textContent = "";
+    const current = el("cpCurrent")?.value || "";
+    const next = el("cpNew")?.value || "";
+    if (next !== (el("cpNew2")?.value || "")) { if (errEl) errEl.textContent = "The two new passwords don't match."; return; }
+    try {
+      await POST("/auth/password", { current_password: current, new_password: next });
+      closeModal(); toast("Password changed — other sessions were signed out");
+    } catch (e) {
+      const msg = e && e.status === 403 ? "That current password isn't right" : errText(e);
+      if (errEl) errEl.textContent = msg; else toast(msg, true);
+    }
+  },
   newUser() {
     openModal(`
       <h3>New user</h3>
@@ -1160,9 +1332,14 @@ function render() {
   // — or this catch — holds a now-detached node and its late write lands harmlessly. We
   // capture #main here, BEFORE fn() runs, so the catch writes through the same node.
   const main = el("main");
-  // No session and no bearer → straight to the sign-in card. Firing authenticated fetches
-  // unauthenticated would just 401 (and, repeated, look like a brute-force attempt to the
-  // server's auth throttle).
+  // The invite-redemption screen is deliberately public: the token IS the credential.
+  if (State.route.name === "welcome") {
+    screenWelcome().catch((e) => { main.innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`; });
+    return;
+  }
+  // No session and no bearer → straight to the signed-out card (setup on first run,
+  // email+password otherwise). Firing authenticated fetches unauthenticated would just
+  // 401 (and, repeated, look like a brute-force attempt to the server's auth throttle).
   if (!State.token && !State.session) {
     main.innerHTML = signInCard();
     return;

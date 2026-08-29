@@ -38,7 +38,12 @@ def test_signin_session_security(server, new_context):
     page.on("request", lambda r: requests.append(r.url))
 
     page.goto(server + "/#/prompts")
-    page.wait_for_selector("#signinBtn", timeout=15000)
+    page.wait_for_selector(".signin-card", timeout=15000)
+    # The default signed-out card is setup/email+password; flip to the key mode
+    # (the same path signin() takes) to inspect the key card's copy.
+    if not page.locator("#signinKey").count():
+        page.click('[data-act="signinMode"][data-mode="key"]')
+        page.wait_for_selector("#signinKey", timeout=5000)
 
     card = page.inner_text(".signin-card")
     assert "Sign in to Incant" in card
@@ -314,3 +319,57 @@ def test_mobile_drawer_and_reduced_motion(server, new_context):
         "getComputedStyle(document.querySelector('.brand .star')).animationName"
     )
     assert anim in ("none", ""), anim
+
+
+def test_account_setup_invite_and_password_journey(server, new_context):
+    """The whole human-accounts arc, in a real browser: first-run setup creates the
+    admin (no API key involved), the admin invites a person from Access, and the
+    invitee redeems the link in a FRESH browser context, picks a password, and lands
+    signed in. Finally the password door itself is exercised."""
+    ctx = new_context()
+    page = ctx.new_page()
+    page.goto(server + "/#/prompts")
+
+    # First-run: the signed-out screen is the setup card, not a key prompt.
+    page.wait_for_selector("#setupBtn", timeout=15000)
+    page.fill("#setupName", "Ada Admin")
+    page.fill("#setupEmail", "ada@example.com")
+    page.fill("#setupPassword", "a-very-good-password")
+    page.click("#setupBtn")
+    page.wait_for_selector(".signin-card", state="detached", timeout=15000)
+    page.wait_for_selector("text=showing what's live", timeout=15000)
+
+    # Invite a person from Access; capture the one-time link from the modal.
+    page.goto(server + "/#/access")
+    page.wait_for_selector("text=People", timeout=15000)
+    page.click("button:has-text('Invite person')")
+    page.wait_for_selector("#invEmail", timeout=8000)
+    page.fill("#invEmail", "sam@example.com")
+    page.fill("#invName", "Sam")
+    page.select_option("#invRole", "viewer")   # a roleless invitee would land on a 403 library
+    page.click("#invBtn")
+    page.wait_for_selector("text=shown only once", timeout=8000)
+    link = page.locator(".modal input[readonly]").input_value()
+    assert "/#/welcome/" in link
+
+    # The invitee redeems it in a fresh context (no cookies, no admin state).
+    ctx2 = new_context()
+    page2 = ctx2.new_page()
+    page2.goto(link)
+    page2.wait_for_selector("#welcomeBtn", timeout=15000)
+    page2.fill("#welcomePassword", "sams-great-password")
+    page2.fill("#welcomePassword2", "sams-great-password")
+    page2.click("#welcomeBtn")
+    page2.wait_for_selector(".signin-card", state="detached", timeout=15000)
+    page2.wait_for_selector("text=showing what's live", timeout=15000)
+
+    # And the plain password door works for them from yet another fresh context.
+    ctx3 = new_context()
+    page3 = ctx3.new_page()
+    page3.goto(server + "/#/prompts")
+    page3.wait_for_selector("#pwSigninBtn", timeout=15000)
+    page3.fill("#signinEmail", "sam@example.com")
+    page3.fill("#signinPassword", "sams-great-password")
+    page3.click("#pwSigninBtn")
+    page3.wait_for_selector(".signin-card", state="detached", timeout=15000)
+    page3.wait_for_selector("text=showing what's live", timeout=15000)

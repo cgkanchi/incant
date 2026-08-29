@@ -147,7 +147,8 @@ def _adoption_revision(inspector) -> str:
       * a3f1c8e29b41 — uniqueness on ``api_keys(prefix)`` (``uq_apikey_prefix``, which
         replaced the old non-unique ``ix_api_keys_prefix`` index);
       * b7d2e6f4a1c9 — uniqueness on ``reviews(draft_id, reviewer)`` (``uq_review``);
-      * c4e8a17d5b23 — the ``rule_revisions.state`` column.
+      * c4e8a17d5b23 — the ``rule_revisions.state`` column;
+      * d7f3b92e6a41 — the ``users`` table.
 
     We never return anything older than the baseline: a populated schema is assumed to
     contain at least ``da3e34b2b8fe``'s tables (that is what "has tables but no
@@ -162,6 +163,8 @@ def _adoption_revision(inspector) -> str:
         return "a3f1c8e29b41"
     if "state" not in {c["name"] for c in inspector.get_columns("rule_revisions")}:
         return "b7d2e6f4a1c9"
+    if "users" not in tables:
+        return "c4e8a17d5b23"
     return "head"
 
 

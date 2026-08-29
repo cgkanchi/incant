@@ -15,7 +15,7 @@ from fastapi import APIRouter
 # Re-exported from the package root so callers (and the old `.mgmt` import site) keep
 # working; StaleDraftWrite now lives in the registry package.
 from ...registry import StaleDraftWrite
-from . import admin, audit, drafts, prompts, remotes, targeting
+from . import admin, audit, drafts, prompts, remotes, targeting, users
 from .helpers import ROLES
 
 router = APIRouter(prefix="/mgmt", tags=["mgmt"])
@@ -23,6 +23,7 @@ router.include_router(prompts.router)
 router.include_router(drafts.router)
 router.include_router(targeting.router)
 router.include_router(admin.router)
+router.include_router(users.router)
 router.include_router(remotes.router)
 router.include_router(audit.router)
 

@@ -26,10 +26,46 @@ class EvaluateRequest(BaseModel):
 # ── browser sessions ─────────────────────────────────────────────────
 
 class SessionLoginRequest(BaseModel):
-    # An API key presented once to exchange for an HttpOnly session cookie. Verified
-    # through the same machinery (and failed-auth throttle) as bearer auth.
-    key: str
+    # Two doors, one endpoint: humans sign in with email + password; an API key is
+    # still accepted (machine access, recovery, tests). Exactly one of the two forms
+    # must be presented — the handler enforces it. Both are verified under the same
+    # failed-auth throttle.
+    email: Optional[str] = None
+    password: Optional[str] = None
+    key: Optional[str] = None
     remember: bool = False
+
+
+class SetupRequest(BaseModel):
+    # First-boot only: create the initial admin account (refused once any user exists).
+    name: str
+    email: str
+    password: str
+
+
+class AcceptInviteRequest(BaseModel):
+    # Redeem an invite/reset token for a password. Signs the user in on success.
+    token: str
+    password: str
+    name: Optional[str] = None      # invitees may correct/set their display name
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class InviteUserRequest(BaseModel):
+    email: str
+    name: str = ""
+    # Optional initial role binding, same shape as key issuance.
+    role: Optional[str] = None
+    project_id: Optional[str] = None
+    environment_id: Optional[str] = None
+
+
+class UserStatusRequest(BaseModel):
+    disabled: bool
 
 
 # ── authoring ────────────────────────────────────────────────────────

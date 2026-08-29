@@ -252,9 +252,13 @@ def page(context):
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def signin(page, key: str = ADMIN_KEY, remember: bool = False) -> None:
-    """Fill the sign-in card and submit, waiting for it to be replaced. The card
-    posts the key to /auth/session, which sets the HttpOnly session cookie."""
-    page.wait_for_selector("#signinBtn", timeout=15000)
+    """Sign in with an API key, whatever state the signed-out card is in. The
+    default card is email+password (or first-run setup when no accounts exist);
+    both carry a link to the API-key mode, which these tests use."""
+    page.wait_for_selector(".signin-card", timeout=15000)
+    if not page.locator("#signinKey").count():
+        page.click('[data-act="signinMode"][data-mode="key"]')
+        page.wait_for_selector("#signinKey", timeout=5000)
     page.fill("#signinKey", key)
     if remember:
         page.check("#signinRemember")

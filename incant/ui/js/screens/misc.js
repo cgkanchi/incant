@@ -94,6 +94,31 @@ function _scopeLabel(b) {
   return parts.join(" · ");
 }
 
+// ── welcome: redeem an invite / reset link (public — the token is the credential) ──
+async function screenWelcome() {
+  const main = el("main");
+  const token = State.route.token || "";
+  if (!token) {
+    main.innerHTML = `<div class="signin-wrap"><div class="signin-card">
+      <div class="signin-mark">✦</div>
+      <div class="signin-title serif">This link is incomplete</div>
+      <p class="signin-copy">An invite link looks like <span class="mono">…/#/welcome/incant_inv_…</span> — ask the admin who invited you to copy the whole thing.</p>
+    </div></div>`;
+    return;
+  }
+  main.innerHTML = `<div class="signin-wrap"><div class="signin-card">
+    <div class="signin-mark">✦</div>
+    <div class="signin-title serif">Welcome to Incant</div>
+    <p class="signin-copy">You've been invited. Pick a password and you're in. This also works as a password reset.</p>
+    <input id="welcomeName" class="signin-input" placeholder="Your name (optional)" autocomplete="name" data-enter="welcomeBtn">
+    <input id="welcomePassword" type="password" class="signin-input" placeholder="Password (10+ characters)" autocomplete="new-password" data-enter="welcomeBtn" style="margin-top:8px">
+    <input id="welcomePassword2" type="password" class="signin-input" placeholder="Repeat the password" autocomplete="new-password" data-enter="welcomeBtn" style="margin-top:8px">
+    <button id="welcomeBtn" class="btn primary" data-act="acceptInvite" data-token="${esc(token)}" style="width:100%;margin-top:12px">Set password &amp; sign in</button>
+    <div class="err" id="welcomeErr" style="margin-top:8px"></div>
+  </div></div>`;
+}
+
+
 async function screenAccess() {
   const main = el("main");   // capture before any await (Issue B)
   await ensureWhoami();   // for the "you're signed in as" note
@@ -159,16 +184,47 @@ async function screenAccess() {
   const me = State.me, myRole = me ? highestRole(me.roles) : null;
   const yourKey = `<div class="card pad" style="margin-bottom:14px">
     <div style="font-size:12.5px">You're signed in as <b>${me ? esc(me.name) : "…"}</b>${myRole ? ` <span class="pill acc">${esc(myRole)}</span>` : ""}.</div>
-    <div class="faint" style="font-size:11.5px;margin-top:4px">Keys are shown once at creation and can only be revoked — your current key isn't displayed anywhere. Switch keys from the account menu in the sidebar.</div></div>`;
+    <div class="faint" style="font-size:11.5px;margin-top:4px">Keys are shown once at creation and can only be revoked — your current key isn't displayed anywhere.</div></div>`;
+
+  // ── People: human accounts (invites, resets, disable). Roles/keys for each
+  // person live on their principal card below — this section is account lifecycle.
+  let people = [];
+  try { people = (await GET("/mgmt/users")).users || []; } catch (_) { /* pre-migration server */ }
+  const peopleRows = people.map((u) => {
+    const status = u.status === "active" ? '<span class="pill live">active</span>'
+      : u.status === "disabled" ? '<span class="pill danger">disabled</span>'
+      : '<span class="pill warn">invited</span>';
+    const pending = u.invite_pending && u.status !== "disabled"
+      ? '<span class="faint" style="font-size:11px">has an unredeemed link</span>' : "";
+    const lastSeen = u.last_login_at
+      ? `<span class="faint" style="font-size:11px">signed in ${ago(u.last_login_at)}</span>` : "";
+    const actions = u.status === "disabled"
+      ? `<button type="button" class="link btn-bare" data-act="userEnable" data-uid="${esc(u.id)}">Enable</button>`
+      : `<button type="button" class="link btn-bare" data-act="resetUserLink" data-uid="${esc(u.id)}" data-email="${esc(u.email)}">${u.status === "invited" ? "New invite link" : "Send reset link"}</button>
+         <button type="button" class="link btn-bare" data-act="userDisable" data-uid="${esc(u.id)}" data-email="${esc(u.email)}" style="color:var(--danger)">Disable</button>`;
+    return `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:9px 0;border-top:1px solid var(--line2)">
+      <span style="font-size:13px;font-weight:700">${esc(u.name || u.email)}</span>
+      <span class="mono faint" style="font-size:11.5px">${esc(u.email)}</span>
+      ${status}${pending}${lastSeen}
+      <div class="grow"></div>${actions}</div>`;
+  }).join("") || '<div class="faint" style="font-size:12px;padding:8px 0">No accounts yet — invite the first person.</div>';
+  const peopleCard = `<div class="card pad" style="margin-bottom:14px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <div style="font-size:13px;font-weight:700">People</div>
+      <span class="faint" style="font-size:11.5px">sign in with email &amp; password — invite links are shown once and expire in 7 days</span>
+      <div class="grow"></div>
+      <button class="btn primary sm" data-act="inviteUser">＋ Invite person</button></div>
+    ${peopleRows}</div>`;
 
   main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Access</span>
-      <span class="sub">users, roles, and API keys</span>
+      <span class="sub">people, roles, and API keys</span>
       <div class="grow"></div>
-      <button class="btn primary" data-act="newUser">+ New user</button></div>
+      <button class="btn" data-act="newUser">+ Service key</button></div>
     ${yourKey}
+    ${peopleCard}
     <div style="display:flex;flex-direction:column;gap:12px">${cards}</div>
-    <div style="font-size:11px;color:var(--faint);margin-top:14px">Roles: renderer &lt; viewer &lt; editor &lt; operator &lt; releaser &lt; admin. A role can be scoped instance-wide, to a project, to an environment, or to both. Keys are shown once at creation and can only be revoked, not recovered.</div></div>`;
+    <div style="font-size:11px;color:var(--faint);margin-top:14px">Roles: renderer &lt; viewer &lt; editor &lt; operator &lt; releaser &lt; admin. A role can be scoped instance-wide, to a project, to an environment, or to both. Keys are for machines and are shown once at creation; people sign in with email &amp; password.</div></div>`;
 }
 
 // Options helpers for the role/scope selectors in the access modals.
@@ -193,6 +249,15 @@ function keyExpiryHtml(k) {
   if (!(ms > 0)) return '<span class="pill warn">expired</span>';
   const days = Math.max(1, Math.ceil(ms / 86400000));
   return `<span class="faint">expires in ${days}d</span>`;
+}
+function _showInviteModal(r, title) {
+  const link = `${location.origin}/${(r.invite_path || "").replace(/^\//, "")}`;
+  openModal(`
+    <h3>${esc(title || `Invite created for ${r.user?.email || "them"}`)}</h3>
+    <p class="hint">Share this link with them now — it is shown <b>only once</b>, works once, and expires in 7 days. They'll pick their own password.</p>
+    <input readonly data-act="selectAll" value="${esc(link)}"
+      style="width:100%;font-family:'IBM Plex Mono',monospace;font-size:12px">
+    <div class="modal-actions"><button class="btn primary" data-act="closeModal">Done</button></div>`);
 }
 function _showKeyModal(key) {
   openModal(`

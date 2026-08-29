@@ -46,10 +46,19 @@ _VERSION_HISTORY_LIMIT = 50
 # ── identity ─────────────────────────────────────────────────────────
 
 @router.get("/whoami")
-def whoami(ident: Identity = Depends(identity)):
+def whoami(
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    # `email` is present iff the principal is a human account (users table) — the UI
+    # keys password self-service ("Change password…") off it.
+    user = session.execute(
+        select(models.User).where(models.User.principal_id == ident.principal_id)
+    ).scalar_one_or_none()
     return {
         "principal_id": ident.principal_id,
         "name": ident.name,
+        "email": user.email if user else None,
         "roles": [
             {"role": b.role, "project_id": b.project_id, "environment_id": b.environment_id}
             for b in ident.bindings

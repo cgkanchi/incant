@@ -546,10 +546,16 @@ keys.
 
 ### Principals
 
-- **Users** — OIDC (Okta, Entra, Google); server-side DB sessions, revocable
-  immediately.
+- **Users** — human accounts (email + password, scrypt-hashed): the first-run setup
+  screen creates the initial admin; admins invite everyone else with single-use,
+  expiring links (the same mechanism is password reset). Server-side DB sessions,
+  revocable immediately; disabling an account deletes its sessions, revokes its
+  keys, and kills outstanding invites atomically. OIDC (Okta, Entra, Google) is a
+  future addition minting the same sessions for the same principals.
 - **Service keys** — bearer API keys: created/revoked in the UI, salted hashes with a
-  lookup prefix (`incant_sk_…`), expiry, last-used tracking.
+  lookup prefix (`incant_sk_…`), expiry, last-used tracking. Machine and developer
+  access only — humans never sign in with a key (the API-key card remains as the
+  machine/recovery door).
 
 ### Roles × scopes
 
@@ -837,9 +843,9 @@ scattered through code comments — so a reader knows which promises are live.
 - **No Postgres LISTEN/NOTIFY (§7, §13).** Propagation is the 2-second poll alone
   (`INCANT_CONTROL_POLL_SECONDS`), which already meets the <2s target. NOTIFY
   remains an optimization to layer in when poll load matters.
-- **No OIDC/SSO (§11).** Principals are API keys plus browser sessions minted from a
-  key (`POST /auth/session`, HttpOnly + CSRF). OIDC would mint the same server-side
-  sessions and is additive.
+- **No OIDC/SSO (§11).** Humans use local email+password accounts (first-run setup +
+  admin invites, scrypt hashing); machines use API keys. OIDC would mint the same
+  server-side sessions for the same principals and is additive.
 - **Metric label trims (§14).** `incant_renders_total` and
   `incant_content_fallbacks_total` omit the `version` label — version identity lives
   in the render logs' version tuple; labels stay low-cardinality.

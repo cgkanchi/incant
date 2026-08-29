@@ -37,12 +37,19 @@ docker compose logs incant | grep -A6 "bootstrap admin key"   # grab the generat
 docker compose exec incant uv run incant seed   # example dataset (prints a renderer key)
 ```
 
-Open <http://localhost:8080> for the UI. On first boot with no admin configured,
-Incant **generates a strong random bootstrap admin key and prints it once** to the
-logs (`incant_sk_…`) — save it; it is not shown again. Pin your own key by setting
-`INCANT_BOOTSTRAP_ADMIN_KEY`. The well-known `incant_sk_dev_admin` is refused unless
-you also set `INCANT_ALLOW_DEV_KEY=1` (local/test only). `uv run incant seed` prints
-its own scoped renderer key for the serving examples below.
+Open <http://localhost:8080> — the **first-run screen creates the initial admin
+account** (name, email, password; no API key involved). Do it right after boot: the
+setup door closes the moment the first account exists. From there, invite everyone
+else from **Access** — each person gets a single-use link (valid 7 days) to pick
+their own password. People sign in with email & password; **API keys are for
+machines and developer access**, issued by admins in Access.
+
+For headless/API-only use, Incant also **generates a bootstrap admin key and prints
+it once** to the logs on first boot (`incant_sk_…`) — save it; it is not shown
+again. Pin your own by setting `INCANT_BOOTSTRAP_ADMIN_KEY`. The well-known
+`incant_sk_dev_admin` is refused unless you also set `INCANT_ALLOW_DEV_KEY=1`
+(local/test only). `uv run incant seed` prints its own scoped renderer key for the
+serving examples below.
 
 To run outside Docker, point `INCANT_DATABASE_URL` at a Postgres you manage:
 
@@ -180,8 +187,17 @@ Incant authenticates every request; there is no side door. A few operational not
   `Content-Security-Policy` (scripts are `'self'` only), `X-Content-Type-Options`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a locked-down
   `Permissions-Policy`.
+- **People sign in with email & password.** Accounts are created by the first-run
+  setup screen or by admin invites (single-use links, shown once, 7-day expiry —
+  the same mechanism doubles as password reset). Passwords are hashed with
+  **scrypt** (per-user salt, self-describing parameters, transparently upgraded on
+  sign-in if the work factor is raised); policy is NIST-style length-only (10+).
+  Sign-in failures share the API's per-IP throttle and never reveal whether an
+  email exists. Changing a password signs out every other session; disabling an
+  account is immediate and total (sessions deleted, keys revoked, invites dead).
 - **Browser sessions (the UI's door).** Interactive UI access never keeps a credential
-  in JS-readable storage. The browser exchanges a key once at `POST /auth/session` for a
+  in JS-readable storage. The browser exchanges a password (or, for machine access, a
+  key) once at `POST /auth/session` for a
   server-side session, delivered as an `HttpOnly`, `SameSite=Strict`, `Path=/` cookie
   (`incant_session`) — marked `Secure` when TLS is enforced or the request is https, and
   persistent (`Max-Age`) only for "remember me" (30 days; 12 hours otherwise). Only the
@@ -216,6 +232,6 @@ Incant authenticates every request; there is no side door. A few operational not
 - **`/metrics`** requires either a valid key holding `viewer` (any scope) or the
   `INCANT_METRICS_TOKEN` bearer (for principal-less scrapers). `/healthz` and `/readyz`
   stay public — they are LB probes and return no sensitive data.
-- **Roadmap — SSO.** Browser access already uses short-lived `HttpOnly`, `SameSite`
-  session cookies (above); API keys remain the service-to-service mechanism. Optional
-  OIDC/SSO login (minting the same server-side sessions) is a possible future addition.
+- **Roadmap — SSO.** Local email+password accounts are the human door today; API keys
+  remain the service-to-service mechanism. Optional OIDC/SSO login (minting the same
+  server-side sessions for the same principals) is a possible future addition.

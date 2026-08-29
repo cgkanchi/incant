@@ -29,7 +29,7 @@ function accountChipInner(me) {
       <span class="acct-name">${esc(me.name)}</span>
       ${role ? `<span class="pill acc acct-role">${esc(role)}</span>` : ""}`;
   }
-  if (State._meFailed)
+  if (State._meFailed || (!State.session && !State.token))
     return `<span class="acct-av err">!</span><span class="acct-name faint">not signed in</span>`;
   return `<span class="acct-av">…</span><span class="acct-name faint">signing in…</span>`;
 }
@@ -56,18 +56,63 @@ function ensureWhoami() {
   return State._mePromise;
 }
 
-// The centered sign-in card that replaces screen content on a 401.
+// One-shot needs-setup probe: decides whether the signed-out screen is the
+// first-run "create the first admin" card or the sign-in card. Kicked by
+// signInCard(); re-renders once the answer lands.
+function ensureSetupStatus() {
+  if (State._setupChecked || State._setupPromise) return;
+  State._setupPromise = (async () => {
+    try { State.needsSetup = (await GET("/auth/setup")).needs_setup; }
+    catch (_) { State.needsSetup = false; }
+    finally {
+      State._setupChecked = true; State._setupPromise = null;
+      if (typeof render === "function") render();
+    }
+  })();
+}
+
+// The centered signed-out card. Three states: first-run setup (no accounts exist
+// yet), email + password sign-in (the human door), and the API-key fallback
+// (machines, recovery, tests) — reachable from either of the first two.
 function signInCard() {
-  return `<div class="signin-wrap"><div class="signin-card">
-    <div class="signin-mark">✦</div>
+  ensureSetupStatus();
+  const mode = State.signinMode || (State.needsSetup ? "setup" : "password");
+  const remember = `<label class="remember-row"><input type="checkbox" id="signinRemember"> Stay signed in for 30 days on this device</label>`;
+  let body;
+  if (mode === "setup") {
+    body = `
+    <div class="signin-title serif">Welcome to Incant</div>
+    <p class="signin-copy">This instance has no accounts yet. Create the first admin — you'll invite everyone else from <b>Access</b>.</p>
+    <input id="setupName" class="signin-input" placeholder="Your name" autocomplete="name" data-enter="setupBtn">
+    <input id="setupEmail" type="email" class="signin-input" placeholder="you@company.com" autocomplete="email" data-enter="setupBtn" style="margin-top:8px">
+    <input id="setupPassword" type="password" class="signin-input" placeholder="Password (10+ characters)" autocomplete="new-password" data-enter="setupBtn" style="margin-top:8px">
+    <button id="setupBtn" class="btn primary" data-act="doSetup" style="width:100%;margin-top:12px">Create admin account</button>
+    <div class="err" id="signinErr" style="margin-top:8px"></div>
+    <div class="signin-hint"><button type="button" class="link btn-bare" data-act="signinMode" data-mode="key">Sign in with an API key instead</button></div>`;
+  } else if (mode === "key") {
+    body = `
     <div class="signin-title serif">Sign in to Incant</div>
-    <p class="signin-copy">Paste an API key — your admin created one for you, or use the admin key printed when this instance first started.</p>
+    <p class="signin-copy">Paste an API key — for machine or developer access, or the admin key printed when this instance first started.</p>
     <input id="signinKey" type="password" class="signin-input" placeholder="incant_sk_…" spellcheck="false" autocomplete="off"
       data-enter="signinBtn">
-    <label class="remember-row"><input type="checkbox" id="signinRemember"> Stay signed in for 30 days on this device</label>
+    ${remember}
     <button id="signinBtn" class="btn primary" data-act="setToken" style="width:100%;margin-top:10px">Sign in</button>
     <div class="err" id="signinErr" style="margin-top:8px"></div>
-    <div class="signin-hint">Keys are managed in <b>Access</b> — an admin can issue you one.</div>
+    <div class="signin-hint"><button type="button" class="link btn-bare" data-act="signinMode" data-mode="${State.needsSetup ? "setup" : "password"}">${State.needsSetup ? "Set up the first admin account" : "Sign in with email & password"}</button></div>`;
+  } else {
+    body = `
+    <div class="signin-title serif">Sign in to Incant</div>
+    <p class="signin-copy">Use your email and password — an admin invited you, or set this up on first boot.</p>
+    <input id="signinEmail" type="email" class="signin-input" placeholder="you@company.com" autocomplete="username" data-enter="pwSigninBtn">
+    <input id="signinPassword" type="password" class="signin-input" placeholder="Password" autocomplete="current-password" data-enter="pwSigninBtn" style="margin-top:8px">
+    ${remember}
+    <button id="pwSigninBtn" class="btn primary" data-act="passwordSignIn" style="width:100%;margin-top:10px">Sign in</button>
+    <div class="err" id="signinErr" style="margin-top:8px"></div>
+    <div class="signin-hint">Lost your password? An admin can send you a reset link from <b>Access</b>.
+      <button type="button" class="link btn-bare" data-act="signinMode" data-mode="key">Use an API key instead</button></div>`;
+  }
+  return `<div class="signin-wrap"><div class="signin-card">
+    <div class="signin-mark">✦</div>${body}
   </div></div>`;
 }
 // "Sign in with a different key…" — a password-input modal that reuses setToken semantics

@@ -17,6 +17,16 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import get_settings
+from ..service import get_app
+from ..targeting.audit import record_audit
+from . import passwords
+from .accounts import (
+    create_user,
+    redeem_invite,
+    user_by_email,
+    user_count,
+    valid_email,
+)
 from .auth import (
     CSRF_HEADER,
     SESSION_COOKIE,
@@ -32,10 +42,19 @@ from .auth import (
     new_session_token,
     touch_last_seen,
 )
-from .deps import _authenticate, _presented_credential, get_session
-from .schemas import SessionLoginRequest
+from .deps import _authenticate, _presented_credential, client_ip, get_session
+from .schemas import (
+    AcceptInviteRequest,
+    PasswordChangeRequest,
+    SessionLoginRequest,
+    SetupRequest,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# Verified when an email doesn't exist, so "unknown email" and "wrong password"
+# take the same time — the response text alone never confirms an account.
+_DUMMY_HASH = passwords.hash_password("incant-timing-equalizer")
 
 
 def _roles(ident: Identity) -> list[dict]:
@@ -55,6 +74,56 @@ def _cookie_secure(request: Request) -> bool:
     return get_settings().enforce_tls or request.url.scheme == "https"
 
 
+def _mint_session(
+    request: Request, response: Response, session: Session,
+    ident: Identity, remember: bool,
+) -> dict:
+    """Mint a server-side session for an already-authenticated identity and set the
+    HttpOnly cookie. Shared by key sign-in, password sign-in, setup, and invites."""
+    token = new_session_token()
+    csrf = new_csrf_token()
+    now = dt.datetime.now(dt.timezone.utc)
+    ttl = SESSION_TTL_REMEMBER if remember else SESSION_TTL_DEFAULT
+    session.add(models.Session(
+        id=new_session_id(), token_hash=hash_key(token), principal_id=ident.principal_id,
+        created_at=now, expires_at=now + ttl, last_seen_at=now,
+        csrf_token=csrf, remember=remember,
+    ))
+    response.set_cookie(
+        SESSION_COOKIE, token, httponly=True, samesite="strict", path="/",
+        secure=_cookie_secure(request),
+        # Persistent cookie only for "remember me"; otherwise a session cookie that
+        # dies with the browser (absolute server-side expiry still applies).
+        max_age=int(ttl.total_seconds()) if remember else None,
+    )
+    return _whoami(ident, csrf)
+
+
+def _throttle_gate(request: Request) -> None:
+    """The same per-IP failed-auth throttle bearer auth gets, for the password and
+    invite doors (both accept low-entropy guesses, so they need it MOST)."""
+    app = get_app()
+    retry = app.throttle.retry_after(client_ip(request),
+                                     app.settings.auth_throttle_limit,
+                                     app.settings.auth_throttle_window)
+    if retry is not None:
+        raise HTTPException(status_code=429, detail="too many failed attempts",
+                            headers={"Retry-After": str(int(retry))})
+
+
+def _throttle_failure(request: Request) -> None:
+    app = get_app()
+    if app.settings.auth_throttle_limit > 0:
+        app.throttle.record_failure(client_ip(request), app.settings.auth_throttle_window)
+
+
+def _ident_for_user(session: Session, user: models.User) -> Identity:
+    ident = identity_for_principal(session, user.principal_id)
+    if ident is None:  # pragma: no cover - the FK guarantees the principal exists
+        raise HTTPException(status_code=401, detail="invalid email or password")
+    return ident
+
+
 @router.post("/session")
 def create_session(
     req: SessionLoginRequest,
@@ -62,28 +131,145 @@ def create_session(
     response: Response,
     session: Session = Depends(get_session),
 ):
-    """Verify the presented key through the same machinery as bearer auth (throttle
-    included — a bad key here is a presented credential and counts), then mint a
-    server-side session and set the HttpOnly cookie."""
-    ident = _authenticate(request, session, f"Bearer {req.key}")
+    """Sign in. Humans present email + password; machines/recovery may present an
+    API key. Every failure path is throttled per IP, and the error text never
+    reveals whether an email exists."""
+    if req.key and (req.email or req.password):
+        raise HTTPException(422, "present either email+password or an API key, not both")
 
-    token = new_session_token()
-    csrf = new_csrf_token()
-    now = dt.datetime.now(dt.timezone.utc)
-    ttl = SESSION_TTL_REMEMBER if req.remember else SESSION_TTL_DEFAULT
-    session.add(models.Session(
-        id=new_session_id(), token_hash=hash_key(token), principal_id=ident.principal_id,
-        created_at=now, expires_at=now + ttl, last_seen_at=now,
-        csrf_token=csrf, remember=req.remember,
+    if req.key:
+        # Verified through the same machinery as bearer auth (throttle included —
+        # a bad key here is a presented credential and counts).
+        ident = _authenticate(request, session, f"Bearer {req.key}")
+        return _mint_session(request, response, session, ident, req.remember)
+
+    if not (req.email and req.password):
+        raise HTTPException(422, "email and password are required")
+
+    _throttle_gate(request)
+    user = user_by_email(session, req.email)
+    # Always burn one verification so unknown-email and wrong-password take the
+    # same time; only an active account with a matching password gets through.
+    ok = passwords.verify_password(req.password, (user.password_hash if user else None)
+                                   or _DUMMY_HASH)
+    if user is None or user.status != "active" or not user.password_hash or not ok:
+        _throttle_failure(request)
+        raise HTTPException(status_code=401, detail="invalid email or password")
+
+    if passwords.needs_rehash(user.password_hash):
+        user.password_hash = passwords.hash_password(req.password)  # transparent upgrade
+    user.last_login_at = dt.datetime.now(dt.timezone.utc)
+    return _mint_session(request, response, session,
+                         _ident_for_user(session, user), req.remember)
+
+
+@router.get("/setup")
+def setup_status(session: Session = Depends(get_session)):
+    """Public: does this instance still need its first admin account? Reveals only
+    whether setup has happened — the UI uses it to pick the first-run screen."""
+    return {"needs_setup": user_count(session) == 0}
+
+
+@router.post("/setup")
+def initial_setup(
+    req: SetupRequest,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session),
+):
+    """First boot: create the initial admin ACCOUNT (no API key involved) and sign
+    them in. Works exactly once — refused the moment any user exists. Run it right
+    after bringing an instance up; machine access stays on API keys (§11)."""
+    if user_count(session) > 0:
+        raise HTTPException(409, "setup already completed — sign in instead")
+    if not req.name.strip():
+        raise HTTPException(422, "name is required")
+    if not valid_email(req.email):
+        raise HTTPException(422, "a valid email address is required")
+    problem = passwords.validate_password(req.password)
+    if problem:
+        raise HTTPException(422, problem)
+
+    user = create_user(session, email=req.email, name=req.name.strip())
+    user.password_hash = passwords.hash_password(req.password)
+    user.status = "active"
+    user.last_login_at = dt.datetime.now(dt.timezone.utc)
+    session.add(models.RoleBinding(principal_id=user.principal_id, role="admin"))
+    record_audit(session, user.email, "auth.setup", "user", user.id,
+                 after={"email": user.email, "role": "admin"})
+    get_app().invalidate_auth()
+    return _mint_session(request, response, session,
+                         _ident_for_user(session, user), remember=False)
+
+
+@router.post("/accept-invite")
+def accept_invite(
+    req: AcceptInviteRequest,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session),
+):
+    """Redeem an invite (or password-reset) link: set a password, activate the
+    account, sign in. The token is single-use — redemption clears it."""
+    _throttle_gate(request)
+    user = redeem_invite(session, req.token)
+    if user is None:
+        _throttle_failure(request)
+        raise HTTPException(status_code=401, detail="invalid or expired invite link — "
+                                                    "ask an admin for a fresh one")
+    problem = passwords.validate_password(req.password)
+    if problem:
+        raise HTTPException(422, problem)
+
+    user.password_hash = passwords.hash_password(req.password)
+    user.status = "active"
+    user.invite_token_hash = None
+    user.invite_expires_at = None
+    if req.name and req.name.strip():
+        user.name = req.name.strip()
+        principal = session.get(models.Principal, user.principal_id)
+        if principal is not None:
+            principal.name = user.name
+    user.last_login_at = dt.datetime.now(dt.timezone.utc)
+    record_audit(session, user.email, "user.accept_invite", "user", user.id,
+                 after={"email": user.email})
+    get_app().invalidate_auth()
+    return _mint_session(request, response, session,
+                         _ident_for_user(session, user), remember=False)
+
+
+@router.post("/password", status_code=204)
+def change_password(
+    req: PasswordChangeRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Change the signed-in user's own password (cookie + CSRF). Requires the
+    current password, and signs out every OTHER session — a stolen session must not
+    survive the owner rotating their credential."""
+    ident = _authenticate(request, session, None, allow_cookie=True)
+    row = lookup_session(session, request.cookies.get(SESSION_COOKIE) or "")
+    if row is None:
+        raise HTTPException(status_code=401, detail="password change requires a "
+                                                    "signed-in browser session")
+    user = session.execute(
+        select(models.User).where(models.User.principal_id == ident.principal_id)
+    ).scalar_one_or_none()
+    if user is None or user.status != "active" or not user.password_hash:
+        raise HTTPException(status_code=400, detail="this principal has no password account")
+    if not passwords.verify_password(req.current_password, user.password_hash):
+        _throttle_failure(request)
+        raise HTTPException(status_code=403, detail="current password is incorrect")
+    problem = passwords.validate_password(req.new_password)
+    if problem:
+        raise HTTPException(422, problem)
+    user.password_hash = passwords.hash_password(req.new_password)
+    session.execute(delete(models.Session).where(
+        models.Session.principal_id == ident.principal_id,
+        models.Session.id != row.id,
     ))
-    response.set_cookie(
-        SESSION_COOKIE, token, httponly=True, samesite="strict", path="/",
-        secure=_cookie_secure(request),
-        # Persistent cookie only for "remember me"; otherwise a session cookie that
-        # dies with the browser (absolute server-side expiry still applies).
-        max_age=int(ttl.total_seconds()) if req.remember else None,
-    )
-    return _whoami(ident, csrf)
+    record_audit(session, user.email, "user.password_change", "user", user.id)
+    return Response(status_code=204)
 
 
 @router.get("/session")
