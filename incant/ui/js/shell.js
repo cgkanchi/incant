@@ -137,7 +137,7 @@ function sidebar() {
   const envOpts = State.envs.map((e) =>
     `<option value="${esc(e.id)}" ${e.id === State.env ? "selected" : ""}>${esc(e.id)}</option>`).join("");
   const curEnv = State.envs.find((e) => e.id === State.env) || {};
-  return `<div class="sidebar">
+  return `<nav class="sidebar" aria-label="Primary">
     <div class="brand">
       <span class="star">✦</span><span class="name">Incant</span><div class="grow"></div>
       <button class="theme-btn" aria-label="${State.theme === "light" ? "Switch to dark theme" : "Switch to light theme"}" data-act="theme">${State.theme === "light" ? "☾" : "☀"}</button>
@@ -165,24 +165,24 @@ function sidebar() {
       ${curEnv.track_tip ? '<span class="pill live" title="valid saves publish automatically in this environment">auto-publish</span>' : ""}
     </div>
     ${accountChip()}
-  </div>`;
+  </nav>`;
 }
 
 // A fixed top bar (shown only under 920px via CSS) with the app mark, current env, and
 // a hamburger that toggles the off-canvas nav drawer. The scrim closes the drawer.
 function topbar() {
-  return `<div class="topbar">
+  return `<header class="topbar">
     <button class="hamburger" aria-label="Menu" aria-expanded="${State.navOpen ? "true" : "false"}" data-act="navToggle">☰</button>
     <span class="topbar-mark"><span class="star">✦</span>Incant</span>
     <span class="grow"></span>
     <span class="pill acc">${esc(State.env)}</span>
-  </div>`;
+  </header>`;
 }
 function shell(mainHtml) {
   return `${topbar()}
     <button class="nav-scrim btn-bare" aria-label="Close menu" data-act="navClose"></button>
     <div class="shell">${sidebar()}
-    <div class="main" id="main">${mainHtml}</div>
+    <main class="main" id="main">${mainHtml}</main>
     ${State.tweakOpen && State.route.pid ? tweakPanel() : ""}
   </div>`;
 }

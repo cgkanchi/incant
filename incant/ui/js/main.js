@@ -1459,11 +1459,24 @@ const Actions = {
 };
 
 // ── render + wire ────────────────────────────────────────────────────
+// Route-aware tab titles: "pm-review/system · Edit · Incant" beats fifteen tabs all
+// reading "Incant" (history, tab switching, and screen-reader page announcements).
+const SCREEN_TITLES = {
+  prompts: "Prompts", overview: "Overview", draft: "Edit", compare: "Compare",
+  rules: "Who sees what", pointers: "Publish history", segments: "Segments",
+  play: "Playground", audit: "Audit", access: "Access", envs: "Environments",
+  welcome: "Welcome",
+};
+function routeTitle(route) {
+  const label = SCREEN_TITLES[route.name] || "Prompts";
+  return (route.pid ? `${route.pid} · ${label}` : label) + " · Incant";
+}
 function render() {
   if (Auto.timer) fireAutosave();   // flush a pending autosave before the DOM is replaced
   document.body.dataset.theme = State.theme;
   if (document.body && document.body.classList) document.body.classList.toggle("nav-open", State.navOpen);
   State.route = parseRoute();
+  document.title = routeTitle(State.route);
   el("app").innerHTML = shell(`<div class="empty">Loading…</div>`);
   // Invariant: screens write through the #main node captured at entry; render() replaces
   // #main's parent shell (a fresh #main) on every navigation, so a superseded async screen
