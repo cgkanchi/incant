@@ -30,14 +30,24 @@ async function screenPointers() {
 
   const locked = !!State.envs.find((e) => e.id === State.env)?.protected;
   const hasWaiting = vrow.tip_ahead > 0 && vrow.tip_full_sha;
+  // A committed version with NO live pointer has never been published here — that is
+  // the opposite of "already live", and it's exactly what a brand-new prompt looks
+  // like. tip_ahead is 0 in that state (it counts commits past the live pointer), so
+  // it must never be the only gate.
+  const neverPublished = !vrow.live_full_sha && !!vrow.tip_full_sha;
   const advance = !canPublish
-    ? (hasWaiting
-        ? `<span style="font-size:12px;color:var(--mut)">${vrow.tip_ahead} unpublished ${plural(vrow.tip_ahead, "edit")} waiting — a releaser can publish them.</span>`
-        : `<span style="font-size:12px;color:var(--live);font-weight:600">✓ The latest edits are already live.</span>`)
-    : hasWaiting
-      ? `<button class="tweak-btn" style="width:auto;display:inline-flex" data-act="makeLive" data-sha="${vrow.tip_full_sha}" data-short="${esc(vrow.tip_sha)}" data-v="${version}">✦ Publish latest edits (${vrow.tip_ahead} waiting)</button>
-         <span class="faint" style="font-size:11px">preview the impact before it goes live${locked ? ` — ${esc(State.env)} is locked, type the prompt id to confirm` : ""}</span>`
-      : `<span style="font-size:12px;color:var(--live);font-weight:600">✓ The latest edits are already live — nothing to publish.</span>`;
+    ? (neverPublished
+        ? `<span style="font-size:12px;color:var(--mut)">v${version} has never been published in ${esc(State.env)} — a releaser can publish it.</span>`
+        : hasWaiting
+          ? `<span style="font-size:12px;color:var(--mut)">${vrow.tip_ahead} unpublished ${plural(vrow.tip_ahead, "edit")} waiting — a releaser can publish them.</span>`
+          : `<span style="font-size:12px;color:var(--live);font-weight:600">✓ The latest edits are already live.</span>`)
+    : neverPublished
+      ? `<button class="tweak-btn" style="width:auto;display:inline-flex" data-act="makeLive" data-sha="${vrow.tip_full_sha}" data-short="${esc(vrow.tip_sha)}" data-v="${version}">✦ Publish v${version} for the first time</button>
+         <span class="faint" style="font-size:11px">nothing is live in ${esc(State.env)} for v${version} yet${locked ? ` — ${esc(State.env)} is locked, type the prompt id to confirm` : ""}</span>`
+      : hasWaiting
+        ? `<button class="tweak-btn" style="width:auto;display:inline-flex" data-act="makeLive" data-sha="${vrow.tip_full_sha}" data-short="${esc(vrow.tip_sha)}" data-v="${version}">✦ Publish latest edits (${vrow.tip_ahead} waiting)</button>
+           <span class="faint" style="font-size:11px">preview the impact before it goes live${locked ? ` — ${esc(State.env)} is locked, type the prompt id to confirm` : ""}</span>`
+        : `<span style="font-size:12px;color:var(--live);font-weight:600">✓ The latest edits are already live — nothing to publish.</span>`;
 
   main.innerHTML = `<div class="screen">
     <div class="h1row"><span class="h1 sm serif">Publish history — <i>v${version} · ${esc(State.env)}</i></span></div>
@@ -70,6 +80,11 @@ async function openPublishModal({ v, toSha, toShort, mode }) {
   const tipRules = activeRulesFor(rd.rules, pid).filter((r) => r.prompt_id && (serveTarget(r.serve) || {}).tip);
   window._publish = {
     pid, env, mode, v, toSha,
+    // First publish of a prompt with NO default version in this env: the pointer
+    // alone would serve nobody, so the publish also sets the default (atomic,
+    // server-side). Publishing a non-default version of an established prompt
+    // (the testing flow) deliberately does NOT touch the default.
+    makeDefault: !dv.versions.some((x) => x.is_default),
     liveFull: vrow.live_full_sha || null, liveShort: vrow.live_sha || null,
     toShort: toShort || vrow.tip_sha || null,
     tipAhead: vrow.tip_ahead || 0, history: vrow.history || [],

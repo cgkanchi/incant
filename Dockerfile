@@ -1,4 +1,8 @@
-FROM python:3.13-slim
+# Base MUST match .python-version: with a mismatched base, uv downloads its own
+# interpreter into /root/.local (0700) and the non-root runtime user can't reach
+# it. UV_PYTHON_DOWNLOADS=never turns that failure mode into a loud build error.
+FROM python:3.12-slim
+ENV UV_PYTHON_DOWNLOADS=never
 RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client curl \
     && rm -rf /var/lib/apt/lists/*
 # Pinned by major.minor (not :latest): builds stay reproducible without freezing

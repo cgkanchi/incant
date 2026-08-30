@@ -100,42 +100,10 @@ def get_rules(
     # half — flag any ACTIVE rule whose serve target cannot currently resolve.
     snap = app.get_snapshot(session, env)
 
-    def _unservable_reason(r: models.Rule) -> str | None:
-        if r.status != "active":
-            return None
-        serve = r.serve if isinstance(r.serve, dict) else {}
-        if r.scope == "global":
-            label = serve.get("label") or (serve.get("rollout") or {}).get("label")
-            if label and not any(
-                snap.version_for_label(pid, label) is not None for pid in snap.versions):
-                return f"label {label!r} has no participating prompts"
-            return None
-        pid = r.prompt_id
-        targets: list[tuple[int, str | None, str | None]] = []
-        if "version" in serve:
-            targets.append((int(serve["version"]), serve.get("at"), serve.get("sha")))
-        for band in (serve.get("rollout") or {}).get("weights", []):
-            if band.get("version") is not None and not band.get("default"):
-                targets.append((int(band["version"]), None, None))
-        for version, at, sha in targets:
-            vinfo = snap.version_info(pid, version)
-            if vinfo is None:
-                return f"v{version} does not exist"
-            if at == "tip":
-                if vinfo.tip_sha is None:
-                    return f"v{version} has no validated tip"
-            elif at == "sha":
-                if not sha or not snap.servable(pid, version, sha):
-                    return f"pinned SHA for v{version} is not servable"
-            elif vinfo.live_sha is None or not snap.servable(pid, version, vinfo.live_sha):
-                if not any(snap.servable(pid, version, s) for s in vinfo.previous_live):
-                    return f"v{version} has no servable live content"
-        return None
-
     rules = [
         {"id": r.id, "scope": r.scope, "prompt_id": r.prompt_id, "priority": r.priority,
          "when": r.clauses, "serve": r.serve, "status": r.status, "comment": r.comment,
-         "unservable_reason": _unservable_reason(r)}
+         "unservable_reason": _unservable_reason(snap, r)}
         for r in tgt.list_rules(env)
         # Scoped read keeps global rules (they govern this project's prompts too) plus the
         # project's own prompt-scoped rules; other projects' rules stay hidden.
@@ -155,6 +123,43 @@ def get_rules(
         "rules_version": e.rules_version, "rules": rules,
         "kills": kills, "defaults": defaults,
     }
+
+
+def _unservable_reason(snap, r: models.Rule) -> str | None:
+    """§7 "skipped, counted, surfaced": the static half of the eval-time skip — why an
+    ACTIVE rule's serve target cannot currently resolve (None when it can). Used by the
+    rules listing AND echoed as a warning when a rule is created/updated, so an author
+    learns "this can never serve" at save time, not after 30 baffling requests."""
+    if r.status != "active":
+        return None
+    serve = r.serve if isinstance(r.serve, dict) else {}
+    if r.scope == "global":
+        label = serve.get("label") or (serve.get("rollout") or {}).get("label")
+        if label and not any(
+            snap.version_for_label(pid, label) is not None for pid in snap.versions):
+            return f"label {label!r} has no participating prompts"
+        return None
+    pid = r.prompt_id
+    targets: list[tuple[int, str | None, str | None]] = []
+    if "version" in serve:
+        targets.append((int(serve["version"]), serve.get("at"), serve.get("sha")))
+    for band in (serve.get("rollout") or {}).get("weights", []):
+        if band.get("version") is not None and not band.get("default"):
+            targets.append((int(band["version"]), None, None))
+    for version, at, sha in targets:
+        vinfo = snap.version_info(pid, version)
+        if vinfo is None:
+            return f"v{version} does not exist"
+        if at == "tip":
+            if vinfo.tip_sha is None:
+                return f"v{version} has no validated tip"
+        elif at == "sha":
+            if not sha or not snap.servable(pid, version, sha):
+                return f"pinned SHA for v{version} is not servable"
+        elif vinfo.live_sha is None or not snap.servable(pid, version, vinfo.live_sha):
+            if not any(snap.servable(pid, version, s) for s in vinfo.previous_live):
+                return f"v{version} has no servable live content"
+    return None
 
 
 @router.post("/envs/{env}/rules")
@@ -182,7 +187,14 @@ def upsert_rule(
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
     app.invalidate_after_commit(session, env)
-    return {"id": r.id, "rules_version": session.get(models.Environment, env).rules_version}
+    out = {"id": r.id, "rules_version": session.get(models.Environment, env).rules_version}
+    # Save-time honesty: a rule whose serve target can't resolve (e.g. a rollout to a
+    # version that's never been published here) is accepted — publishing later makes it
+    # real — but the author hears about it NOW, not after baffling default-only traffic.
+    warning = _unservable_reason(app.get_snapshot(session, env), r)
+    if warning:
+        out["warning"] = f"this rule can't serve yet — {warning}"
+    return out
 
 
 @router.post("/envs/{env}/rules/batch")
@@ -225,14 +237,28 @@ def upsert_rules_batch(
             _require_stored_scope(ident, existing, env)
     tgt = app.targeting(session, ident.name)
     ids: list[str] = []
+    upserted: list[models.Rule] = []
     try:
         for r in req.rules:
-            ids.append(tgt.upsert_rule(env, r.model_dump()).id)
+            row = tgt.upsert_rule(env, r.model_dump())
+            ids.append(row.id)
+            upserted.append(row)
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
     app.invalidate_after_commit(session, env)
-    return {"ids": ids, "count": len(ids),
-            "rules_version": session.get(models.Environment, env).rules_version}
+    out = {"ids": ids, "count": len(ids),
+           "rules_version": session.get(models.Environment, env).rules_version}
+    # Same save-time honesty as the single upsert: any rule in the batch whose serve
+    # target can't currently resolve is reported NOW (the composer toasts these).
+    snap = app.get_snapshot(session, env)
+    warnings = []
+    for row in upserted:
+        reason = _unservable_reason(snap, row)
+        if reason:
+            warnings.append(f"rule {row.id!r} can't serve yet — {reason}")
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 @router.patch("/envs/{env}/rules/{rule_id}")
@@ -434,6 +460,10 @@ def publish(
         outcome = tgt.make_live(
             env, req.prompt_id, req.version_number, req.to_sha, comment=req.comment,
         )
+        if req.make_default:
+            # Same transaction: the pointer advance and the default switch land (or
+            # roll back) together — "publish for everyone" is never half-true.
+            tgt.set_default(env, req.prompt_id, req.version_number)
         archived = 0
         for rid in req.archive_rule_ids:
             r = session.get(models.Rule, rid)

@@ -83,10 +83,10 @@ function signInCard() {
     body = `
     <div class="signin-title serif">Welcome to Incant</div>
     <p class="signin-copy">This instance has no accounts yet. Create the first admin — you'll invite everyone else from <b>Access</b>.</p>
-    <input id="setupName" class="signin-input" placeholder="Your name" autocomplete="name" data-enter="setupBtn">
-    <input id="setupEmail" type="email" class="signin-input" placeholder="you@company.com" autocomplete="email" data-enter="setupBtn" style="margin-top:8px">
-    <input id="setupPassword" type="password" class="signin-input" placeholder="Password (10+ characters)" autocomplete="new-password" data-enter="setupBtn" style="margin-top:8px">
-    <input id="setupProject" class="signin-input" placeholder="Project name — e.g. acme (optional)" spellcheck="false" autocomplete="off" data-enter="setupBtn" style="margin-top:8px">
+    <input id="setupName" class="signin-input" placeholder="Your name" aria-label="Your name" autocomplete="name" data-enter="setupBtn">
+    <input id="setupEmail" type="email" class="signin-input" placeholder="you@company.com" aria-label="Email address" autocomplete="email" data-enter="setupBtn" style="margin-top:8px">
+    <input id="setupPassword" type="password" class="signin-input" placeholder="Password (10+ characters)" aria-label="Password, at least 10 characters" autocomplete="new-password" data-enter="setupBtn" style="margin-top:8px">
+    <input id="setupProject" class="signin-input" placeholder="Project name — e.g. acme (optional)" aria-label="Project name, optional" spellcheck="false" autocomplete="off" data-enter="setupBtn" style="margin-top:8px">
     <button id="setupBtn" class="btn primary" data-act="doSetup" style="width:100%;margin-top:12px">Create admin account</button>
     <div class="err" id="signinErr" style="margin-top:8px"></div>
     <div class="signin-hint"><button type="button" class="link btn-bare" data-act="signinMode" data-mode="key">Sign in with an API key instead</button></div>`;
@@ -94,7 +94,7 @@ function signInCard() {
     body = `
     <div class="signin-title serif">Sign in to Incant</div>
     <p class="signin-copy">Paste an API key — for machine or developer access, or the admin key printed when this instance first started.</p>
-    <input id="signinKey" type="password" class="signin-input" placeholder="incant_sk_…" spellcheck="false" autocomplete="off"
+    <input id="signinKey" type="password" class="signin-input" placeholder="incant_sk_…" aria-label="API key" spellcheck="false" autocomplete="off"
       data-enter="signinBtn">
     ${remember}
     <button id="signinBtn" class="btn primary" data-act="setToken" style="width:100%;margin-top:10px">Sign in</button>
@@ -104,8 +104,8 @@ function signInCard() {
     body = `
     <div class="signin-title serif">Sign in to Incant</div>
     <p class="signin-copy">Use your email and password — an admin invited you, or set this up on first boot.</p>
-    <input id="signinEmail" type="email" class="signin-input" placeholder="you@company.com" autocomplete="username" data-enter="pwSigninBtn">
-    <input id="signinPassword" type="password" class="signin-input" placeholder="Password" autocomplete="current-password" data-enter="pwSigninBtn" style="margin-top:8px">
+    <input id="signinEmail" type="email" class="signin-input" placeholder="you@company.com" aria-label="Email address" autocomplete="username" data-enter="pwSigninBtn">
+    <input id="signinPassword" type="password" class="signin-input" placeholder="Password" aria-label="Password" autocomplete="current-password" data-enter="pwSigninBtn" style="margin-top:8px">
     ${remember}
     <button id="pwSigninBtn" class="btn primary" data-act="passwordSignIn" style="width:100%;margin-top:10px">Sign in</button>
     <div class="err" id="signinErr" style="margin-top:8px"></div>

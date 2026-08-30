@@ -297,26 +297,48 @@ const Actions = {
     updatePromptList();
   },
   newPrompt() {
+    // One project per deployment. Once bound (any project registered — the
+    // overview reports it even with zero prompts), the prefix is FIXED: show it
+    // as a non-editable chip and ask only for the name. Before binding, the
+    // first prompt's leading segment names the deployment's one project.
+    const bound = _promptsCache?.data?.projects?.[0]?.project || null;
+    const hint = bound
+      ? `Every prompt here lives under <span class="mono">${esc(bound)}/</span> — one project
+         per deployment. Nested paths are fine (<span class="mono">style/language-rules</span>).
+         Fragments are just prompts — this can be included by any other.`
+      : `A prompt id is a path: <span class="mono">project/name</span>. The first segment names
+         this deployment's ONE project — every later prompt lives under it too.
+         Fragments are just prompts — this can be included by any other.`;
+    const idField = bound
+      ? `<div class="field"><label for="npId">Prompt name</label>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="mono" style="color:var(--faint);white-space:nowrap">${esc(bound)}/</span>
+            <input id="npId" placeholder="refunds" spellcheck="false" style="flex:1" aria-label="Prompt name under ${esc(bound)}"></div></div>`
+      : `<div class="field"><label for="npId">Prompt id</label>
+          <input id="npId" placeholder="acme/refunds" spellcheck="false"></div>`;
     openModal(`
       <h3>New prompt</h3>
-      <p class="hint">A prompt id is a path: <span class="mono">project/name</span> (e.g.
-        <span class="mono">support/refunds</span>). A new leading segment creates a new project.
-        Fragments are just prompts — this can be included by any other.</p>
-      <div class="field"><label>Prompt id</label>
-        <input id="npId" placeholder="support/refunds" spellcheck="false"></div>
-      <div class="field"><label>Description <span style="text-transform:none;font-weight:400">(optional)</span></label>
+      <p class="hint">${hint}</p>
+      ${idField}
+      <div class="field"><label for="npDesc">Description <span style="text-transform:none;font-weight:400">(optional)</span></label>
         <textarea id="npDesc" placeholder="What this prompt is for…"></textarea></div>
       <div class="err" id="npErr"></div>
       <div class="modal-actions">
         <button class="btn" data-act="closeModal">Cancel</button>
-        <button class="btn primary" data-act="createPrompt">Create &amp; edit v1</button>
+        <button class="btn primary" data-act="createPrompt" data-project="${esc(bound || "")}">Create &amp; edit v1</button>
       </div>`);
   },
-  async createPrompt() {
-    const id = (el("npId").value || "").trim().replace(/^\/+|\/+$/g, "");
+  async createPrompt(ds) {
+    const bound = (ds && ds.project) || "";
+    let id = (el("npId").value || "").trim().replace(/^\/+|\/+$/g, "");
     const desc = (el("npDesc").value || "").trim();
     const errEl = el("npErr");
-    if (!id || !id.includes("/")) {
+    if (bound) {
+      // Tolerate a pasted full id — don't double-prefix.
+      if (id.startsWith(bound + "/")) id = id.slice(bound.length + 1);
+      if (!id) { errEl.textContent = "Enter a name for the prompt."; return; }
+      id = `${bound}/${id}`;
+    } else if (!id || !id.includes("/")) {
       errEl.textContent = "Enter a path like project/name (needs at least one “/”).";
       return;
     }
@@ -333,7 +355,9 @@ const Actions = {
       toast(`Created ${id} — start writing v1`);
       go(`#/p/${enc(id)}/draft?draft=${draft.id}`);
     } catch (e) {
-      if (e.status === 409) errEl.textContent = "A prompt with that id already exists.";
+      // 409 carries the real reason (duplicate id vs. the one-project rule) —
+      // surface it instead of guessing "already exists".
+      if (e.status === 409) errEl.textContent = errText(e) || "A prompt with that id already exists.";
       else if (e.status === 403) errEl.textContent = "You don't have editor access on that project.";
       else errEl.textContent = errText(e);
     }
@@ -342,8 +366,13 @@ const Actions = {
     const pid = (ds && ds.pid) || State.route.pid;
     try {
       const dv = await GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`);
-      const seed = dv.versions.find((x) => x.is_default)?.version || dv.versions[0]?.version;
-      const created = await POST(`/mgmt/prompts/${enc(pid)}/drafts`, { seed_from_version: seed, title: "New version" });
+      const seedRow = dv.versions.find((x) => x.is_default) || dv.versions[0];
+      // Seed from what's PUBLISHED (the live sha), not the version's tip: unpublished
+      // tip edits may have been deliberately rolled back, and a new version must not
+      // quietly resurrect them. No live pointer yet => the tip is all there is.
+      const body = { seed_from_version: seedRow?.version, title: "New version" };
+      if (seedRow?.live_full_sha) body.seed_from_sha = seedRow.live_full_sha;
+      const created = await POST(`/mgmt/prompts/${enc(pid)}/drafts`, body);
       closeModal();   // dismiss the "Create a new version?" explainer if open
       go(`#/p/${enc(pid)}/draft?draft=${created.id}`);
     } catch (e) { toast(errText(e), true); }
@@ -691,7 +720,7 @@ const Actions = {
       const res = await POST(`/mgmt/envs/${enc(p.env)}/publish`, {
         prompt_id: p.pid, version_number: parseInt(p.v), to_sha: p.toSha,
         comment: p.mode === "revert" ? "Reverted to an earlier state via the UI" : "Published via the UI",
-        confirm: p.pid, archive_rule_ids,
+        confirm: p.pid, archive_rule_ids, make_default: !!p.makeDefault,
       });
       closeModal();
       const removed = res.archived || 0;
@@ -960,9 +989,14 @@ const Actions = {
     render();
   },
   seedExample() {
+    // Name the destination honestly: a bound deployment seeds into ITS project.
+    const bound = _promptsCache?.data?.projects?.[0]?.project || null;
+    const where = bound
+      ? `example prompts into your <span class="mono">${esc(bound)}</span> project`
+      : `a small example <span class="mono">support</span> project`;
     openModal(`
       <h3>Load the example dataset?</h3>
-      <p class="hint">Fills the empty library with a small support project — prompts with real version history, targeting rules, segments and test contexts — so every screen has something to show. It also issues a renderer service key (shown once) so you can try the render API. Only works while the library is empty.</p>
+      <p class="hint">Fills the empty library with ${where} — prompts with real version history, targeting rules, segments and test contexts — so every screen has something to show. It also issues a renderer service key (shown once) so you can try the render API. Only works while the library is empty.</p>
       <div class="modal-actions">
         <button class="btn" data-act="closeModal">Cancel</button>
         <button id="seedBtn" class="btn primary" data-act="seedExampleConfirm">Load example data</button></div>`);
@@ -975,7 +1009,7 @@ const Actions = {
       closeModal();
       openModal(`
         <h3>Example data loaded</h3>
-        <p class="hint">A renderer service key was issued for the example project (scope: support · prod). Copy it now if you want to try the render API — it is <b>not recoverable</b>.</p>
+        <p class="hint">A renderer service key was issued for the example data (scope: ${esc(r.project || "support")} · prod). Copy it now if you want to try the render API — it is <b>not recoverable</b>.</p>
         <input readonly data-act="selectAll" value="${esc(r.renderer_key)}"
           style="width:100%;font-family:'IBM Plex Mono',monospace;font-size:12px">
         <div class="modal-actions"><button class="btn primary" data-act="closeModal">Done</button></div>`);
@@ -1303,9 +1337,13 @@ const Actions = {
     // no longer half-applies the renumber (server rolls the whole request back).
     const rules = plan.map((p) => ruleUpsertBody(p.rule, p.priority)).concat([base]);
     try {
-      await POST(`/mgmt/envs/${enc(State.env)}/rules/batch`, { rules });
+      const res = await POST(`/mgmt/envs/${enc(State.env)}/rules/batch`, { rules });
       closeModal();
-      toast(co.editing ? "Rule saved" : "Rule created");
+      // A rule whose serve target can't resolve yet (e.g. a rollout to a version never
+      // published here) saves fine but would silently serve the default to everyone —
+      // say so NOW, not after 30 baffling requests.
+      const warn = (res.warnings || []).length ? ` — ⚠ ${res.warnings.join("; ")}` : "";
+      toast((co.editing ? "Rule saved" : "Rule created") + warn, !!warn);
       render();
     } catch (e) { co.err = errText(e); renderComposer(); }
   },
@@ -1334,7 +1372,7 @@ const Actions = {
     const vrow = dv.versions.find((v) => v.version === t.version) || {};
     const sha = vrow.tip_full_sha;
     if (!sha) return toast("No unpublished edits to publish for this version", true);
-    const body = `Publish <b>v${t.version}</b>'s latest edits to <b>${esc(pid)}</b> for everyone, then remove this test rule so it stops targeting a group.`;
+    const body = `Publish <b>v${t.version}</b> of <b>${esc(pid)}</b> for everyone — it becomes the version this environment serves by default — then remove this test rule so it stops targeting a group.`;
     if (isLocked()) {
       openModal(typeToConfirm({
         title: "Stop test & publish", body: body + ` <b>${esc(State.env)}</b> is locked.`,
@@ -1346,21 +1384,24 @@ const Actions = {
     openModal(`
       <h3>Stop test &amp; publish</h3>
       <p class="hint">${body}</p>
-      <div style="display:flex;gap:10px;margin:0 0 6px;padding:12px 14px;background:var(--acc-soft2);border-radius:10px;font-size:12.5px;color:var(--mut);line-height:1.6">Two steps, in order: publish v${t.version}'s latest edits (advance the live pointer), then archive this test rule. Everyone gets the same content — the group test is no longer needed.</div>
+      <div style="display:flex;gap:10px;margin:0 0 6px;padding:12px 14px;background:var(--acc-soft2);border-radius:10px;font-size:12.5px;color:var(--mut);line-height:1.6">Three steps, in order: publish v${t.version}'s latest edits, make v${t.version} the default everyone gets, then archive this test rule. Cohort and control now see the same content — the group test is no longer needed.</div>
       <div class="modal-actions">
         <button class="btn" data-act="closeModal">Cancel</button>
         <button class="btn primary" data-act="stopTestConfirm" data-id="${esc(rule.id)}" data-pid="${esc(pid)}" data-v="${t.version}" data-sha="${esc(sha)}">Publish &amp; stop test</button></div>`);
   },
   async stopTestConfirm(ds) {
     try {
-      // Pointer move + archive of the redundant test rule in one atomic request.
+      // Pointer move + DEFAULT promotion + archive of the redundant test rule, one
+      // atomic request. Without make_default the tested cohort's version never became
+      // what everyone gets — the archived rule silently dropped both cohort AND
+      // control back to the old default, the opposite of what the modal promises.
       await POST(`/mgmt/envs/${enc(State.env)}/publish`, {
         prompt_id: ds.pid, version_number: parseInt(ds.v), to_sha: ds.sha,
         comment: "Published via stop-test-and-publish", confirm: ds.pid,
-        archive_rule_ids: [ds.id],
+        archive_rule_ids: [ds.id], make_default: true,
       });
       closeModal();
-      toast("Published — test rule removed");
+      toast(`Published — v${ds.v} is now the default; test rule removed`);
       render();
     } catch (e) { toast(errText(e), true); }
   },

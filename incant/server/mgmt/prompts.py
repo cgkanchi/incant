@@ -140,6 +140,12 @@ def overview(
             "newest_version_live": bool(newest_vinfo and newest_vinfo.live_sha),
             "updated": {"when": updated.date, "who": updated.author} if updated else None,
         })
+    # Registered projects with no prompts yet still appear (empty): the library
+    # must know the deployment's bound project even before the first prompt —
+    # the New Prompt modal fixes its prefix from this.
+    for proj_id in session.execute(select(models.Project.id).order_by(models.Project.id)).scalars():
+        if proj_id not in projects and ident.has("viewer", project=proj_id, environment=environment):
+            projects[proj_id] = []
     return {
         "environment": environment,
         "rules_version": snap.rules_version,

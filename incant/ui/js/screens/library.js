@@ -165,8 +165,8 @@ async function screenPrompts() {
          "a git mirror — without one this container's disk is the only copy", "#/access"],
         [st.people >= 2, "Invite your team",
          "PMs and engineers sign in with email &amp; password", "#/access"],
-        [st.service_keys > 0, "Issue a service key",
-         "your app renders prompts with a scoped renderer key", "#/access"],
+        [st.renderer_keys > 0, "Issue a renderer key",
+         "your app renders prompts with a scoped renderer service key", "#/access"],
       ];
       if (items.every(([done]) => done)) {
         localStorage.setItem("incant_setup_done", "1");

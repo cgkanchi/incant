@@ -171,6 +171,7 @@ class RegistryService:
         *,
         version_number: int | None = None,
         seed_from_version: int | None = None,
+        seed_from_sha: str | None = None,
         author: str = "",
         author_principal_id: str | None = None,
         title: str = "",
@@ -200,7 +201,12 @@ class RegistryService:
 
         if content is None:
             if seed_from_version is not None:
-                content = self.git.read(f"{prompt_id}/v{seed_from_version}.j2") or ""
+                path = f"{prompt_id}/v{seed_from_version}.j2"
+                # seed_from_sha pins WHICH revision of that version seeds the draft
+                # (the UI passes the live sha for new versions — published content,
+                # not unpublished tip edits). Absent => the tip, as before.
+                content = (self.git.read(path, ref=seed_from_sha) if seed_from_sha
+                           else self.git.read(path)) or ""
             elif not new_version:
                 content = self.git.read(f"{prompt_id}/v{version_number}.j2") or ""
             else:

@@ -135,11 +135,34 @@ function draftPrimary(draft) {
     return `<button class="btn primary" data-act="draftTab" data-tab="review">Awaiting ${need - have} approval(s)</button>`;
   return `<button class="btn primary" data-act="openCommit">Save edits…</button>`;
 }
+// The structured Test-render form must reflect the DRAFT's current variables — the
+// names live in the template being typed — enriched with committed metadata (types,
+// defaults, descriptions) where it exists. Initializing from the committed version
+// alone claims "no variables" for every name introduced since the last commit.
+function draftVarDefs(committed, draftVars) {
+  const meta = new Map((committed || []).map((v) => [v.name, v]));
+  const req = new Set((draftVars && draftVars.required) || []);
+  return ((draftVars && draftVars.names) || []).map((n) =>
+    meta.get(n) || { name: n, required: req.has(n), type: "string", default: null, description: "" });
+}
 function applyDraftUpdate(r) {
   window._dp.draft = r;
   const lc = el("draftLintChip"); if (lc) lc.innerHTML = lintChipHtml(r);
   const pw = el("draftPrimaryWrap"); if (pw) pw.innerHTML = draftPrimary(r);
   const vl = el("varLine"); if (vl) vl.innerHTML = varsLine(r);
+  // Variables added/removed while typing update the structured form too. Skip while
+  // the source doesn't parse (the last good set stays), and only rebuild when the
+  // name set actually changed — focus is in the textarea during autosave, so the
+  // side-panel rebuild never steals it.
+  const dp = window._dp;
+  if (r.variables && !r.variables.error && dp) {
+    const before = (dp.varDefs || []).map((v) => v.name).join(",");
+    const next = draftVarDefs(dp.committedVars, r.variables);
+    if (next.map((v) => v.name).join(",") !== before) {
+      dp.varDefs = next;
+      const w = el("ctxFormWrap"); if (w) w.innerHTML = ctxFormHtml(dp);
+    }
+  }
 }
 
 async function screenDraft() {
@@ -193,7 +216,11 @@ async function screenDraft() {
     tcActive: tcs.test_contexts[0]?.name || "__custom",
     customVars: null, customFlags: null,
     flagDefs: targetingFlags(rulesRes.rules, segsRes.segments, [pid, ...(dv.includes || [])]),
-    varDefs: (dv.variables || []).slice(), ctx: null, ctxJson: false,
+    committedVars: (dv.variables || []).slice(),
+    // Draft truth when it parses; the committed set is the fallback while it doesn't.
+    varDefs: (draft.variables && !draft.variables.error)
+      ? draftVarDefs(dv.variables, draft.variables) : (dv.variables || []).slice(),
+    ctx: null, ctxJson: false,
     diffAgainst: "base", diffMode: "source", diffTc: tcs.test_contexts[0]?.name || null,
     // Review tab: which context drives the rendered before/after, and whether the
     // secondary source-diff section is expanded.
@@ -291,7 +318,8 @@ function draftWriteTab(dp) {
     <div class="card editor">
       <div class="ed-head"><span class="mono">v${draft.version_number}.j2</span><span>·</span><span>Jinja2</span>
         <span style="margin-left:auto" class="mono">${esc(draft.id)}</span></div>
-      <textarea class="ta" id="draftTa" data-act="draftInput" spellcheck="false">${esc(draft.content || "")}</textarea>
+      <textarea class="ta" id="draftTa" data-act="draftInput" spellcheck="false"
+        aria-label="Template source — ${esc(State.route.pid || draft.prompt_id || "")} version ${draft.version_number}">${esc(draft.content || "")}</textarea>
       <div class="ed-foot"><span id="varLine">${varsLine(draft)}</span>
         <span style="margin-left:auto" class="faint">autosaves as you type</span></div>
     </div>

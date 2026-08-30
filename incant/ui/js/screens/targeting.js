@@ -10,10 +10,15 @@ async function screenRules() {
   const pid = State.route.pid;
   // Both reads retry scoped to this prompt's project on a 403, so a project-scoped operator
   // can still manage (and see the history of) the rules that govern their own prompt.
-  const [d, rv] = await Promise.all([
+  let [d, rv] = await Promise.all([
     fetchEnvRules(env, pid),
     fetchEnvRevisions(env, pid, 25),
   ]);
+  // On a prompt's own targeting page, show ONLY the rules that govern THIS prompt:
+  // its prompt-scoped rules plus global rules (which apply to every prompt). Other
+  // prompts' rules must not appear here — a "Stop test & publish" on a row belonging
+  // to a different prompt would advance and mutate that unrelated prompt.
+  if (pid) d = { ...d, rules: d.rules.filter((r) => r.prompt_id === pid || r.scope === "global") };
   _rulesData = d;   // stashed for the "turn targeting off" confirm modal
   // If the rule list itself couldn't be loaded (outage), the rows below would read as
   // "No rules yet" — warn instead so an empty screen isn't mistaken for empty targeting.
@@ -114,7 +119,9 @@ async function screenRules() {
     <div id="audienceCard">${audienceCardHtml(testerPid)}</div>
     ${techDetails(`rules_version ${esc(String(d.rules_version))} · synced &lt;2s`, "rules version, sync")}
     <div class="h1row" style="margin-top:26px"><span class="h1 sm serif">Change history</span>
-      <span class="sub">every targeting change — who, what, when</span></div>
+      <span class="sub">${pid
+        ? `every targeting change in ${esc(env)} — all prompts, because going back restores the whole environment`
+        : "every targeting change — who, what, when"}</span></div>
     <div class="card" style="overflow-x:auto"><table class="grid">
       <thead class="ghead"><tr><th>Version</th><th>Change</th><th>Who</th><th>Comment</th><th>When</th><th></th></tr></thead>
       <tbody>${revRows}</tbody></table></div>
@@ -128,14 +135,19 @@ function openTargetingOffModal(pid) {
   const d = _rulesData; if (!d) return;
   const defV = d.defaults[pid];
   const defTxt = defV != null ? `Version ${defV} (live)` : "the environment default";
-  const ignored = d.rules.filter((r) => r.status === "active").map((r) =>
-    `<div style="font-size:12.5px;color:var(--mut)">· ${esc(r.comment || r.id)} <span class="faint">→ ${serveTargetPlain(r.serve)}</span></div>`
-  ).join("") || '<div class="faint" style="font-size:12.5px">No active rules.</div>';
+  // The kill is PER-PROMPT: list only the rules that actually govern this prompt
+  // (its own + global ones, noting the latter are ignored for this prompt only) —
+  // not every rule in the environment, which overstates the blast radius.
+  const affected = d.rules.filter((r) =>
+    r.status === "active" && (r.prompt_id === pid || r.scope === "global"));
+  const ignored = affected.map((r) =>
+    `<div style="font-size:12.5px;color:var(--mut)">· ${esc(r.comment || r.id)} <span class="faint">→ ${serveTargetPlain(r.serve)}${r.scope === "global" ? " · global — ignored for this prompt only" : ""}</span></div>`
+  ).join("") || '<div class="faint" style="font-size:12.5px">No active rules govern this prompt.</div>';
   openModal(`
     <div style="display:flex;align-items:center;gap:10px">
       <span class="toggle"><span class="knob"></span></span>
       <h3 style="margin:0">Turn targeting off?</h3></div>
-    <p class="hint" style="margin-top:10px">Every request will fall through to the default — <b>${defTxt}</b> — and all rules below will be ignored.</p>
+    <p class="hint" style="margin-top:10px">Every request for <b>${esc(pid)}</b> will fall through to the default — <b>${defTxt}</b> — and the rules below will be ignored for it. Other prompts are not affected.</p>
     <div style="display:flex;gap:10px;margin:0 0 14px;padding:12px 14px;background:var(--warn-soft);border-radius:10px">
       <span style="font-size:14px;line-height:1.3">⚠</span>
       <div style="font-size:12.5px;color:var(--warn);line-height:1.6">This also overrides versions pinned on purpose. Anyone currently kept on an older version for business reasons will switch to the default too. For those users this may be worse, not safer.</div></div>

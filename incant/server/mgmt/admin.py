@@ -279,9 +279,17 @@ def setup_status(
         "prompts": _count(models.Prompt),
         "people": _count(models.User),
         "remotes": _count(models.Remote),
-        "service_keys": session.execute(
-            select(func.count()).select_from(models.ApiKey)
-            .where(models.ApiKey.revoked.is_(False))
+        # The checklist item is "issue a key your app can RENDER with" — so count
+        # active keys on renderer-bound principals only. Counting every ApiKey marked
+        # the item done from minute one: the auto-generated bootstrap ADMIN key
+        # (auth._insert_bootstrap_admin) always exists and is not a serving credential.
+        "renderer_keys": session.execute(
+            select(func.count(func.distinct(models.ApiKey.id)))
+            .select_from(models.ApiKey)
+            .join(models.RoleBinding,
+                  models.RoleBinding.principal_id == models.ApiKey.principal_id)
+            .where(models.ApiKey.revoked.is_(False),
+                   models.RoleBinding.role == "renderer")
         ).scalar() or 0,
     }
 
@@ -301,10 +309,12 @@ def seed_example(
                                  "dataset only loads into an empty deployment")
     from ...seed import seed as run_seed
     renderer_key = run_seed(app)
-    record_audit(session, ident.name, "seed.example", "project", "support")
+    # The seed lands in the deployment's bound project (or names it "support").
+    project = session.execute(select(models.Project.id)).scalars().first()
+    record_audit(session, ident.name, "seed.example", "project", project or "support")
     app.invalidate()
     app.invalidate_auth_after_commit(session)
-    return {"ok": True, "renderer_key": renderer_key,
+    return {"ok": True, "renderer_key": renderer_key, "project": project,
             "note": "store the renderer key now; it is not shown again"}
 
 

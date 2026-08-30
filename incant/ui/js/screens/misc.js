@@ -110,9 +110,9 @@ async function screenWelcome() {
     <div class="signin-mark">✦</div>
     <div class="signin-title serif">Welcome to Incant</div>
     <p class="signin-copy">You've been invited. Pick a password and you're in. This also works as a password reset.</p>
-    <input id="welcomeName" class="signin-input" placeholder="Your name (optional)" autocomplete="name" data-enter="welcomeBtn">
-    <input id="welcomePassword" type="password" class="signin-input" placeholder="Password (10+ characters)" autocomplete="new-password" data-enter="welcomeBtn" style="margin-top:8px">
-    <input id="welcomePassword2" type="password" class="signin-input" placeholder="Repeat the password" autocomplete="new-password" data-enter="welcomeBtn" style="margin-top:8px">
+    <input id="welcomeName" class="signin-input" placeholder="Your name (optional)" aria-label="Your name, optional" autocomplete="name" data-enter="welcomeBtn">
+    <input id="welcomePassword" type="password" class="signin-input" placeholder="Password (10+ characters)" aria-label="Password, at least 10 characters" autocomplete="new-password" data-enter="welcomeBtn" style="margin-top:8px">
+    <input id="welcomePassword2" type="password" class="signin-input" placeholder="Repeat the password" aria-label="Repeat the password" autocomplete="new-password" data-enter="welcomeBtn" style="margin-top:8px">
     <button id="welcomeBtn" class="btn primary" data-act="acceptInvite" data-token="${esc(token)}" style="width:100%;margin-top:12px">Set password &amp; sign in</button>
     <div class="err" id="welcomeErr" style="margin-top:8px"></div>
   </div></div>`;

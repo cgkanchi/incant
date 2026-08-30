@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from jinja2 import Environment, nodes
+from jinja2 import Environment, TemplateError, nodes
 from jinja2 import meta as jinja_meta
 
 
@@ -29,14 +29,21 @@ class ExtractedVars:
     required: frozenset[str] = field(default_factory=frozenset)
     optional: frozenset[str] = field(default_factory=frozenset)
     includes: tuple[str, ...] = ()  # static include targets (string literals)
+    # Set when the source doesn't parse (mid-typing syntax errors are an ordinary
+    # editor state, not an exception): the sets above are then empty, and the
+    # message says why. Extraction NEVER raises on user-authored source.
+    error: str | None = None
 
     def as_dict(self) -> dict[str, dict]:
-        return {
+        out = {
             "names": sorted(self.names),
             "required": sorted(self.required),
             "optional": sorted(self.optional),
             "includes": list(self.includes),
         }
+        if self.error:
+            out["error"] = self.error
+        return out
 
 
 def _guard_names(test: nodes.Node) -> set[str]:
@@ -119,10 +126,18 @@ def _static_includes(ast: nodes.Node) -> tuple[str, ...]:
 
 
 def extract(source: str, env: Environment | None = None) -> ExtractedVars:
-    """Parse ``source`` and return the variable set + inferred optionality."""
+    """Parse ``source`` and return the variable set + inferred optionality.
+
+    Unparseable source (an everyday mid-typing state — ``{% if broken %}`` with no
+    endif) returns an empty set carrying ``error`` instead of raising: extraction
+    runs on every draft read and autosave, and a raise there bricks the draft
+    (validation reports the syntax error separately, via its compile check)."""
 
     env = env or Environment()
-    ast = env.parse(source)
+    try:
+        ast = env.parse(source)
+    except TemplateError as exc:
+        return ExtractedVars(error=f"template error: {exc}")
     names = frozenset(jinja_meta.find_undeclared_variables(ast))
 
     hard: set[str] = set()

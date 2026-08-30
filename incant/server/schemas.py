@@ -89,6 +89,10 @@ class VersionUpdateRequest(BaseModel):
 class CreateDraftRequest(BaseModel):
     version_number: Optional[int] = None      # None => allocate a new version
     seed_from_version: Optional[int] = None
+    # With seed_from_version: seed from that version's content AT THIS COMMIT rather
+    # than its tip. The UI passes the live pointer's sha when creating a new version,
+    # so unpublished (possibly deliberately rolled-back) tip edits don't resurrect.
+    seed_from_sha: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     author: str = ""
     title: str = ""
     content: Optional[str] = None
@@ -232,6 +236,11 @@ class PublishRequest(BaseModel):
     comment: str = ""
     confirm: Optional[str] = None  # locked env: must echo the prompt id
     archive_rule_ids: list[str] = Field(default_factory=list)
+    # Also make version_number the environment default for this prompt, in the same
+    # transaction. Used by "Stop test & publish" (promoting the tested version so
+    # EVERYONE gets it, as the confirmation promises) and by a first publish (a
+    # brand-new prompt has no default; a pointer alone would serve nobody).
+    make_default: bool = False
 
 
 class DefaultRequest(BaseModel):

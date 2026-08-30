@@ -1,8 +1,9 @@
 """Seed the design's example dataset so the app is explorable out of the box.
 
-One project (support — one per deployment), two environments (prod protected,
-staging track-tip), the support/system v1–v3 lineage with v2 live and tip ahead
-+2, the shared style fragment (a prompt like any other), rules, segments,
+One project (one per deployment — the existing project if the deployment is
+already bound, else "support"), two environments (prod protected, staging
+track-tip), the <project>/system v1–v3 lineage with v2 live and tip ahead +2,
+the shared style fragment (a prompt like any other), rules, segments,
 refinements, and test contexts.
 """
 
@@ -57,76 +58,93 @@ def _author(ctx: AppContext, s, prompt_id, version, content, author, message, *,
 
 def seed(ctx: AppContext | None = None) -> str:
     """Plant the design's example dataset. Callable from the CLI (fresh context)
-    or in-process from the mgmt seed-example endpoint (the running app's context)."""
+    or in-process from the mgmt seed-example endpoint (the running app's context).
+    Seeds into the deployment's existing project when one is already named (the
+    setup screen's optional project field), else creates "support"."""
     if ctx is None:
         ctx = AppContext()
         ctx.initialize()
 
     with session_scope() as s:
+        # One project per deployment: adopt the bound one, or name it "support".
+        existing = s.execute(select(models.Project.id)).scalars().first()
+    project = existing or "support"
+    # The shared fragment is referenced by path inside two templates.
+    v2_warm = SYSTEM_V2_WARM.replace("support/", f"{project}/")
+    v3_voice = SYSTEM_V3_VOICE.replace("support/", f"{project}/")
+
+    with session_scope() as s:
         ensure_bootstrap_admin(s, ctx.settings.bootstrap_admin_key)
-        # Environments
+        # Environments — the example's demo state is ENFORCED, not just created:
+        # boot pre-creates the default env unprotected, and the dataset's story
+        # (locked prod with type-to-confirm, track-tip staging) must hold either way.
         for eid, protected, track_tip in [("prod", True, False), ("staging", False, True)]:
-            if s.get(models.Environment, eid) is None:
+            e = s.get(models.Environment, eid)
+            if e is None:
                 s.add(models.Environment(id=eid, name=eid, protected=protected, track_tip=track_tip))
-        # Projects (seed with review_policy 0 so we can commit freely).
+            else:
+                e.protected, e.track_tip = protected, track_tip
         reg = ctx.registry(s, "system")
-        reg.ensure_project("support", review_policy=0)  # the deployment's ONE project
+        p = reg.ensure_project(project, review_policy=0)
+        # Authoring below assumes no review gate; the final block sets the
+        # example's demo state (policy 1) regardless of how the project began.
+        p.review_policy = 0
 
     with session_scope() as s:
         # Shared fragment first (referenced by support/system).
-        _author(ctx, s, "support/style/language-rules", 1, LANGUAGE_RULES_V1, "Rae", "language rules v1")
-        _author(ctx, s, "support/style/language-rules", 2,
+        _author(ctx, s, f"{project}/style/language-rules", 1, LANGUAGE_RULES_V1, "Rae", "language rules v1")
+        _author(ctx, s, f"{project}/style/language-rules", 2,
                 LANGUAGE_RULES_V1 + "\nNo double negatives.", "Rae", "tighten language rules",
                 make_live=False)
-        ctx.targeting(s, "Rae").set_default("prod", "support/style/language-rules", 1)
-        ctx.targeting(s, "Rae").set_default("staging", "support/style/language-rules", 1)
+        ctx.targeting(s, "Rae").set_default("prod", f"{project}/style/language-rules", 1)
+        ctx.targeting(s, "Rae").set_default("staging", f"{project}/style/language-rules", 1)
 
     with session_scope() as s:
         # support/system v1 (archived), v2 (live + tip ahead +2), v3 (voice-v2 label).
-        _author(ctx, s, "support/system", 1,
+        _author(ctx, s, f"{project}/system", 1,
                 "You are a support agent for {{ customer_name }}.", "Jamie", "v1 initial")
         v = s.execute(select(models.Version).where(
-            models.Version.prompt_id == "support/system", models.Version.number == 1)).scalar_one()
+            models.Version.prompt_id == f"{project}/system", models.Version.number == 1)).scalar_one()
         v.status = "archived"
 
     with session_scope() as s:
         # v2 first commit = live pointer target
-        first = _author(ctx, s, "support/system", 2, SYSTEM_V2_FORMAL, "Dana",
+        first = _author(ctx, s, f"{project}/system", 2, SYSTEM_V2_FORMAL, "Dana",
                         "v2 formal baseline")
         # two more tweak commits => tip ahead +2 (do NOT move the pointer)
         reg = ctx.registry(s, "Sam")
-        d = reg.create_draft("support/system", version_number=2, author="Sam",
+        d = reg.create_draft(f"{project}/system", version_number=2, author="Sam",
                              content=SYSTEM_V2_FORMAL + "\n")
         reg.commit_draft(d.id, author="Sam", message="whitespace pass")
-        d2 = reg.create_draft("support/system", version_number=2, author="Sam",
-                              content=SYSTEM_V2_WARM)
+        d2 = reg.create_draft(f"{project}/system", version_number=2, author="Sam",
+                              content=v2_warm)
         reg.commit_draft(d2.id, author="Sam", message="Warm tone + shared style fragment")
-        ctx.targeting(s, "Sam").set_default("prod", "support/system", 2)
-        ctx.targeting(s, "Sam").set_default("staging", "support/system", 2)
+        ctx.targeting(s, "Sam").set_default("prod", f"{project}/system", 2)
+        ctx.targeting(s, "Sam").set_default("staging", f"{project}/system", 2)
 
     with session_scope() as s:
         # v3 voice-v2
-        out3 = _author(ctx, s, "support/system", 3, SYSTEM_V3_VOICE, "Maya",
+        out3 = _author(ctx, s, f"{project}/system", 3, v3_voice, "Maya",
                        "v3 voice rewrite", make_live=True)
         v3 = s.execute(select(models.Version).where(
-            models.Version.prompt_id == "support/system", models.Version.number == 3)).scalar_one()
+            models.Version.prompt_id == f"{project}/system", models.Version.number == 3)).scalar_one()
         v3.label = "voice-v2"
         # v3 lives in staging as default via track_tip; make it live there.
-        ctx.targeting(s, "Maya").make_live("staging", "support/system", 3, out3.sha,
+        ctx.targeting(s, "Maya").make_live("staging", f"{project}/system", 3, out3.sha,
                                            comment="v3 to staging")
 
     with session_scope() as s:
-        _author(ctx, s, "support/greeting", 1,
+        _author(ctx, s, f"{project}/greeting", 1,
                 "Hello {{ customer_name }} — thanks for reaching out. How can I help?",
                 "Maya", "greeting v1")
-        _author(ctx, s, "support/greeting", 2,
+        _author(ctx, s, f"{project}/greeting", 2,
                 "Hi {{ customer_name }}! What can I help with today?", "Maya",
                 "greeting v2", make_live=False)
-        ctx.targeting(s, "Maya").set_default("prod", "support/greeting", 1)
-        _author(ctx, s, "support/escalation/triage", 1,
+        ctx.targeting(s, "Maya").set_default("prod", f"{project}/greeting", 1)
+        _author(ctx, s, f"{project}/escalation/triage", 1,
                 "Triage the issue: {{ issue }}. Severity: {{ severity | default('normal') }}.",
                 "Dana", "triage v1")
-        ctx.targeting(s, "Dana").set_default("prod", "support/escalation/triage", 1)
+        ctx.targeting(s, "Dana").set_default("prod", f"{project}/escalation/triage", 1)
 
     with session_scope() as s:
         tgt = ctx.targeting(s, "Dana")
@@ -136,13 +154,13 @@ def seed(ctx: AppContext | None = None) -> str:
         ]})
         # v3 needs a prod live pointer for "v3 @ live" rule targets to resolve.
         v3 = s.execute(select(models.CommitValidation).where(
-            models.CommitValidation.prompt_id == "support/system",
+            models.CommitValidation.prompt_id == f"{project}/system",
             models.CommitValidation.version_number == 3,
             models.CommitValidation.status == "valid",
         ).order_by(models.CommitValidation.validated_at.desc())).scalars().first()
-        tgt.make_live("prod", "support/system", 3, v3.sha, comment="v3 pointer for beta rule")
+        tgt.make_live("prod", f"{project}/system", 3, v3.sha, comment="v3 pointer for beta rule")
         tgt.upsert_rule("prod", {
-            "id": "beta-gets-v3", "scope": "prompt", "prompt_id": "support/system",
+            "id": "beta-gets-v3", "scope": "prompt", "prompt_id": f"{project}/system",
             "priority": 10, "comment": "Voice v2 beta — EXP-142",
             "when": {"all": [{"segment": "beta-us"},
                              {"flag": "tier", "op": "in", "values": ["enterprise", "pro"]}]},
@@ -150,7 +168,7 @@ def seed(ctx: AppContext | None = None) -> str:
         })
         # team-x-tip: testing the v2 tweak before make-live
         tgt.upsert_rule("prod", {
-            "id": "team-x-tip", "scope": "prompt", "prompt_id": "support/system",
+            "id": "team-x-tip", "scope": "prompt", "prompt_id": f"{project}/system",
             "priority": 20, "comment": "Testing the v2 tweak before make-live",
             "when": {"flag": "user_id", "op": "in", "values": ["u_12", "u_88", "u_301"]},
             "serve": {"version": 2, "at": "tip"},
@@ -158,37 +176,37 @@ def seed(ctx: AppContext | None = None) -> str:
 
     with session_scope() as s:
         reg = ctx.registry(s, "system")
-        reg.set_test_context("support/system", "enterprise-us",
+        reg.set_test_context(f"{project}/system", "enterprise-us",
                              {"tier": "enterprise", "region": "us"},
                              {"customer_name": "Acme Corp", "plan_name": "Enterprise", "history": []})
-        reg.set_test_context("support/system", "free-eu",
+        reg.set_test_context(f"{project}/system", "free-eu",
                              {"tier": "free", "region": "eu"},
                              {"customer_name": "Lumen GmbH", "history": []})
-        reg.set_refinement("support/system", 2, "customer_name", type="string", required=True,
+        reg.set_refinement(f"{project}/system", 2, "customer_name", type="string", required=True,
                            description="The customer's company or name.")
-        reg.set_refinement("support/system", 2, "history", type="list", required=False, default=[])
+        reg.set_refinement(f"{project}/system", 2, "history", type="list", required=False, default=[])
 
     with session_scope() as s:
         # Review policy on support; an open draft to populate the review/editor screens.
-        proj = s.get(models.Project, "support")
+        proj = s.get(models.Project, project)
         proj.review_policy = 1
         reg = ctx.registry(s, "Sam")
-        reg.create_draft("support/system", version_number=2, author="Sam",
-                         title="Warm tone + shared style fragment", content=SYSTEM_V2_WARM)
+        reg.create_draft(f"{project}/system", version_number=2, author="Sam",
+                         title="Warm tone + shared style fragment", content=v2_warm)
 
     # A renderer service key scoped to (support, prod).
     with session_scope() as s:
         import uuid
         raw = "incant_sk_" + uuid.uuid4().hex
-        pid = "p_render_support"
+        pid = f"p_render_{project}"
         if s.get(models.Principal, pid) is None:
-            s.add(models.Principal(id=pid, kind="service", subject="support-service",
-                                   name="support-service"))
+            s.add(models.Principal(id=pid, kind="service", subject=f"{project}-service",
+                                   name=f"{project}-service"))
             s.flush()  # parent row before FK-bearing children
             s.add(models.ApiKey(principal_id=pid, prefix=key_prefix(raw), hash=hash_key(raw),
-                                name="support renderer"))
+                                name=f"{project} renderer"))
             s.add(models.RoleBinding(principal_id=pid, role="renderer",
-                                     project_id="support", environment_id="prod"))
+                                     project_id=project, environment_id="prod"))
             renderer_key = raw
         else:
             renderer_key = "(already seeded)"

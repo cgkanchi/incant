@@ -48,6 +48,7 @@ def create_draft(
         d = reg.create_draft(
             prompt_id, version_number=req.version_number,
             seed_from_version=req.seed_from_version,
+            seed_from_sha=req.seed_from_sha,
             author=ident.name, author_principal_id=ident.principal_id,
             title=req.title, content=req.content,
         )
