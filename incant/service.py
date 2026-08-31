@@ -31,7 +31,7 @@ from .core import (
     render_source,
     resolve,
 )
-from .db import after_commit, init_db, session_scope
+from .db import after_commit, init_db
 from .gitstore import BackupPusher, ContentStore, GitStore
 from .registry import MainReconcileResult, RegistryService
 from .targeting import TargetingService, build_snapshot, snapshot_from_state

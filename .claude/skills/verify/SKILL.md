@@ -25,13 +25,13 @@ uv run --project /home/cgkanchi/code/incant incant serve --host 127.0.0.1 --port
 ```
 
 - `uv run incant` must resolve the project — use `--project` when cwd is elsewhere.
-- Admin auth: `Authorization: Bearer incant_sk_dev_admin` — but ONLY with `INCANT_ALLOW_DEV_KEY=1`; without a configured key the server generates one and prints it once at first boot. The UI has NO baked-in key: a fresh browser context lands on the signed-out card — **first-run setup** (create-admin form) when no user accounts exist, email+password otherwise. To sign in with the dev key, click the API-key mode link (`[data-act="signinMode"][data-mode="key"]`), fill `#signinKey`, click `#signinBtn` — exactly what `tests/browser/conftest.signin()` does. Cookies are per-context; a new Playwright context must sign in again unless "Remember on this device" was checked.
-- The client is split across `incant/ui/js/**` (ordered classic scripts listed in index.html); the DOM harnesses load them via `scratchpad/load-app.js`.
-- Seed data: `support/system` (v2 live by Dana, v3 testing via rules, 2 unpublished edits by Sam), `support/greeting` (v2 committed, never published — the "draft, not live" case), `shared/style/language-rules`. `prod` is protected (type-to-confirm on publish/rollback), `staging` is track_tip.
+- Admin auth: `Authorization: Bearer incant_sk_dev_admin` — but ONLY with `INCANT_ALLOW_DEV_KEY=1`; without a configured key the server generates one and prints it once at first boot. The UI has NO baked-in key: a fresh browser context lands on the signed-out card — **first-run setup** (create-admin form) when no user accounts exist, email+password otherwise. To sign in with the dev key, click the API-key mode link (`[data-act="signinMode"][data-mode="key"]`), fill `#signinKey`, click `#signinBtn` — exactly what `tests/browser/conftest.signin()` does. Cookies are per-context; a new Playwright context must sign in again unless "Stay signed in for 30 days on this device" (`#signinRemember`) was checked.
+- The client is split across `incant/ui/js/**` (ordered classic scripts listed in `index.html`; `js/main.js` is the router/entry point).
+- Seed data: `support/system` (v2 live by Dana, v3 testing via rules, 2 unpublished edits by Sam), `support/greeting` (v2 committed, never published — the "draft, not live" case), `support/style/language-rules`. `prod` is protected (type-to-confirm on publish/rollback), `staging` is track_tip.
 
 ## Drive the UI
 
-It's a hash-routed SPA (`incant/ui/app.js`, no build). Playwright with system Chrome works:
+It's a hash-routed SPA (`incant/ui/js/main.js` + `js/screens/*`, no build). Playwright with system Chrome works:
 
 ```bash
 uv run --with playwright --no-project python drive.py
@@ -42,7 +42,7 @@ Key routes: `#/prompts`, `#/p/support%2Fsystem/overview` (status hero), `.../rul
 
 Gotchas:
 - The "technical details" disclosure state persists in localStorage (`incant_tech`) across screens/loads.
-- Protected env mutations open a type-to-confirm modal: `#confirmInput` + `#confirmBtn` (disabled until the token — prompt id or env name — is typed exactly).
+- Protected env mutations open a type-to-confirm modal (disabled until the token — prompt id or env name — is typed exactly). The generic modal is `#confirmInput` + `#confirmBtn`; the publish screen has its own (`#publishConfirm` + `[data-btn="publishBtn"]`, as `tests/browser/test_browser.py` drives it); env rename uses `#renEnvConfirm`.
 - The draft primary button only reads "Save edits…" when lint is clean AND the review policy is satisfied; seeded `support` needs 1 approval, so it shows "Awaiting 1 approval(s)" — not a bug.
 - Capture `page.on("pageerror")` — the app has no framework, so a JS error usually kills the whole render.
 

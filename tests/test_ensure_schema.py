@@ -12,7 +12,6 @@ available, exercise the full stamp-then-upgrade path end to end.
 
 from __future__ import annotations
 
-import pytest
 
 from incant.db import _adoption_revision, _has_unique_columns
 

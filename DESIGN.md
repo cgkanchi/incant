@@ -92,7 +92,7 @@ serving; pointer moves do.
 | **Variables** | Values interpolated into the chosen template by Jinja. |
 | **Environment** | A named targeting scope (`prod`, `staging`): rules, segments, kill switches, defaults, live pointers. Pure DB state. |
 | **Rule / segment** | Per-environment. Rules map flag conditions to versions (at live, tip, or a pinned SHA) or labels; segments are named, reusable conditions. |
-| **Remote** | A git URL receiving backup pushes. Plural, optional, never read from in normal operation. |
+| **Remote** | A git URL receiving backup pushes from the full node. Plural, optional; read only by serve replicas (hydrate + follow, §6) and by first-boot bootstrap. |
 
 Flags choose *which version at which commit*; variables fill in *the blanks within it*.
 Same request, never mixed: flags are invisible to templates unless explicitly passed as
@@ -130,8 +130,8 @@ into the DB, where operational state belongs.
 | Live pointers, defaults, rules, segments, kill switches | **DB** |
 | Validation results per commit, extracted variables, refinements | **DB** (keyed by SHA/blob — derived, rebuildable) |
 | Drafts/review state, comments, test contexts | **DB** (draft content on git refs) |
-| Principals, roles, keys, approvals, audit | **DB** |
-| Compiled templates, rule snapshots | **Memory** (+ disk spill, rebuildable) |
+| Principals, users, roles, keys, sessions, audit | **DB** |
+| Compiled templates, rule snapshots | **Memory** (rebuilt from the repo + DB at boot) |
 | Off-site copy of content | **Remotes** (async backup pushes) |
 
 **Durability, stated plainly:** the canonical repo volume is now durable state — the
@@ -179,7 +179,7 @@ support/                        # project
 Any prompt includes any other by id:
 
 ```jinja
-{% include "shared/style/language-rules" %}
+{% include "support/style/language-rules" %}
 ```
 
 The include resolves **through the targeting engine, with the same flag context, in the
@@ -277,7 +277,7 @@ status.
 
 ## 6. The canonical repo and its backups
 
-- Incant owns one canonical repository (per instance, monorepo of projects) on its
+- Incant owns one canonical repository (per deployment — one project, §17) on its
   volume. Single `main` branch; drafts live at `refs/incant/drafts/<id>`; commits are
   authored as the acting user, committed by Incant, with structured trailers
   (`Incant-Prompt`, `Incant-Version`, `Incant-Draft`) for machine-readable history.
@@ -457,7 +457,7 @@ POST /prompt/{prompt_id}
   "variables":   {"customer_name": "Acme", "history": []},
   "environment": "prod",             // optional; defaults to the instance default env
   "pin": {                           // optional; exact replay of a historical render
-    "versions": {"support/system": "v2@8c1f2ab", "shared/style/language-rules": "v1@2fe9c1a"},
+    "versions": {"support/system": "v2@8c1f2ab", "support/style/language-rules": "v1@2fe9c1a"},
     "rules_version": 4172            // alternative: pin targeting state instead
   }
 }
@@ -471,13 +471,14 @@ POST /prompt/{prompt_id}
   "matched_rule": {"scope": "global", "id": "voice-v2-beta"},   // or {"scope":"prompt",...} or "default"
   "versions": {                      // every prompt that contributed content, resolved
     "support/system": {"version": 2, "commit": "8c1f2ab", "label": "voice-v2"},
-    "shared/style/language-rules": {"version": 1, "commit": "2fe9c1a"}
+    "support/style/language-rules": {"version": 1, "commit": "2fe9c1a"}
   },
   "environment": "prod",
   "rules_version": 4172,
   "stale_rules": false,              // true iff targeting is frozen at last-known-good (§10)
-  "content_fallback": false          // true iff any entry served a previous live SHA (§10)
-}
+  "content_fallback": false,         // true iff any entry served a previous live SHA (§10)
+  "skipped_rules": []                // matched-but-unservable rules, skipped + reported (§7):
+}                                    //   [{rule_id, prompt_id, reason}]
 ```
 
 The `versions` map + `rules_version` is the reproducibility tuple — log it beside LLM
@@ -518,10 +519,11 @@ variable/render failure (naming the variable or line) · `503` node not ready.
 POST /prompt/{prompt_id}/evaluate   # flags only → resolved version+SHA (no render)
 POST /evaluate                      # flags → resolution for EVERY prompt in the env;
                                     #   "what does this experiment change?" in one call
-GET  /prompts?environment=…         # prompt list: descriptions, effective variable schemas,
-                                    #   defaults, labels, tip-vs-live status
-GET  /prompt/{prompt_id}/versions   # versions; per version: label, notes, status,
-                                    #   commit history, live pointers per environment
+GET  /prompts?environment=…         # what this credential can render: ids, descriptions,
+                                    #   versions, defaults, labels (renderer-scoped)
+GET  /prompt/{prompt_id}/spec       # what to pass: variables merged across the versions
+                                    #   targeting can currently serve, the flags active
+                                    #   rules consult (+ known values), includes
 GET  /healthz  /readyz  /metrics
 ```
 
@@ -530,7 +532,7 @@ GET  /healthz  /readyz  /metrics
 ## 10. Availability & failure modes
 
 Node state: the canonical repo (durable — content system of record), content + compiled
-caches (rebuildable), rule snapshots (memory + disk spill). Postgres is authoritative
+caches (rebuildable), rule snapshots (memory). Postgres is authoritative
 for the control plane and sits on the refresh/write paths only, never per-request.
 
 | Failure | Behavior |
@@ -543,7 +545,7 @@ for the control plane and sits on the refresh/write paths only, never per-reques
 | Nothing in the version's pointer history is servable | `409` for that request — never substitute another version. |
 | Publish interrupted (crash/rollback between git and DB) | Staged publish (§6): a rolled-back transaction leaves `main` untouched and the draft editable — no residue. A crash between DB commit and promotion leaves a pending ref that recovery promotes (or rebases, with the same validation verdict) at boot and on the reconcile interval. |
 | Repo volume lost | Restore by cloning a remote (full history, no reconstruction). Between backup pushes, the queue metric bounds the exposure window. Serve replicas hydrate themselves from a remote the same way (§6). |
-| Node restart | Caches/spills reload; re-warm before `readyz` goes green. Readiness is gated on the **default environment** (plus the auth cache): a broken scratch environment must not hold new capacity out of rotation for a healthy prod — it is retried in the background, answered per-request by this table meanwhile, and named in `/healthz` (`degraded_environments`). |
+| Node restart | Caches rebuild from the repo + DB; re-warm before `readyz` goes green. Readiness is gated on the **default environment** (plus the auth cache): a broken scratch environment must not hold new capacity out of rotation for a healthy prod — it is retried in the background, answered per-request by this table meanwhile, and named in `/healthz` (`degraded_environments`). |
 | Missing required variable / render error | `422` — caller-input problem, never a fallback trigger. |
 
 Availability posture: **rules freeze** (last-known-good targeting keeps evaluating
@@ -566,8 +568,9 @@ keys.
   revocable immediately; disabling an account deletes its sessions, revokes its
   keys, and kills outstanding invites atomically. OIDC (Okta, Entra, Google) is a
   future addition minting the same sessions for the same principals.
-- **Service keys** — bearer API keys: created/revoked in the UI, salted hashes with a
-  lookup prefix (`incant_sk_…`), expiry, last-used tracking. Machine and developer
+- **Service keys** — bearer API keys: created/revoked in the UI, stored as peppered
+  HMAC-SHA256 hashes (`INCANT_KEY_PEPPER`; plain SHA-256 when unset) with a lookup
+  prefix (`incant_sk_…`), expiry, last-used tracking. Machine and developer
   access only — humans never sign in with a key (the API-key card remains as the
   machine/recovery door).
 
@@ -580,7 +583,7 @@ Bindings are `(principal, role, scope)`; scope = instance, project, or
 |---|---|
 | `renderer` | Render/evaluate via the serving API (what service keys hold) |
 | `viewer` | Read prompts, versions, rules, history; run previews and test contexts |
-| `editor` | `viewer` + drafts, test contexts, commits (subject to project review policy); targeting in unprotected environments |
+| `editor` | `viewer` + drafts, test contexts, commits (subject to project review policy) — content, never targeting (§17) |
 | `operator` | `viewer` + targeting in granted environments: rules, segments, ramps, kill switches, pointer moves, defaults |
 | `releaser` | `operator` + approvals for pointer-class changes in protected environments |
 | `admin` | Everything: projects, environments, principals, keys, bindings, remotes |
@@ -607,13 +610,13 @@ One app, three centers of gravity:
 
 **Author & review.** Project browser → prompt page: version files with tip-vs-live
 badges per environment, labels, effective variable schema (auto-extracted, refinable
-inline), include graph. Draft editor (Monaco, lint-as-you-type) with the test panel:
+inline), include graph. Draft editor (lint-as-you-type) with the test panel:
 saved contexts rendering live, rendered diffs against any version at any SHA. Review
 queue with comments on source or rendered output. A "tweak flow" affordance walks the
 canonical loop: edit → commit → target to cohort → expand → make live.
 
 **Target & operate.** Per environment: rule list (global + per-prompt,
-drag-to-reprioritize), segment editor, ramp sliders writing live, kill switches, live
+reorderable), segment editor, rollout weights writing live, kill switches, live
 pointers per prompt/version with advance/revert controls, the per-version pointer
 timeline (who made what live, when, why — the blame view), rendered old→new diffs,
 approval queue (protected envs), targeting history with one-click rollback. Controls
@@ -628,28 +631,44 @@ depth, last push per remote).
 
 ```
 # authoring
-GET/POST /mgmt/projects/{p}/prompts            GET /mgmt/prompts/{id}/versions
-POST /mgmt/prompts/{id}/versions               # create vN+1 (seeded from a version/SHA)
-POST /mgmt/prompts/{id}/drafts                 PUT /mgmt/drafts/{id}/content
-POST /mgmt/drafts/{id}/render                  # test-context render, rendered diff
+GET  /mgmt/overview                            GET  /mgmt/whoami
+POST /mgmt/prompts                             # register a prompt; its v1 arrives via a draft
+GET  /mgmt/prompts/{id}/versions               PATCH /mgmt/prompts/{id}/versions/{n}  # label, notes, archive
+GET  /mgmt/prompts/{id}/diff                   GET  /mgmt/prompts/{id}/drafts
+POST /mgmt/prompts/{id}/drafts                 # draft on a version, or a new vN+1 (seeded from a version/SHA)
+GET  /mgmt/drafts/{id}                         PUT  /mgmt/drafts/{id}/content
+POST /mgmt/drafts/{id}/render                  GET  /mgmt/drafts/{id}/diff   # test-context render, rendered diff
 POST /mgmt/prompts/{id}/preview                # render via the REAL serving resolution,
                                                #   viewer-gated — the UI's Playground /
                                                #   audience tester door (sessions can't
                                                #   call the bearer-only serving API)
-POST /mgmt/drafts/{id}/review  /approve  /commit
+POST /mgmt/drafts/{id}/review                  # verdict: approved | changes_requested
+GET/POST /mgmt/drafts/{id}/comments            POST /mgmt/drafts/{id}/commit  /discard
 GET/PUT /mgmt/prompts/{id}/variables           # refine extracted metadata
 GET/PUT /mgmt/prompts/{id}/test-contexts
 
 # targeting & pointers
-GET/POST /mgmt/envs/{env}/rules                PATCH /mgmt/envs/{env}/rules/{id}
-POST /mgmt/envs/{env}/prompts/{id}:kill        GET/POST /mgmt/envs/{env}/segments
-POST /mgmt/envs/{env}/pointers                 # make-live / revert (bulk-capable)
+GET  /mgmt/envs                                GET/POST /mgmt/envs/{env}/rules
+POST /mgmt/envs/{env}/rules/batch              PATCH /mgmt/envs/{env}/rules/{id}
+GET/POST /mgmt/envs/{env}/segments             POST /mgmt/envs/{env}/kill?prompt_id=…
+GET/POST /mgmt/envs/{env}/pointers             # make-live / revert (bulk-capable)
+POST /mgmt/envs/{env}/publish                  # pointer advance + default + rule archive, atomically
 POST /mgmt/envs/{env}/defaults                 # set default versions
 GET  /mgmt/envs/{env}/revisions                POST /mgmt/envs/{env}/rollback
 
 # admin
-GET/POST /mgmt/projects /mgmt/envs /mgmt/principals /mgmt/keys /mgmt/bindings /mgmt/remotes
-GET /mgmt/audit?…
+POST/PATCH /mgmt/projects[/{id}]               POST/PATCH/DELETE /mgmt/envs[/{env}]   POST /mgmt/envs/{env}/rename
+GET  /mgmt/principals                          POST/DELETE /mgmt/principals/{pid}/bindings[/{id}]
+POST /mgmt/keys  /mgmt/principals/{pid}/keys   POST /mgmt/keys/{id}/rotate  /revoke   DELETE /mgmt/principals/{pid}/sessions
+GET/POST /mgmt/users                           PATCH /mgmt/users/{id}   POST /mgmt/users/{id}/reset
+GET/POST/PATCH/DELETE /mgmt/remotes[/{id}]     POST /mgmt/remotes/{id}/push
+GET  /mgmt/setup-status                        POST /mgmt/seed-example
+GET  /mgmt/audit?…
+
+# browser sessions
+GET/POST /auth/setup                           # first-run admin account
+POST/GET/DELETE /auth/session                  GET/DELETE /auth/sessions
+POST /auth/accept-invite                       POST /auth/password
 ```
 
 ---
@@ -665,7 +684,7 @@ GET /mgmt/audit?…
  (backup only)  │   └─► content cache ─► compiled templates (memory, eager-warm)  │
                 │                                       │                         │
  Postgres ◄────►│ Control plane: pointers, rules, review, RBAC, audit             │
- (control       │   └─ RulesSync (LISTEN/NOTIFY) ─► snapshots (memory + spill)    │
+ (control       │   └─ RulesSync (2 s poll, §17) ─► snapshots (memory)            │
   plane)        │                                       │                         │
   clients ─────►│ Serving API ─► RBAC ─► Evaluator ─► Renderer ─► response        │
  (services)     │ /prompt/*        (all in-memory on the hot path)                │
@@ -691,7 +710,7 @@ GET /mgmt/audit?…
 | Templates | jinja2 (`SandboxedEnvironment`, `jinja2.meta`) | the requirement; AST access for variable inference |
 | Content | `git` CLI via subprocess | the content store; battle-tested ssh/https transport for backup pushes |
 | Database | Postgres + SQLAlchemy core + Alembic | control plane — everywhere, dev and tests included (no SQLite path: it hid FK, migration, and concurrency differences) |
-| Config | pydantic-settings | bootstrap only: DB URL, OIDC, bind, repo path |
+| Config | pydantic-settings | env vars only (`INCANT_*`, `_FILE` variants for secrets): DB URL, bind, repo path, intervals |
 | Metrics | prometheus-client | |
 
 ```
@@ -700,34 +719,46 @@ incant/
 ├── gitstore/      # canonical repo, commits, validation pipeline, backup pusher
 ├── registry/      # version registry, drafts, reviews, variable refinements
 ├── targeting/     # rules, segments, pointers, snapshots, propagation
-├── server/        # FastAPI: serving API, mgmt API, RBAC middleware
-└── ui/            # frontend (built assets served by the server)
+├── server/        # FastAPI: serving API, mgmt API, browser sessions, RBAC, metrics
+├── ui/            # vanilla-JS single-page UI (no build step), served as static assets
+├── service.py     # AppContext: wiring + snapshot cache + serve/evaluate hot path
+├── models.py      # control-plane ORM — SHAs and state, no content
+├── config.py      # pydantic-settings (INCANT_*)
+├── db.py          # engine, sessions, Alembic at boot
+├── cli.py         # init | seed | serve
+└── seed.py        # the example dataset
 ```
+
+Alongside the server package: `sdk/python` (incant-sdk), `mcp/python` (incant-mcp),
+`skills/` (agent skills), `alembic/`, `tests/`, `docs/`.
 
 ### Schema sketch (control plane — note: no content anywhere)
 
 ```
-projects(id, name, review_policy)
-prompts(id, project_id, path)                        -- registry of the tree
+projects(id, name, review_policy, allow_self_review)     -- exactly one row (§17)
+prompts(id, project_id, description)                     -- registry of the tree
 versions(id, prompt_id, number, label?, status: active|archived, notes, created_by, created_at)
-commit_validations(sha, path, status, error?, extracted_variables, validated_at)
+commit_validations(sha, blob_sha, path, prompt_id, version_number, status, error?, extracted_variables, validated_at)
 variable_refinements(prompt_id, version_number, name, type?, required?, default?, description?)
 test_contexts(id, prompt_id, name, flags, variables)
-drafts(id, prompt_id, version_number?, base_sha, git_ref, author, status)
-reviews(id, draft_id, reviewer, state)  review_comments(...)
-environments(id, name, protected, track_tip)
+drafts(id, prompt_id, version_number?, base_sha, git_ref, draft_sha, title, author, author_principal_id, status)
+reviews(id, draft_id, reviewer, reviewer_principal_id, state, reviewed_sha)  review_comments(...)
+environments(id, name, protected, track_tip, rules_version)
 pointer_moves(environment_id, prompt_id, version_number, from_sha?, to_sha?,
               moved_by, moved_at, comment)      -- append-only; current live = newest row
                                                 --   (NULL to_sha = rollback tombstone)
 env_defaults(environment_id, prompt_id, version_number)
+kill_switches(environment_id, prompt_id, engaged, by, at)
 segments(id, environment_id, name, clauses, version)
 rules(id, environment_id, scope, prompt_id?, priority, clauses, serve, status, comment)
-rule_revisions(rule_id, version, snapshot, actor, at, comment)
-env_versions(environment_id, rules_version)
+rule_revisions(environment_id, rule_id?, kind, rules_version, snapshot, state?, actor, at, comment)
+                                                -- state = full checkpoint every Kth revision (§7)
 remotes(id, url, auth_ref, enabled, last_pushed_sha, last_push_at)
-principals(id, kind, subject, name)  sessions(...)  api_keys(...)
+principals(id, kind, subject, name)
+users(principal_id, email, name, password_hash, status, invite_token_hash, invite_expires_at, last_login_at)
+api_keys(principal_id, prefix, hash, name, expires_at, last_used_at, revoked)
+sessions(token_hash, principal_id, expires_at, last_seen_at, csrf_token, remember)
 role_bindings(principal_id, role, project_id?, environment_id?)
-approvals(id, environment_id, change, proposed_by, approved_by?, status)
 audit_log(actor, action, object_type, object_id, before, after, at)
 ```
 
@@ -760,56 +791,23 @@ audit_log(actor, action, object_type, object_id, before, after, at)
 
 ## 15. Deployment
 
-Docker-first: the app image plus Postgres.
+The app image plus Postgres. The real files are the reference — `Dockerfile`,
+`docker-compose.yaml` (explicitly dev-only: plaintext DB password, published 5432) and
+`docs/DEPLOYING.md` (production topology, hardening checklist, restore drill) — and are
+not duplicated here. The properties this design relies on:
 
-```dockerfile
-FROM python:3.13-slim
-RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client curl \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project   # deps layer, cached across code changes
-COPY . .
-RUN uv sync --frozen --no-dev
-EXPOSE 8080
-CMD ["uv", "run", "uvicorn", "incant.server:app", "--host", "0.0.0.0", "--port", "8080"]
-```
-
-```yaml
-# docker-compose.yaml
-services:
-  incant:
-    build: .
-    ports: ["8080:8080"]
-    depends_on: [db]
-    volumes:
-      - content:/var/lib/incant/repo               # canonical repo — DURABLE, back up via remotes
-      - cache:/var/lib/incant/cache                # caches + spills — rebuildable
-      - ./incant.server.yaml:/etc/incant/config.yaml:ro
-      - ./secrets/backup_key:/secrets/backup_key:ro # push-only deploy key for backup remotes
-      - ./secrets/known_hosts:/etc/incant/known_hosts:ro
-    environment:
-      INCANT_CONFIG: /etc/incant/config.yaml
-      INCANT_DATABASE_URL: postgresql://incant:…@db/incant
-      INCANT_MODE: full                            # full | serve (no mgmt/UI; read-only)
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
-      interval: 10s
-  db:
-    image: postgres:17
-    volumes: [pgdata:/var/lib/postgresql/data]
-    environment: {POSTGRES_DB: incant, POSTGRES_USER: incant, POSTGRES_PASSWORD_FILE: /run/secrets/…}
-volumes:
-  content:
-  cache:
-  pgdata:
-```
-
+- `python:3.12-slim` pinned to `.python-version` (`UV_PYTHON_DOWNLOADS=never` turns a
+  mismatch into a build error); `uv` pinned by major.minor; git + openssh-client for
+  the canonical repo and remote transport.
+- A non-root runtime user owns `/var/lib/incant/repo` — the ONE durable mount. There
+  is no cache volume: caches are memory-only (§17).
+- Exactly one uvicorn worker per container (`--workers 1`); scale with containers.
+- Configuration is env-only (`INCANT_*`, `_FILE` variants for secrets); no config file.
+- Remote credentials are mounted files named by `auth_ref` / `INCANT_BOOTSTRAP_REMOTE_KEY`;
+  host keys pinned via `INCANT_KNOWN_HOSTS_PATH`.
 - Migrations (Alembic) run at boot before `readyz`.
 - **Two durable things**: the `content` volume (canonical repo; off-site copy =
-  backup pushes to remotes) and `pgdata` (control plane; normal Postgres backups). The
-  `cache` volume is fully rebuildable.
+  backup pushes to remotes) and `pgdata` (control plane; normal Postgres backups).
 - `INCANT_MODE=serve` replicas scale horizontally (read-only DB role, no mgmt
   surface). A replica's repo copy hydrates automatically — a mirror clone from an
   enabled backup remote on first boot — and follows by periodic mirror-fetch
@@ -836,9 +834,13 @@ volumes:
    controls, admin screens.
 5. **Hardening** — approvals for protected environments, backup pusher + restore
    tooling, promote-rules-between-envs, label UX, dashboards.
-6. **Later** — SDK clients (Python/TS) with client-side caching and stale-on-fail,
-   releases (named bundles of prompt versions promoted together), experiment analytics,
-   scheduled ramps, eval hooks.
+6. **Clients** — Python SDK (`sdk/python`: sync + async, typed errors, retries,
+   discovery via `GET /prompts` + `GET /prompt/{id}/spec`) and MCP server
+   (`mcp/python`: 23 task-shaped tools under the key's roles, `--read-only`) with
+   paired agent skills (`skills/`). Built.
+7. **Later** — TS SDK, client-side caching and stale-on-fail, releases (named bundles
+   of prompt versions promoted together), experiment analytics, scheduled ramps, eval
+   hooks.
 
 ---
 
@@ -848,8 +850,9 @@ This document is the source of truth for intent; where the implementation
 deliberately departs from a section above, the departure is recorded HERE — not
 scattered through code comments — so a reader knows which promises are live.
 
-- **No propose→approve ceremony (§7, §11).** Pointer-class changes are unilateral:
-  gated to `releaser`, audited, and — in protected environments — behind
+- **No propose→approve ceremony (§7, §11, §12).** Pointer-class changes are unilateral:
+  pointer moves and publishes gated to `releaser`, environment defaults to `operator`
+  (`releaser` in protected environments), audited, and — in protected environments — behind
   LaunchDarkly-style type-to-confirm. The `approvals` table and two-person flow are
   not built; the `releaser` role is the control. Rationale: a pointer can only ever
   reference validated, reviewed content, so the second person's review already
@@ -881,3 +884,12 @@ scattered through code comments — so a reader knows which promises are live.
   test-context render resolves includes through the default env's targeting; other
   environments' include resolution can differ. The §7 write-time integrity checks
   and eval-time skip backstop cover the gap.
+- **Targeting is `operator`-only (§11).** Editors never write targeting, protected
+  environment or not: rules, segments, defaults, kills, and pointers all require
+  `operator` on the environment (`releaser` for pointer-class changes in protected
+  environments). The role split is content (`editor`) vs. audience (`operator`,
+  `releaser`); protection raises the gate, it never lowers it.
+- **No disk spill (§3, §10, §13, §15).** Content, compiled-template, and snapshot
+  caches are memory-only, rebuilt from the canonical repo and the DB at boot
+  (readiness waits for the warm). No cache volume exists; the repo volume is the only
+  durable mount.

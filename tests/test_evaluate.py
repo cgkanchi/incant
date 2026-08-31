@@ -1,15 +1,12 @@
 import pytest
 
 from incant.core import (
-    Rule,
-    ServeVersion,
     Skip,
     UnresolvedPrompt,
     Unservable,
     parse_rule,
     resolve,
 )
-from incant.core.model import RolloutBand, ServeLabel, ServeRollout
 
 from .conftest import snapshot, vinfo
 

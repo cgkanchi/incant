@@ -59,6 +59,10 @@ INCANT_DATABASE_URL=postgresql+psycopg://incant:incant@localhost:5432/incant \
   uv run incant serve
 ```
 
+`incant serve` migrates the database at boot and takes `--host`, `--port`, `--reload`;
+`incant init` runs the same repo + schema initialization on its own (CI, one-off
+provisioning); `incant seed` loads the example dataset.
+
 Render a prompt:
 
 ```bash
@@ -68,10 +72,6 @@ curl -s localhost:8080/prompt/support/system \
   -d '{"flags":{"user_id":"u_12"},"variables":{"customer_name":"Acme","history":[]}}'
 ```
 
-## Layout
-
-```
-incant/
 Discovery for the same credential: `GET /prompts?environment=…` lists what the key can
 render (ids, descriptions, versions, defaults, labels — renderer-scoped), and
 `GET /prompt/{id}/spec` says what to pass — variables merged across the versions
@@ -97,17 +97,28 @@ curated tools for authoring, testing, publishing, and targeting under the API
 key's roles — paired with the agent skills in [`skills/`](skills) that encode
 the workflows and guardrails (`incant-authoring`, `incant-release`).
 
+## Layout
+
+```
+incant/
 ├── core/        # pure library: evaluator, sandboxed renderer, variable inference,
 │                #   include resolution — no I/O, exhaustively unit-tested
 ├── gitstore/    # canonical bare repo (git plumbing), commit + validation pipeline,
 │                #   content-addressed ContentStore for the hot path
 ├── registry/    # version registry, drafts, review policy, refinements, test contexts
 ├── targeting/   # rules, segments, append-only pointers, defaults, kills, snapshots
-├── server/      # FastAPI: serving API, mgmt API, API-key RBAC, audit, metrics
-├── ui/          # single-page UI ("Signal" direction), served as static assets
+├── server/      # FastAPI: serving API, mgmt API, browser sessions, RBAC, audit, metrics
+├── ui/          # single-page UI ("Signal" direction), vanilla JS, served as static assets
 ├── service.py   # AppContext: wiring + snapshot cache + serve/evaluate hot path
 ├── models.py    # control-plane ORM (SQLAlchemy) — SHAs and state, no content
+├── config.py    # pydantic-settings (INCANT_* env vars)
+├── db.py        # engine, sessions, Alembic migrations at boot
+├── cli.py       # incant init | seed | serve
 └── seed.py      # the design's example dataset
+sdk/python/      # incant-sdk — Python client (sync + async)
+mcp/python/      # incant-mcp — MCP server for agents
+skills/          # agent skills paired with the MCP server
+alembic/  tests/  docs/
 ```
 
 ## The core loop
@@ -157,10 +168,11 @@ Point `INCANT_TEST_DATABASE_URL` at a different Postgres if you manage your own.
 If no server answers, the suite exits immediately with that exact instruction
 instead of failing test-by-test.
 
-Tests drop and recreate all tables, so they are **isolated to a dedicated
-`<db>_test` database**: the URL is redirected to `incant_test` (created on
-demand) and the app's `incant` database is never touched. A safety rail refuses to
-reset any database whose name doesn't end in `_test`.
+Tests drop and recreate all tables, so they are **isolated to dedicated `*_test`
+databases** on the same server (created on demand): `incant_test` for the in-process
+suite, `incant_sdk_test` / `incant_mcp_test` for the suites that boot a real server,
+`incant_browser_test` for the browser suite. The app's `incant` database is never
+touched; a safety rail refuses to reset any database whose name doesn't end in `_test`.
 
 ### Browser end-to-end tests (opt-in)
 
@@ -188,14 +200,18 @@ Chrome/Chromium binary if yours lives elsewhere.
 | `INCANT_REPO_PATH` | `./var/repo` | canonical bare git repo |
 | `INCANT_DEFAULT_ENVIRONMENT` | `prod` | default serving environment |
 | `INCANT_MODE` | `full` | `full` (API + mgmt + UI) or `serve` (read-only) |
+| `INCANT_HOST` / `INCANT_PORT` | `0.0.0.0` / `8080` | bind address and port (`incant serve --host/--port` override) |
 | `INCANT_BOOTSTRAP_ADMIN_KEY` | *(empty)* | bootstrap admin API key; empty ⇒ generate + print once on first boot |
-| `INCANT_ALLOW_DEV_KEY` | *(unset)* | set to `1` to permit the unsafe `incant_sk_dev_admin` (local/test only) |
+| `INCANT_ALLOW_DEV_KEY` | *(unset)* | set to `1` to permit the unsafe `incant_sk_dev_admin` (local/test only; read from the process environment only, not `.env`) |
 | `INCANT_KEY_PEPPER` | *(empty)* | secret pepper for key hashing; set ⇒ new/rotated keys stored as `v2$` HMAC-SHA256, legacy keys upgraded on next auth |
 | `INCANT_METRICS_TOKEN` | *(empty)* | shared bearer token that lets a principal-less Prometheus scraper read `/metrics` |
 | `INCANT_ENFORCE_TLS` | `false` | emit `Strict-Transport-Security` (HSTS) — enable only when TLS terminates at a proxy in front of Incant |
 | `INCANT_BACKUP_POLL_SECONDS` | `15.0` | backup-push interval to enabled remotes (full mode); `0` disables the loop |
 | `INCANT_CONTENT_FETCH_SECONDS` | `30.0` | serve-replica content mirror-fetch interval; `0` disables (shared-volume deployments) |
 | `INCANT_BACKUP_TIMEOUT_SECONDS` | `60.0` | timeout for one remote git operation (push/fetch/clone) |
+| `INCANT_CONTROL_POLL_SECONDS` | `2.0` | control-plane poll — how fast targeting changes (incl. make-live) and key revocations reach a node; floor 0.1 |
+| `INCANT_RECONCILE_INTERVAL_SECONDS` | `3600.0` | git↔DB drift census cadence (full mode); detect-and-report only, never flips readiness |
+| `INCANT_REVISION_CHECKPOINT_INTERVAL` | `20` | full targeting state materialized every Kth revision (always on baseline/rollback); bounds replay/rollback work |
 | `INCANT_KNOWN_HOSTS_PATH` | *(empty)* | pinned known_hosts file for ssh remotes; empty ⇒ ssh defaults |
 | `INCANT_BOOTSTRAP_REMOTE` | *(empty)* | git URL cloned on first boot when the repo volume is empty (blank remote ⇒ fresh start pushed there; populated Incant repo ⇒ content adopted; unreachable ⇒ boot fails). Auto-registered as a backup remote |
 | `INCANT_BOOTSTRAP_REMOTE_KEY` | *(empty)* | credential **path** for the bootstrap remote — an ssh private key or an https credential-store file mounted into the container |

@@ -288,8 +288,8 @@ class TargetingService:
         # unvalidated pinned SHA before this write bumps rules_version.
         self._validate_rule_targets(existing.scope, existing.prompt_id, existing.serve)
         self.s.flush()
-        rv = self._bump(env, "rule", _rule_snapshot(existing), rule_id=rid,
-                        comment=existing.comment)
+        self._bump(env, "rule", _rule_snapshot(existing), rule_id=rid,
+                   comment=existing.comment)
         record_audit(self.s, self.actor, "rule.upsert", "rule", rid, after=_rule_snapshot(existing))
         return existing
 

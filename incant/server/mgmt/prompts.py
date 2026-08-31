@@ -174,7 +174,6 @@ def get_versions(
         snap = build_snapshot(session, environment)
     except KeyError:
         raise HTTPException(404, f"unknown environment {environment!r}")
-    vers = snap.versions.get(prompt_id, {})
     default_v = snap.defaults.get(prompt_id)
     version_rows = reg.get_versions(prompt_id)
     # Show effective variables/includes for the default version, or the newest
@@ -182,7 +181,6 @@ def get_versions(
     display_v = default_v or (version_rows[0].number if version_rows else None)
     out = []
     for v in version_rows:
-        vinfo = vers.get(v.number)
         hist = app.git.history(f"{prompt_id}/v{v.number}.j2", limit=_VERSION_HISTORY_LIMIT)
         tip = hist[0] if hist else None
         live = _current_live(session, environment, prompt_id, v.number)

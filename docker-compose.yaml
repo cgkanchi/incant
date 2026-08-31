@@ -3,7 +3,7 @@
 # posture. For production follow docs/DEPLOYING.md: real secrets, no published DB
 # port, TLS at a proxy in front, and backup remotes registered.
 # Two durable volumes: `content` (canonical repo — back up off-site via git remotes)
-# and `pgdata` (control plane — normal Postgres backups). `cache` is rebuildable.
+# and `pgdata` (control plane — normal Postgres backups).
 services:
   incant:
     build: .
@@ -11,7 +11,6 @@ services:
     depends_on: [db]
     volumes:
       - content:/var/lib/incant/repo               # canonical repo — DURABLE
-      - cache:/var/lib/incant/cache                # caches + spills — rebuildable
     environment:
       INCANT_REPO_PATH: /var/lib/incant/repo
       INCANT_DATABASE_URL: postgresql+psycopg://incant:incant@db/incant
@@ -49,5 +48,4 @@ services:
       retries: 12
 volumes:
   content:
-  cache:
   pgdata:

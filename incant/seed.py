@@ -109,8 +109,8 @@ def seed(ctx: AppContext | None = None) -> str:
 
     with session_scope() as s:
         # v2 first commit = live pointer target
-        first = _author(ctx, s, f"{project}/system", 2, SYSTEM_V2_FORMAL, "Dana",
-                        "v2 formal baseline")
+        _author(ctx, s, f"{project}/system", 2, SYSTEM_V2_FORMAL, "Dana",
+                "v2 formal baseline")
         # two more tweak commits => tip ahead +2 (do NOT move the pointer)
         reg = ctx.registry(s, "Sam")
         d = reg.create_draft(f"{project}/system", version_number=2, author="Sam",

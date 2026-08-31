@@ -44,8 +44,9 @@ of `INCANT_MODE=serve` replicas.
    cache), `/healthz` for liveness — it stays green under governance drift but
    names it (`drift`, `degraded_environments`).
 8. **Kubernetes.** StatefulSet (or Deployment + PVC) for the full node; Deployment
-   for serve replicas (they need only the cache volume — content hydrates from a
-   remote); managed Postgres; `readyz` as readinessProbe.
+   for serve replicas (no durable volume needed — the repo copy hydrates from a
+   remote on boot, so an ephemeral `INCANT_REPO_PATH` is fine); managed Postgres;
+   `readyz` as readinessProbe.
 
 ## The backup remote, done right (deploy key click-path)
 

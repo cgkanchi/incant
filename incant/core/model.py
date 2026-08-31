@@ -15,7 +15,7 @@ from typing import Any, Callable, Literal, Protocol
 
 Operator = Literal[
     "eq", "neq", "in", "not_in", "contains", "starts_with", "ends_with",
-    "matches", "gt", "gte", "lt", "lte", "semver_gt", "semver_lt", "exists",
+    "gt", "gte", "lt", "lte", "semver_gt", "semver_lt", "exists",
 ]
 
 

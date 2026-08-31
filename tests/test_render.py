@@ -2,7 +2,6 @@ import pytest
 
 from incant.core import (
     IncludeCycle,
-    IncludeDepthExceeded,
     MissingVariable,
     RenderError,
     parse_rule,
