@@ -187,10 +187,14 @@ class EnvSnapshot:
         return self.versions.get(prompt_id, {}).get(version)
 
     def version_for_label(self, prompt_id: str, label: str) -> int | None:
+        """The ACTIVE version carrying ``label``. Labels are unique per prompt at write
+        time; for pre-existing duplicates the highest version wins, deterministically.
+        Archived versions never resolve — they do not serve."""
+        best = None
         for v in self.versions.get(prompt_id, {}).values():
-            if v.label == label:
-                return v.version
-        return None
+            if v.label == label and v.status != "archived" and (best is None or v.version > best):
+                best = v.version
+        return best
 
     def all_prompt_ids(self) -> list[str]:
         ids = set(self.versions) | set(self.defaults)

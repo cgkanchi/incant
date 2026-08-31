@@ -21,6 +21,8 @@ from sqlalchemy.orm import Session
 from . import models
 from .config import Settings, get_settings
 from .core import (
+    IncludeDepthExceeded,
+    IncludeCycle,
     EnvSnapshot,
     MissingVariable,
     RenderError,
@@ -37,6 +39,15 @@ from .registry import MainReconcileResult, RegistryService
 from .targeting import TargetingService, build_snapshot, snapshot_from_state
 
 log = logging.getLogger("incant.service")
+
+
+def _record_snapshot_build_failure(env_id: str) -> None:
+    """Best-effort §14 counter (lazy import: server.metrics depends on this module)."""
+    try:
+        from .server.metrics import snapshot_build_failures_total
+        snapshot_build_failures_total.labels(env_id).inc()
+    except Exception:  # pragma: no cover - telemetry must never affect serving
+        pass
 
 
 class ServingError(Exception):
@@ -152,7 +163,7 @@ class AppContext:
 
     def registry(self, session: Session, actor: str = "system") -> RegistryService:
         return RegistryService(session, self.git, self.content,
-                               default_env=self.settings.default_environment)
+                               default_env=self.settings.default_environment, actor=actor)
 
     def targeting(self, session: Session, actor: str = "system") -> TargetingService:
         return TargetingService(session, actor)
@@ -225,12 +236,32 @@ class AppContext:
             rows = session.execute(
                 select(models.Environment.id, models.Environment.rules_version)
             ).all()
+            live = {env_id for env_id, _ in rows}
+            # An environment deleted on another node must stop serving here too: evict
+            # cached snapshots (and replay states) for ids the DB no longer has.
+            for env_id in [e for e in self._snapshots if e not in live]:
+                self._snapshots.pop(env_id, None)
+                for key in [k for k in self._historical if k[0] == env_id]:
+                    self._historical.pop(key, None)
+                log.warning("environment %r no longer exists — evicted from the snapshot cache", env_id)
             for env_id, rules_version in rows:
                 cached = self._snapshots.get(env_id)
                 if cached is None:
                     continue
                 if cached.rules_version != rules_version:
-                    snap = build_snapshot(session, env_id)              # build fully…
+                    try:
+                        snap = build_snapshot(session, env_id)          # build fully…
+                    except SQLAlchemyError:
+                        raise
+                    except Exception:
+                        # Bad data in ONE environment (an unparseable rule) must not stall
+                        # propagation for every other environment: keep serving this env's
+                        # last good snapshot, count it, and carry on with the pass.
+                        log.exception("snapshot rebuild failed for environment %r — serving "
+                                      "its last good snapshot; other environments continue",
+                                      env_id)
+                        _record_snapshot_build_failure(env_id)
+                        continue
                     self._snapshots[env_id] = _CachedSnapshot(rules_version, snap)  # …then swap
                 else:
                     cached.confirmed_at = time.monotonic()  # unchanged, freshly confirmed
@@ -402,20 +433,29 @@ class AppContext:
 
     # ── serving ──────────────────────────────────────────────────────
 
-    def _unresolved_error(self, snap: EnvSnapshot, env_id: str, prompt_id: str) -> ServingError:
+    def _unresolved_error(self, snap: EnvSnapshot, env_id: str, prompt_id: str,
+                          root: str | None = None) -> ServingError:
         """The honest 404 for an unresolvable prompt. 'Unknown prompt' is only true
         when the prompt genuinely doesn't exist; a prompt that EXISTS but has no
         default/rules in this environment is the normal commits-change-nothing state
         right after publishing, and saying 'unknown' at that exact moment convinces
         an integrating dev their commit failed. Name the real situation and the fix."""
+        via = (f" (included by {root!r})" if root is not None and root != prompt_id else "")
         if prompt_id in snap.versions:
             return ServingError(
                 404,
-                f"prompt {prompt_id!r} exists but serves nothing in {env_id!r}: no rule "
+                f"prompt {prompt_id!r}{via} exists but serves nothing in {env_id!r}: no rule "
                 "targets it and it has no environment default. Set a default (POST "
                 f"/mgmt/envs/{env_id}/defaults) or add a rule to start serving it.",
             )
-        return ServingError(404, f"unknown prompt {prompt_id!r} in {env_id!r}")
+        return ServingError(404, f"unknown prompt {prompt_id!r}{via} in {env_id!r}")
+
+    @staticmethod
+    def _unservable_detail(exc: Unservable, root: str) -> str:
+        via = f" (included by {root!r})" if exc.prompt_id != root else ""
+        if exc.reason == "archived":
+            return f"{exc}{via}"
+        return f"resolved content for {exc.prompt_id!r}{via} is unservable"
 
     def evaluate(self, session: Session, env_id: str, prompt_id: str, flags: dict) -> Resolution:
         snap = self.get_snapshot(session, env_id)
@@ -423,8 +463,8 @@ class AppContext:
             return resolve(snap, prompt_id, flags)
         except UnresolvedPrompt:
             raise self._unresolved_error(snap, env_id, prompt_id)
-        except Unservable:
-            raise ServingError(409, f"resolved content for {prompt_id!r} is unservable")
+        except Unservable as exc:
+            raise ServingError(409, self._unservable_detail(exc, prompt_id))
 
     def evaluate_all(self, session: Session, env_id: str, flags: dict) -> dict[str, Resolution]:
         snap = self.get_snapshot(session, env_id)
@@ -483,14 +523,20 @@ class AppContext:
 
         try:
             result = render(snap, prompt_id, flags, variables, self.content, pin=pin)
-        except UnresolvedPrompt:
-            raise self._unresolved_error(snap, env_id, prompt_id)
+        except UnresolvedPrompt as exc:
+            # Name the prompt that actually failed: an include with no default/pointer
+            # here must not be reported as the ROOT serving nothing (it may well be).
+            raise self._unresolved_error(snap, env_id, exc.prompt_id, root=prompt_id)
         except MissingVariable as exc:
             raise ServingError(422, str(exc), variable=exc.name)
         except RenderError as exc:
             raise ServingError(422, str(exc), lineno=exc.lineno)
-        except Unservable:
-            raise ServingError(409, f"resolved content for {prompt_id!r} is unservable")
+        except Unservable as exc:
+            raise ServingError(409, self._unservable_detail(exc, prompt_id))
+        except (IncludeCycle, IncludeDepthExceeded) as exc:
+            # A targeting-induced include cycle (static validation only sees the graph
+            # at current defaults) is a content/config fault, not a caller error.
+            raise ServingError(409, str(exc))
         except KeyError:
             raise ServingError(409, "resolved content missing from store")
 

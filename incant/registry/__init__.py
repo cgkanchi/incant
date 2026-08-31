@@ -16,6 +16,7 @@ from .reconcile import (
 from .service import (
     CommitOutcome,
     ConcurrencyError,
+    RegistryConflict,
     RegistryError,
     RegistryService,
     ReviewRequired,
@@ -29,6 +30,7 @@ __all__ = [
     "MainReconcileResult",
     "PendingRecoveryResult",
     "ReconcileResult",
+    "RegistryConflict",
     "RegistryError",
     "RegistryService",
     "ReviewRequired",

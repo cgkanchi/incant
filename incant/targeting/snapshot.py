@@ -166,7 +166,9 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
 
     # Versions
     versions: dict[str, dict[int, VersionInfo]] = defaultdict(dict)
-    for v in session.execute(select(models.Version)).scalars().all():
+    for v in session.execute(
+        select(models.Version).order_by(models.Version.prompt_id, models.Version.number)
+    ).scalars().all():
         key = (v.prompt_id, v.number)
         hist = pointer_hist.get(key, [])
         live_sha = hist[0] if hist else None

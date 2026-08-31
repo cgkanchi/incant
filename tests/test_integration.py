@@ -8,7 +8,7 @@ from sqlalchemy import select
 from incant import db, models
 from incant.config import Settings, set_settings
 from incant.db import session_scope
-from incant.registry import RegistryError, ReviewRequired
+from incant.registry import RegistryConflict, RegistryError, ReviewRequired
 from incant.service import AppContext, ServingError, reset_app
 from incant.targeting.service import TargetingError
 
@@ -239,32 +239,62 @@ def test_review_policy_uses_principal_ids_not_display_names(app):
         assert reg._policy_met(draft) is True
 
 
-def test_archived_version_rejects_new_work_but_keeps_existing_pointer(app):
-    outcome = _author_version(app, "support/archive", 1, "still live")
+def test_archived_version_stops_serving_until_unarchived(app):
+    """§5: archived versions do not serve. A rule targeting one is skipped and COUNTED,
+    the environment default cannot be archived at all, new drafts/commits/rules/defaults
+    for it are refused, the change propagates as a "version" revision, and unarchiving
+    resumes serving."""
+    _author_version(app, "support/archive", 1, "still live")
+    _author_version(app, "support/archive", 2, "newer")   # also moves the default to v2
+    with session_scope() as s:
+        tgt = app.targeting(s, "sam")
+        tgt.set_default("prod", "support/archive", 1)
+        tgt.upsert_rule("prod", {"id": "to-v2", "scope": "prompt", "prompt_id": "support/archive",
+                                 "priority": 1, "when": None, "serve": {"version": 2}})
+    app.invalidate("prod")
+    with session_scope() as s:
+        assert app.serve(s, "prod", "support/archive", {}, {})["prompt"] == "newer"
+        before = s.get(models.Environment, "prod").rules_version
+
     with session_scope() as s:
         reg = app.registry(s, "sam")
         existing = reg.create_draft(
-            "support/archive", version_number=1, author="sam", content="not publishable"
-        )
-        reg.update_version("support/archive", 1, status="archived", notes="retired")
+            "support/archive", version_number=2, author="sam", content="not publishable")
+        reg.update_version("support/archive", 2, status="archived", notes="retired")
         with pytest.raises(RegistryError):
-            reg.create_draft(
-                "support/archive", version_number=1, author="sam", content="blocked"
-            )
+            reg.create_draft("support/archive", version_number=2, author="sam", content="blocked")
         with pytest.raises(RegistryError):
             reg.commit_draft(existing.id, author="sam")
         with pytest.raises(TargetingError):
             app.targeting(s, "sam").upsert_rule("prod", {
-                "id": "archived-target", "scope": "prompt",
-                "prompt_id": "support/archive", "priority": 1,
-                "when": None, "serve": {"version": 1},
-            })
+                "id": "archived-target", "scope": "prompt", "prompt_id": "support/archive",
+                "priority": 1, "when": None, "serve": {"version": 2}})
+        with pytest.raises(TargetingError):
+            app.targeting(s, "sam").set_default("prod", "support/archive", 2)
+        # The environment default has no fallback: archiving it is refused outright.
+        with pytest.raises(RegistryConflict):
+            reg.update_version("support/archive", 1, status="archived")
+        # Propagation: the archive bumped the environment with a "version" revision.
+        env = s.get(models.Environment, "prod")
+        assert env.rules_version > before
+        kinds = {r.kind for r in s.execute(select(models.RuleRevision).where(
+            models.RuleRevision.environment_id == "prod",
+            models.RuleRevision.rules_version > before)).scalars()}
+        assert "version" in kinds
 
     app.invalidate("prod")
     with session_scope() as s:
         response = app.serve(s, "prod", "support/archive", {}, {})
-        assert response["prompt"] == "still live"
-        assert response["versions"]["support/archive"]["commit"] == outcome.sha
+        assert response["prompt"] == "still live" and response["matched_rule"] == "default"
+        assert response["skipped_rules"] == [
+            {"rule_id": "to-v2", "prompt_id": "support/archive", "reason": "version 2 is archived"}]
+
+    with session_scope() as s:
+        app.registry(s, "sam").update_version("support/archive", 2, status="active")
+    app.invalidate("prod")
+    with session_scope() as s:
+        response = app.serve(s, "prod", "support/archive", {}, {})
+        assert response["prompt"] == "newer" and response["skipped_rules"] == []
 
 
 def test_total_rollback_restores_pointers_defaults_and_kills(app):

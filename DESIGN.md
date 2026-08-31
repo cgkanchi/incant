@@ -268,10 +268,15 @@ same validation, review policy, audit. No side door.
 
 ### Version registry
 
-Versions carry DB metadata: notes, optional **label**, status `active → archived`
-(archived: no new commits, no new rules; existing pointers keep serving forever).
-`incant_versions` mirrors the tree; the tree is authoritative for existence, the DB for
-status.
+Versions carry DB metadata: notes, optional **label**, status `active ⇄ archived`.
+**Archived versions do not serve**: a rule targeting one is skipped (counted in
+`skipped_rules`, flagged in the console), labels ignore it, and a version that is an
+environment's default cannot be archived at all — point the default elsewhere first.
+Archiving refuses new drafts, commits, rules and defaults; unarchiving resumes serving.
+A **label names exactly one version of a prompt** (duplicates are refused). Label and
+status changes propagate like targeting changes (a `version` revision on every
+environment) so replicas see them within the poll interval. `incant_versions` mirrors
+the tree; the tree is authoritative for existence, the DB for status.
 
 ---
 
@@ -378,9 +383,14 @@ nodes in seconds.
 
 ### Integrity
 
-- Rules and pointers may only reference validated SHAs and existing versions/labels;
-  violations are rejected at write time (global rules: warned with participant list).
-- Archiving a version still referenced by active rules requires acknowledging them.
+- Rules and pointers may only reference validated SHAs and existing, active versions;
+  a condition may only name segments the environment has, and segment references may
+  not form a cycle; a global rule serving an explicit version must name one some prompt
+  actively has. Violations are rejected at write time (global label rules: warned when
+  no prompt participates).
+- Archiving a version that is an environment default is refused; archiving one that
+  active rules target is allowed — those rules skip (counted) and are flagged in the
+  console until retargeted or the version is unarchived.
 - Eval-time backstop: a rule resolving to something unservable is skipped, counted
   (`incant_rule_skips_total`), surfaced in the UI.
 
@@ -820,6 +830,9 @@ audit_log(actor, action, object_type, object_id, before, after, at)
 - Backup: `incant_backup_lag_seconds{remote}` (remote id, not URL — URLs may embed
   credentials) · `incant_backup_queue_depth` — bounds the content-durability
   exposure window.
+- Propagation: `incant_snapshot_build_failures_total{environment}` — a rebuild that
+  failed on bad data; that environment serves its last good snapshot while the others
+  keep refreshing (page on nonzero: it is stuck until repaired).
 - Observed flags: `incant_observed_flags_total{outcome}` (`written` · `deduped` ·
   `dropped` · `ignored` — a healthy node is almost all `deduped`; `dropped` means the
   queue is full) · `incant_observed_flags_suppressed` (flags purged as high-cardinality).

@@ -214,13 +214,56 @@ class TargetingService:
             )
         ).first() is not None
 
+    def _segment_names(self, env_id: str) -> set[str]:
+        return set(self.s.execute(select(models.Segment.name).where(
+            models.Segment.environment_id == env_id)).scalars())
+
+    def _validate_segment_refs(self, env_id: str, when) -> None:
+        """Every segment a condition references must exist in this environment. A
+        dangling reference is not "never matches" — the evaluator skips and counts the
+        rule — so refuse it at write time where the author can fix it."""
+        refs = _segment_refs(when)
+        if not refs:
+            return
+        missing = sorted(refs - self._segment_names(env_id))
+        if missing:
+            raise TargetingError(
+                f"unknown segment(s) {missing} in {env_id!r} — create the segment first")
+
+    def _validate_segment_cycle(self, env_id: str, name: str, clauses) -> None:
+        """Segments may reference segments; refuse a reference chain that leads back to
+        the segment being saved (a -> b -> a) — such a rule could never match."""
+        graph = {
+            s.name: _segment_refs(s.clauses)
+            for s in self.s.execute(select(models.Segment).where(
+                models.Segment.environment_id == env_id)).scalars()
+        }
+        graph[name] = _segment_refs(clauses)
+        path: list[str] = []
+        seen: set[str] = set()
+
+        def walk(node: str) -> bool:
+            if node == name and path:
+                return True
+            if node in seen:
+                return False
+            seen.add(node)
+            path.append(node)
+            for nxt in sorted(graph.get(node, ())):
+                if walk(nxt):
+                    return True
+            path.pop()
+            return False
+
+        if walk(name):
+            raise TargetingError("segment cycle: " + " -> ".join(path + [name]))
+
     def _validate_rule_targets(self, scope: str, prompt_id: str | None, serve: dict) -> None:
         """Integrity: a prompt-scoped rule may only serve versions that exist for the
         prompt (§7), and a pinned SHA must be a validated commit for that
-        prompt/version. Global rules serve labels, so version existence is not checked
-        here (a prompt without the label simply skips the rule)."""
-        if scope != "prompt" or not prompt_id:
-            return
+        prompt/version. A global rule serving an explicit version must name a version
+        at least one prompt actively has (labels are not checked — a prompt without the
+        label simply skips the rule)."""
         # (version_number, at, sha) targets carried by this serve.
         targets: list[tuple[int, str | None, str | None]] = []
         if "version" in serve:
@@ -229,6 +272,17 @@ class TargetingService:
             for band in serve["rollout"].get("weights", []):
                 if band.get("version") is not None and not band.get("default"):
                     targets.append((int(band["version"]), None, None))
+        if scope != "prompt" or not prompt_id:
+            for version_number, _at, _sha in targets:
+                exists = self.s.execute(select(models.Version.id).where(
+                    models.Version.number == version_number,
+                    models.Version.status == "active",
+                )).first() is not None
+                if not exists:
+                    raise TargetingError(
+                        f"version {version_number} exists (active) for no prompt — a global "
+                        "rule serving it could never match")
+            return
         for version_number, at, sha in targets:
             if not self._version_exists(prompt_id, version_number):
                 raise TargetingError(
@@ -266,27 +320,36 @@ class TargetingService:
             # another environment via this env's URL (cross-env capture).
             raise TargetingError(
                 f"rule {rid!r} belongs to environment {existing.environment_id!r}, not {env_id!r}")
-        if existing is None:
-            existing = models.Rule(id=rid, environment_id=env_id)
-            self.s.add(existing)
-        existing.scope = rule.get("scope", existing.scope or "prompt")
-        existing.prompt_id = rule.get("prompt_id", existing.prompt_id)
-        if existing.scope == "global":
+        # Compute the MERGED row first and validate it BEFORE the session is touched: a
+        # caller that catches the TargetingError and carries on in the same session must
+        # not find a half-built rule committed under it.
+        scope = rule.get("scope", (existing.scope if existing else None) or "prompt")
+        prompt_id = rule.get("prompt_id", existing.prompt_id if existing else None)
+        if scope == "global":
             # The MERGED row must satisfy the global⇒no-prompt invariant even when a
             # service-level caller omits prompt_id while rescoping (the HTTP layer
             # always sends it explicitly; plain dicts may not). Without this, the
             # stale prompt_id survives the merge, the DB check rejects the flush,
             # and — had it landed — the next snapshot rebuild's strict parse would
             # take the whole environment down.
-            existing.prompt_id = None
+            prompt_id = None
+        clauses = rule.get("when", rule.get("clauses"))
+        serve = rule["serve"]
+        # Integrity: reject targets that reference a non-existent version or an
+        # unvalidated pinned SHA, and conditions naming segments this environment
+        # lacks, before this write bumps rules_version.
+        self._validate_rule_targets(scope, prompt_id, serve)
+        self._validate_segment_refs(env_id, clauses)
+        if existing is None:
+            existing = models.Rule(id=rid, environment_id=env_id)
+            self.s.add(existing)
+        existing.scope = scope
+        existing.prompt_id = prompt_id
         existing.priority = int(rule.get("priority", existing.priority or 10))
-        existing.clauses = rule.get("when", rule.get("clauses"))
-        existing.serve = rule["serve"]
+        existing.clauses = clauses
+        existing.serve = serve
         existing.status = rule.get("status", existing.status or "active")
         existing.comment = rule.get("comment", existing.comment or "")
-        # Integrity: reject targets that reference a non-existent version or an
-        # unvalidated pinned SHA before this write bumps rules_version.
-        self._validate_rule_targets(existing.scope, existing.prompt_id, existing.serve)
         self.s.flush()
         self._bump(env, "rule", _rule_snapshot(existing), rule_id=rid,
                    comment=existing.comment)
@@ -324,6 +387,8 @@ class TargetingService:
         except (KeyError, TypeError, ValueError) as exc:
             raise TargetingError(f"invalid segment condition: {exc}") from exc
         name = name.strip()
+        self._validate_segment_refs(env_id, clauses)
+        self._validate_segment_cycle(env_id, name, clauses)
         existing = self.s.execute(
             select(models.Segment).where(
                 models.Segment.environment_id == env_id, models.Segment.name == name
@@ -537,8 +602,15 @@ class TargetingService:
                     models.EnvDefault.environment_id == env_id)
             ).scalars()
         }
+        skipped_defaults = 0
         for pid, ver in recorded.items():
             d = existing_defaults.get(pid)
+            if (d is None or d.version_number != ver) and not self._version_exists(pid, ver):
+                # The recorded default names a version since archived (or gone): an
+                # archived default is unservable, so leave the current default in place
+                # and report the skip rather than restore a 409.
+                skipped_defaults += 1
+                continue
             if d is None:
                 self.s.add(models.EnvDefault(
                     environment_id=env_id, prompt_id=pid, version_number=ver))
@@ -546,6 +618,8 @@ class TargetingService:
             elif d.version_number != ver:
                 d.version_number = ver
                 changed["defaults"] += 1
+        if skipped_defaults:
+            changed["defaults_skipped"] = skipped_defaults
         for pid, d in existing_defaults.items():
             if pid not in recorded:
                 self.s.delete(d)
@@ -707,9 +781,39 @@ def _apply_deltas(base_state: dict, deltas: list[models.RuleRevision]) -> dict:
             entry = state.setdefault("versions", {}).setdefault(
                 key, {"live": None, "tip": None, "label": None, "status": "active"})
             entry["live"] = snap.get("to_sha")
+        elif rev.kind == "version":
+            # Registry metadata that targeting depends on (label, archived status).
+            key = _version_key(snap["prompt_id"], snap["version"])
+            entry = state.setdefault("versions", {}).setdefault(
+                key, {"live": None, "tip": None, "label": None, "status": "active"})
+            if "label" in snap:
+                entry["label"] = snap["label"]
+            if "status" in snap:
+                entry["status"] = snap["status"]
     state["rules"] = list(rules.values())
     state["segments"] = list(segments.values())
     return state
+
+
+def _segment_refs(cond) -> set[str]:
+    """Segment names a raw condition (JSON shape) references, at any depth."""
+    out: set[str] = set()
+
+    def walk(c) -> None:
+        if not isinstance(c, dict):
+            return
+        seg = c.get("segment")
+        if isinstance(seg, str) and seg.strip():
+            out.add(seg.strip())
+        for k in ("all", "any"):
+            if isinstance(c.get(k), list):
+                for x in c[k]:
+                    walk(x)
+        if "not" in c:
+            walk(c["not"])
+
+    walk(cond)
+    return out
 
 
 def _rule_snapshot(r: models.Rule) -> dict:

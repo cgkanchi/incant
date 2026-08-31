@@ -17,14 +17,37 @@ class UnresolvedPrompt(CoreError):
 
 
 class Unservable(CoreError):
-    """The resolved content cannot be served and no within-version fallback exists."""
+    """The resolved content cannot be served and no within-version fallback exists —
+    or (``reason="archived"``) the environment default names an archived version."""
 
-    def __init__(self, prompt_id: str, version: int) -> None:
+    def __init__(self, prompt_id: str, version: int, reason: str | None = None) -> None:
         self.prompt_id = prompt_id
         self.version = version
-        super().__init__(
-            f"nothing servable in the pointer history of {prompt_id}@v{version}"
-        )
+        self.reason = reason
+        if reason == "archived":
+            msg = (f"default version v{version} of {prompt_id!r} is archived — unarchive it "
+                   "or point the environment default at an active version")
+        else:
+            msg = f"nothing servable in the pointer history of {prompt_id}@v{version}"
+        super().__init__(msg)
+
+
+class MissingSegment(CoreError):
+    """A condition references a segment the environment does not have. Raised (not
+    treated as False) so `not: {segment: gone}` can never invert into "match everyone";
+    the evaluator turns it into a counted rule skip."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"segment {name!r} does not exist")
+
+
+class SegmentCycle(CoreError):
+    """Segment references form a cycle. Same handling as :class:`MissingSegment`."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"segment {name!r} references itself (cycle)")
 
 
 class IncludeCycle(CoreError):

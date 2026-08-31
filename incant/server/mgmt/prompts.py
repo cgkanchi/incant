@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ... import models
-from ...registry import RegistryError
+from ...registry import RegistryConflict, RegistryError
 from ...targeting import build_snapshot
 from ..auth import ANY_ENVIRONMENT, _IMPLIES, Identity
 from ..deps import app_context, get_session, identity
@@ -231,6 +231,8 @@ def update_version(
             prompt_id, version_number,
             label=req.label, notes=req.notes, status=req.status,
         )
+    except RegistryConflict as exc:
+        raise HTTPException(409, str(exc))
     except RegistryError as exc:
         raise HTTPException(404, str(exc))
     app.invalidate_after_commit(session)

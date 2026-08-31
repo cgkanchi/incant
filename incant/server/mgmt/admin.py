@@ -47,11 +47,15 @@ def _validate_env_id(env_id: str) -> None:
 
 
 # Every table whose rows are scoped to one environment by ``environment_id``. Rule, Segment,
-# EnvDefault, KillSwitch and PointerMove carry a real FK to ``environments.id``; RuleRevision
-# and RoleBinding hold it as a plain string. Delete/rename fan out across all seven.
+# EnvDefault, KillSwitch, PointerMove and the observed-flags tables carry a real FK to
+# ``environments.id`` (the observed-flags ones with ON DELETE CASCADE); RuleRevision and
+# RoleBinding hold it as a plain string. Delete/rename fan out across all nine — rename
+# MUST repoint the cascading tables too, or deleting the old parent row would take the
+# observed flags and suppressions with it.
 _ENV_SCOPED_MODELS = (
     models.Rule, models.Segment, models.EnvDefault, models.KillSwitch,
     models.PointerMove, models.RuleRevision, models.RoleBinding,
+    models.ObservedFlag, models.ObservedFlagSuppression,
 )
 
 

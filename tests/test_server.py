@@ -262,30 +262,76 @@ def test_mgmt_overview_and_versions(client):
 
 
 def test_version_metadata_and_archive_lifecycle_endpoint(client):
+    # v2 is the environment default in prod and staging: archiving it is refused (§5 —
+    # archived versions do not serve, and the default has no fallback).
+    r = client.patch("/mgmt/prompts/support/system/versions/2",
+                     json={"status": "archived"}, headers=auth())
+    assert r.status_code == 409 and "environment default" in r.json()["detail"], r.text
+
+    # A rule targeting v3 (live in prod), so the console has something to flag once v3
+    # is archived and serving has a skip to count.
+    r = client.post("/mgmt/envs/prod/rules",
+                    json={"id": "to-v3", "scope": "prompt", "prompt_id": "support/system",
+                          "priority": 1, "when": {"flag": "tier", "op": "eq", "value": "vip"},
+                          "serve": {"version": 3}}, headers=auth())
+    assert r.status_code == 200, r.text
+
+    # v3 is targeted by rules and live in staging, but nobody's default: archivable.
     r = client.patch(
-        "/mgmt/prompts/support/system/versions/2",
-        json={"label": "stable", "notes": "supported baseline", "status": "archived"},
+        "/mgmt/prompts/support/system/versions/3",
+        json={"label": "stable", "notes": "retired voice", "status": "archived"},
         headers=auth(),
     )
     assert r.status_code == 200, r.text
     assert r.json() == {
-        "prompt_id": "support/system", "version": 2, "label": "stable",
-        "notes": "supported baseline", "status": "archived",
+        "prompt_id": "support/system", "version": 3, "label": "stable",
+        "notes": "retired voice", "status": "archived",
     }
     versions = client.get(
         "/mgmt/prompts/support/system/versions?environment=prod", headers=auth()
     ).json()["versions"]
-    assert next(v for v in versions if v["version"] == 2)["status"] == "archived"
+    assert next(v for v in versions if v["version"] == 3)["status"] == "archived"
 
-    # Archived content remains reproducible/live, but cannot receive new traffic.
-    r = client.post(
-        "/mgmt/envs/prod/rules",
-        json={"id": "archived-target", "scope": "prompt",
-              "prompt_id": "support/system", "priority": 1,
-              "serve": {"version": 2}},
-        headers=auth(),
-    )
+    # The console flags the rule that now targets an archived version.
+    rules = client.get("/mgmt/envs/prod/rules", headers=auth()).json()["rules"]
+    mine = next(x for x in rules if x["id"] == "to-v3")
+    assert "archived" in (mine["unservable_reason"] or "")
+    # …and serving skips it (counted), falling to the default.
+    r = client.post("/prompt/support/system", headers=auth(client.renderer_key),
+                    json={"environment": "prod", "flags": {"tier": "vip"},
+                          "variables": {"customer_name": "Acme", "history": []}})
+    assert r.status_code == 200, r.text
+    assert r.json()["matched_rule"] == "default"
+    assert [s["reason"] for s in r.json()["skipped_rules"]] == ["version 3 is archived"]
+
+    # No NEW traffic can be pointed at it either.
+    r = client.post("/mgmt/envs/prod/rules",
+                    json={"id": "archived-target", "scope": "prompt",
+                          "prompt_id": "support/system", "priority": 1, "serve": {"version": 3}},
+                    headers=auth())
     assert r.status_code == 400
+    r = client.post("/mgmt/envs/staging/defaults",
+                    json={"prompt_id": "support/system", "version_number": 3}, headers=auth())
+    assert r.status_code == 400, r.text
+
+    # A label names exactly one version of a prompt.
+    r = client.patch("/mgmt/prompts/support/system/versions/2",
+                     json={"label": "stable"}, headers=auth())
+    assert r.status_code == 409 and "already names v3" in r.json()["detail"], r.text
+
+    # Unarchive → targetable and serving again.
+    r = client.patch("/mgmt/prompts/support/system/versions/3",
+                     json={"status": "active"}, headers=auth())
+    assert r.status_code == 200 and r.json()["status"] == "active"
+    r = client.post("/mgmt/envs/prod/rules",
+                    json={"id": "archived-target", "scope": "prompt",
+                          "prompt_id": "support/system", "priority": 1, "serve": {"version": 3}},
+                    headers=auth())
+    assert r.status_code == 200, r.text
+    r = client.post("/prompt/support/system", headers=auth(client.renderer_key),
+                    json={"environment": "prod", "flags": {"tier": "vip"},
+                          "variables": {"customer_name": "Acme", "history": []}})
+    assert r.json()["matched_rule"] == {"scope": "prompt", "id": "to-v3"}
 
 
 def test_overview_flags_unpublished_newer_version(client):

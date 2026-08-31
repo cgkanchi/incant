@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- **Archived versions stop serving** (DESIGN.md §5). A rule targeting an archived
+  version is skipped and counted; labels ignore archived versions; archiving an
+  environment's default is refused (409); unarchive to serve again. Label and status
+  changes now propagate to replicas (a `version` revision per environment).
+- **Labels are unique per prompt** (409 on a duplicate) and label resolution is
+  deterministic (highest active version).
+- **Broken conditions are counted skips, never matches**: a rule referencing a segment
+  the environment lacks (or a segment cycle) is skipped and reported — previously it
+  evaluated as false, so `not: {segment: gone}` matched everyone. Dangling segment
+  references and segment cycles are refused at write time; global rules serving an
+  explicit version must name one some prompt actively has.
+- **Include failures are honest**: an include that cannot resolve reports the fragment
+  ("included by …"), and a targeting-induced include cycle or depth overflow is a 409,
+  not a 500.
+- **Control-plane propagation isolates bad data**: a snapshot rebuild that fails for one
+  environment no longer aborts the poll for every other environment
+  (`incant_snapshot_build_failures_total{environment}`); environments deleted on
+  another node are evicted from the serving cache on the next poll.
+- **Rollback reports `defaults_skipped`** (a recorded default naming an archived
+  version is not restored) alongside `pointers_skipped`.
+- Fixes: renaming an environment no longer deletes its observed flags and
+  suppressions; `GET /prompt/{id}/spec` no longer collapses `1` and `true` into one value.
+
 ## 1.0.0 — 2026-08-31
 
 First stable release.

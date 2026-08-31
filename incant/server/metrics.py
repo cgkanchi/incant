@@ -64,6 +64,15 @@ backup_lag_seconds = Gauge(
     ["remote"],
 )
 
+# Control-plane propagation (§7/§10): a snapshot rebuild that failed on bad data in one
+# environment. That environment keeps serving its last good snapshot while every other
+# environment continues to refresh — page on nonzero, the env is stuck until repaired.
+snapshot_build_failures_total = Counter(
+    "incant_snapshot_build_failures_total",
+    "Environment snapshot rebuilds that failed (last good snapshot kept serving)",
+    ["environment"],
+)
+
 # Observed flags (§7): request-path observations by outcome. `written` = rows inserted
 # or refreshed by the writer; `deduped` = seen within the window (no queue, no write);
 # `dropped` = queue full (Postgres down or a flood); `ignored` = non-scalar/too long/

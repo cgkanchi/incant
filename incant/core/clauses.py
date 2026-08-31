@@ -4,22 +4,30 @@ Semantics (from the design):
   * Operators: eq, neq, in, not_in, contains, starts_with, ends_with,
     gt/gte/lt/lte, semver_gt/semver_lt, exists; all/any/not composition.
   * A clause referencing an absent flag does not match — never errors.
-  * Segments are named conditions, referenced from any rule.
+  * Segments are named conditions, referenced from any rule. A reference to a
+    segment that does not exist (or a reference cycle) is a broken condition, not
+    a false one: it raises MissingSegment / SegmentCycle so the evaluator can skip
+    and COUNT the rule — evaluating it as False would let `not: {segment: gone}`
+    match everyone.
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .errors import MissingSegment, SegmentCycle
 from .model import All, Any_, Clause, Condition, Not, Segment, SegmentRef
 
 _MISSING = object()
 
 
 def _semver_tuple(v: Any) -> tuple[int, ...] | None:
+    """``1.2.3``, ``v1.2.3``, ``1.2.3-rc.1`` (pre-release dropped) and ``1.2.3+build``
+    (build metadata dropped, per semver precedence) → ``(1, 2, 3)``; anything that is not
+    dotted integers → None (never matches, never raises)."""
     try:
-        parts = str(v).lstrip("v").split("-", 1)[0].split(".")
-        return tuple(int(p) for p in parts)
+        core = str(v).lstrip("v").split("+", 1)[0].split("-", 1)[0]
+        return tuple(int(p) for p in core.split("."))
     except (ValueError, AttributeError):
         return None
 
@@ -93,8 +101,9 @@ def eval_condition(
         return not eval_condition(cond.of, flags, segments, _seen)
     if isinstance(cond, SegmentRef):
         seg = segments.get(cond.name)
-        if seg is None or cond.name in _seen:
-            # Unknown or self-referential segment never matches.
-            return False
+        if seg is None:
+            raise MissingSegment(cond.name)
+        if cond.name in _seen:
+            raise SegmentCycle(cond.name)
         return eval_condition(seg.condition, flags, segments, _seen | {cond.name})
     raise TypeError(f"unknown condition node: {cond!r}")

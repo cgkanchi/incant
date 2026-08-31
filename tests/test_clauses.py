@@ -1,5 +1,8 @@
+import pytest
+
 from incant.core import parse_condition
 from incant.core.clauses import eval_condition
+from incant.core.errors import MissingSegment, SegmentCycle
 from incant.core.model import Segment
 
 
@@ -59,10 +62,25 @@ def test_segment_reference():
     c = cond({"segment": "beta"})
     assert eval_condition(c, {"beta_opt_in": True}, segs)
     assert not eval_condition(c, {"beta_opt_in": False}, segs)
-    # unknown segment never matches
-    assert not eval_condition(cond({"segment": "ghost"}), {}, segs)
+    # An unknown segment is a BROKEN condition, not a false one: it raises, so a `not:`
+    # around it can never invert into "match everyone". The evaluator turns the raise
+    # into a counted rule skip (see test_evaluate / test_edge_cases).
+    with pytest.raises(MissingSegment):
+        eval_condition(cond({"segment": "ghost"}), {}, segs)
+    with pytest.raises(MissingSegment):
+        eval_condition(cond({"not": {"segment": "ghost"}}), {}, segs)
+    with pytest.raises(MissingSegment):
+        eval_condition(cond({"all": [{"segment": "beta"}, {"any": [{"segment": "ghost"}]}]}),
+                       {"beta_opt_in": True}, segs)
 
 
-def test_segment_cycle_is_safe():
+def test_segment_cycle_raises_instead_of_matching():
     segs = {"a": Segment("a", cond({"segment": "a"}))}
-    assert eval_condition(cond({"segment": "a"}), {}, segs) is False
+    with pytest.raises(SegmentCycle):
+        eval_condition(cond({"segment": "a"}), {}, segs)
+    # Mutual cycle a -> b -> a, and under not: — never "everyone".
+    segs = {"a": Segment("a", cond({"segment": "b"})), "b": Segment("b", cond({"segment": "a"}))}
+    with pytest.raises(SegmentCycle):
+        eval_condition(cond({"segment": "a"}), {}, segs)
+    with pytest.raises(SegmentCycle):
+        eval_condition(cond({"not": {"segment": "b"}}), {}, segs)

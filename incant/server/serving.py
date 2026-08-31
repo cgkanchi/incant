@@ -191,10 +191,12 @@ def prompt_spec(
                 .order_by(models.ObservedFlag.last_seen.desc()).limit(25)
             ).all()
             observed = [typed_value(v, t) for v, t in rows]
-        merged_vals = set(vals) | set(observed)
+        # Key by (type, text): in a plain set 1 == True (and 1.0), so one value would
+        # silently swallow the other.
+        merged_vals = {(type(v).__name__, str(v)): v for v in (*vals, *observed)}
         flags_out.append({
             "name": name,
-            "values": sorted(merged_vals, key=lambda v: (type(v).__name__, str(v))),
+            "values": sorted(merged_vals.values(), key=lambda v: (type(v).__name__, str(v))),
             "observed": bool(observed),
             "suppressed": suppressed,
         })

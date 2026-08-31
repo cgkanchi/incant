@@ -4,9 +4,12 @@ Evaluation order per prompt (first match wins):
     global rules -> prompt rules -> environment default.
 
 A rule that resolves to something unservable is *skipped* (counted by the caller
-via the returned skip list), and evaluation continues. The environment default
-serves a version at its live pointer, with the §10 within-version fallback as the
-only permitted content degradation.
+via the returned skip list), and evaluation continues. So is a rule whose condition
+is broken (a missing segment, a segment cycle) — never silently False. Archived
+versions do not serve: a rule targeting one is skipped, labels ignore them, and an
+archived environment default is Unservable. The environment default serves a version
+at its live pointer, with the §10 within-version fallback as the only permitted
+content degradation.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .clauses import eval_condition
-from .errors import UnresolvedPrompt, Unservable
+from .errors import MissingSegment, SegmentCycle, UnresolvedPrompt, Unservable
 from .model import (
     EnvSnapshot,
     Resolution,
@@ -105,6 +108,8 @@ def _resolve_serve(
         vinfo = snap.version_info(prompt_id, serve.version)
         if vinfo is None:
             return None, f"version {serve.version} does not exist"
+        if vinfo.status == "archived":
+            return None, f"version {serve.version} is archived"
         if serve.at == "tip":
             sha = vinfo.tip_sha
             if not sha or not snap.servable(prompt_id, serve.version, sha):
@@ -139,6 +144,8 @@ def _serve_version_live(
     vinfo = snap.version_info(prompt_id, version)
     if vinfo is None:
         return None, f"version {version} does not exist"
+    if vinfo.status == "archived":
+        return None, f"version {version} is archived"
     sha, fallback = _servable_sha_for_version(snap, prompt_id, vinfo)
     if sha is None:
         return None, "no servable pointer in history"
@@ -165,8 +172,17 @@ def resolve(
 
     killed = prompt_id in snap.killed
 
+    def matches(rule: Rule) -> bool:
+        # A broken condition (missing segment / cycle) is a counted skip, never a
+        # match and never a silent False that `not:` could invert.
+        try:
+            return eval_condition(rule.when, flags, snap.segments)
+        except (MissingSegment, SegmentCycle) as exc:
+            skips.append(Skip(rule.id, prompt_id, str(exc)))
+            return False
+
     for rule in () if killed else snap.global_rules():
-        if not eval_condition(rule.when, flags, snap.segments):
+        if not matches(rule):
             continue
         res, reason = _resolve_serve(snap, prompt_id, flags, rule)
         if res is not None:
@@ -175,7 +191,7 @@ def resolve(
             skips.append(Skip(rule.id, prompt_id, reason))
 
     for rule in () if killed else snap.prompt_rules(prompt_id):
-        if not eval_condition(rule.when, flags, snap.segments):
+        if not matches(rule):
             continue
         res, reason = _resolve_serve(snap, prompt_id, flags, rule)
         if res is not None:
@@ -190,6 +206,8 @@ def resolve(
     vinfo = snap.version_info(prompt_id, default_version)
     if vinfo is None:
         raise UnresolvedPrompt(prompt_id, snap.environment)
+    if vinfo.status == "archived":
+        raise Unservable(prompt_id, default_version, reason="archived")
     sha, fallback = _servable_sha_for_version(snap, prompt_id, vinfo)
     if sha is None:
         raise Unservable(prompt_id, default_version)

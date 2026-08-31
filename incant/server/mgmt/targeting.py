@@ -12,6 +12,7 @@ from ...targeting.audit import record_audit
 from ...targeting.observed import (
     all_rules, collect_rule_flags, forget_flag, load_suppressions, typed_value,
 )
+from ...targeting.service import _segment_refs
 from ..auth import Identity
 from ..deps import app_context, get_session, identity
 from ...service import AppContext
@@ -136,12 +137,20 @@ def _unservable_reason(snap, r: models.Rule) -> str | None:
     learns "this can never serve" at save time, not after 30 baffling requests."""
     if r.status != "active":
         return None
+    missing = sorted(_segment_refs(r.clauses) - set(snap.segments))
+    if missing:
+        return f"segment {missing[0]!r} does not exist"
     serve = r.serve if isinstance(r.serve, dict) else {}
     if r.scope == "global":
         label = serve.get("label") or (serve.get("rollout") or {}).get("label")
         if label and not any(
             snap.version_for_label(pid, label) is not None for pid in snap.versions):
             return f"label {label!r} has no participating prompts"
+        if "version" in serve:
+            v = int(serve["version"])
+            if not any((vi := snap.version_info(pid, v)) is not None and vi.status != "archived"
+                       for pid in snap.versions):
+                return f"v{v} exists (active) for no prompt"
         return None
     pid = r.prompt_id
     targets: list[tuple[int, str | None, str | None]] = []
@@ -154,6 +163,8 @@ def _unservable_reason(snap, r: models.Rule) -> str | None:
         vinfo = snap.version_info(pid, version)
         if vinfo is None:
             return f"v{version} does not exist"
+        if vinfo.status == "archived":
+            return f"v{version} is archived — unarchive it to serve"
         if at == "tip":
             if vinfo.tip_sha is None:
                 return f"v{version} has no validated tip"

@@ -9,6 +9,8 @@ from __future__ import annotations
 from .errors import (
     CoreError,
     IncludeCycle,
+    MissingSegment,
+    SegmentCycle,
     IncludeDepthExceeded,
     MissingVariable,
     RenderError,
@@ -43,7 +45,7 @@ from .variables import ExtractedVars, extract
 
 __all__ = [
     "All", "Any_", "Clause", "Condition", "ContentBlob", "ContentProvider",
-    "CoreError", "EnvSnapshot", "ExtractedVars", "IncludeCycle",
+    "CoreError", "EnvSnapshot", "ExtractedVars", "IncludeCycle", "MissingSegment", "SegmentCycle",
     "IncludeDepthExceeded", "MissingVariable", "Not", "RenderError",
     "RenderResult", "Resolution", "RolloutBand", "Rule", "Segment",
     "SegmentRef", "Serve", "ServeLabel", "ServeRollout", "ServeVersion",
