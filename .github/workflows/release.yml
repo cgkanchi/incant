@@ -45,10 +45,21 @@ jobs:
   pypi:
     if: github.event_name == 'push' || inputs.publish_pypi
     runs-on: ubuntu-latest
-    # PyPI Trusted Publishing (OIDC): register this repo + workflow + environment as the
-    # publisher of each project on pypi.org; no long-lived token needed. A PYPI_API_TOKEN
-    # repository secret, if present, is used instead.
-    environment: pypi
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: incant-sdk
+            environment: pypi-incant-sdk
+          - package: incant-mcp
+            environment: pypi-incant-mcp
+    # PyPI Trusted Publishing (OIDC). One GitHub environment PER package: PyPI requires a
+    # *pending* publisher's (owner, repo, workflow, environment) tuple to be unique, so two
+    # not-yet-existing projects cannot share one. Register on pypi.org → Publishing →
+    # "Add a new pending publisher": project <package>, owner cgkanchi, repo incant,
+    # workflow release.yml, environment <environment>. A PYPI_API_TOKEN repository
+    # secret, if present, is used instead of OIDC.
+    environment: ${{ matrix.environment }}
     permissions:
       contents: read
       id-token: write
@@ -57,20 +68,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Versions must match the tag
+      - name: Version must match the tag
         if: github.event_name == 'push'
         run: |
           python3 - <<'PY'
           import os, sys, tomllib
           tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
-          bad = [p for p in ("sdk/python/pyproject.toml", "mcp/python/pyproject.toml")
-                 if tomllib.load(open(p, "rb"))["project"]["version"] != tag]
-          sys.exit(f"version != {tag} in: {bad}" if bad else 0)
+          path = {"incant-sdk": "sdk/python/pyproject.toml", "incant-mcp": "mcp/python/pyproject.toml"}["${{ matrix.package }}"]
+          v = tomllib.load(open(path, "rb"))["project"]["version"]
+          sys.exit(f"{path}: version {v} != tag {tag}" if v != tag else 0)
           PY
       - name: Build
         run: |
-          uv build --package incant-sdk -o dist
-          uv build --package incant-mcp -o dist
+          uv build --package ${{ matrix.package }} -o dist
           ls -la dist
       - name: Publish (token)
         if: env.HAS_TOKEN == 'true'
