@@ -544,7 +544,10 @@ Pin semantics, precisely:
   tip-rule whose tip the checkpoint cannot vouch for is skipped and reported in
   `skipped_rules`, never silently substituted; content-exact replay of tip-rules
   is what `pin.versions` is for. Replays never take the §10 fallback (a degraded
-  replay would be a lie — they 409 instead).
+  replay would be a lie — they 409 instead), and never serve a **killed** prompt: a
+  pin naming a currently killed prompt — or a `rules_version` replay of one — is
+  refused (409, `error: "killed"`). The kill switch beats reproducibility exactly
+  as validation does; the unpinned path degrades to the environment default.
 - Unknown pin fields are refused (422), never silently ignored.
 - Both together are allowed: `versions` entries win per prompt.
 

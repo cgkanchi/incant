@@ -441,3 +441,39 @@ def test_observed_flags_roundtrip_unicode_values(client):
     _flush()
     r = client.get("/mgmt/envs/prod/flags/plan/values?q=%E3%83%97", headers=auth())
     assert [v["value"] for v in r.json()["values"]] == ["プレミアム🚀"]
+
+
+# ── kill switch vs. reproducibility ─────────────────────────────────
+
+def test_pins_and_replays_do_not_bypass_the_kill_switch(client):
+    """The kill switch beats reproducibility, exactly as validation does: a pin naming
+    a killed prompt — and a rules_version replay of one — is a 409 with a
+    machine-readable `error: "killed"`, never the killed content and never a silent
+    substitution. Lifting the kill makes the same pin serve the same commit again."""
+    r = _render(client, {})
+    assert r.status_code == 200, r.text
+    entry = {"version": r.json()["versions"][PID]["version"],
+             "commit": r.json()["versions"][PID]["commit"]}
+    rv = r.json()["rules_version"]
+    assert client.post("/mgmt/envs/prod/kill?prompt_id=support/system",
+                       json={"engaged": True}, headers=auth()).status_code == 200
+
+    body = {"environment": "prod", "flags": {},
+            "variables": {"customer_name": "Acme", "history": []}}
+    r = client.post(f"/prompt/{PID}", headers=auth(client.renderer_key),
+                    json={**body, "pin": {"versions": {PID: entry}}})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"] == "killed"
+    assert "kill switch" in r.json()["detail"]["detail"]
+    r = client.post(f"/prompt/{PID}", headers=auth(client.renderer_key),
+                    json={**body, "pin": {"rules_version": rv}})
+    assert r.status_code == 409 and r.json()["detail"]["error"] == "killed", r.text
+    # The normal (unpinned) path still degrades to the environment default.
+    assert _render(client, {}).status_code == 200
+
+    assert client.post("/mgmt/envs/prod/kill?prompt_id=support/system",
+                       json={"engaged": False}, headers=auth()).status_code == 200
+    r = client.post(f"/prompt/{PID}", headers=auth(client.renderer_key),
+                    json={**body, "pin": {"versions": {PID: entry}}})
+    assert r.status_code == 200 and r.json()["versions"][PID]["commit"] == entry["commit"]
+

@@ -506,6 +506,26 @@ class AppContext:
         else:
             snap = self.get_snapshot(session, env_id)
 
+        # The kill switch beats reproducibility, exactly as validation does (§5/§9): a
+        # pin naming a CURRENTLY killed prompt — or a rules_version replay of one — is
+        # refused loudly instead of replaying content an operator just killed. The
+        # normal (unpinned) path still degrades to the environment default.
+        current_killed = (snap.killed if pin_rules_version is None
+                          else self.get_snapshot(session, env_id).killed)
+        killed_pins = sorted(set(pin or ()) & current_killed)
+        if killed_pins:
+            raise ServingError(
+                409,
+                f"pinned prompt {killed_pins[0]!r} is killed in {env_id!r} — the kill "
+                "switch overrides replay; lift it to replay this pin",
+                error="killed")
+        if pin_rules_version is not None and prompt_id in current_killed:
+            raise ServingError(
+                409,
+                f"prompt {prompt_id!r} is killed in {env_id!r} — a rules_version replay "
+                "cannot serve it; lift the kill switch first",
+                error="killed")
+
         # §5's invariant — "only validated SHAs can ever serve" — applies to pins too.
         # Every other door is already guarded at write time (make_live, rule pins) or
         # eval time (the snapshot's `servable` backstop); without this check a pin

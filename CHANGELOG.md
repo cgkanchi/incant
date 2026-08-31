@@ -22,6 +22,10 @@
   another node are evicted from the serving cache on the next poll.
 - **Rollback reports `defaults_skipped`** (a recorded default naming an archived
   version is not restored) alongside `pointers_skipped`.
+- **The kill switch beats replay**: a pin naming a killed prompt — or a
+  `rules_version` replay of one — returns 409 with `error: "killed"` instead of
+  serving the killed content (reproducibility already yields to validation; now to
+  the emergency lever too). Unpinned requests still degrade to the default.
 - Fixes: renaming an environment no longer deletes its observed flags and
   suppressions; `GET /prompt/{id}/spec` no longer collapses `1` and `true` into one value.
 
