@@ -325,9 +325,11 @@ function cbRowHtml(row, prefix, i, segments, allowNew) {
   } else {
     const isExists = row.op === "exists";
     const valPh = (row.op === "in" || row.op === "not_in") ? "comma,separated,values" : "value";
-    controls = `<input class="cb-flag" id="${p}-flag" value="${esc(row.flag)}" placeholder="flag name" spellcheck="false">
+    // data-sugg opts the inputs into the §7 typeahead (suggest.js): flag names known to
+    // the environment, then values traffic has sent for the flag named beside them.
+    controls = `<input class="cb-flag" id="${p}-flag" value="${esc(row.flag)}" placeholder="flag name" spellcheck="false" autocomplete="off" data-sugg="flag" aria-autocomplete="list">
       <select class="cb-sel" id="${p}-op" data-act="cbOp" data-prefix="${prefix}" data-ri="${i}">${opOptions(row.op)}</select>
-      ${isExists ? "" : `<input class="cb-val grow" id="${p}-val" value="${esc(row.value)}" placeholder="${valPh}" spellcheck="false">`}`;
+      ${isExists ? "" : `<input class="cb-val grow" id="${p}-val" value="${esc(row.value)}" placeholder="${valPh}" spellcheck="false" autocomplete="off" data-sugg="value" data-flag-input="${p}-flag" data-op-input="${p}-op" aria-autocomplete="list">`}`;
   }
   return `<div class="cb-row">${kindSel}${controls}
     <button type="button" class="cb-del btn-bare" data-act="cbDel" data-prefix="${prefix}" data-ri="${i}" aria-label="Remove condition">✕</button></div>${nested}`;

@@ -136,6 +136,8 @@ def server(tmp_path_factory):
         "INCANT_ALLOW_DEV_KEY": "1",
         "INCANT_BOOTSTRAP_ADMIN_KEY": ADMIN_KEY,
         "INCANT_MODE": "full",
+        # §7 observed flags: flush fast so the typeahead test sees traffic without a long wait.
+        "INCANT_OBSERVED_FLAGS_FLUSH_SECONDS": "0.5",
     })
 
     for step in (["init"], ["seed"]):

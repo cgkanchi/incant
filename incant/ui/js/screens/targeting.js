@@ -300,7 +300,7 @@ function composerRolloutHtml(co) {
     <div class="ro-foot"><button type="button" class="link btn-bare" data-act="cbRoAdd">＋ add a version</button><span class="grow"></span>
       <span class="ro-sum ${sum === 100 ? "ok" : "bad"}" id="rolloutSum">sum: ${sum}%</span></div>
     <div class="field" style="margin-top:12px;margin-bottom:0"><label>Bucket by (flag)</label>
-      <input id="co-bucket" value="${esc(co.rollout.bucket_by)}" placeholder="user_id" spellcheck="false" style="max-width:220px;font-family:'IBM Plex Mono',monospace"></div>
+      <input id="co-bucket" value="${esc(co.rollout.bucket_by)}" placeholder="user_id" spellcheck="false" autocomplete="off" data-sugg="flag" aria-autocomplete="list" style="max-width:220px;font-family:'IBM Plex Mono',monospace"></div>
     <div class="cb-hint">Each request is bucketed by this flag; a given user stays in the same arm as you ramp the weights.</div></div>`;
 }
 function composerServeHtml(co) {

@@ -223,6 +223,90 @@ def test_targeting_composer_and_audience(server, page):
     assert "→ they'd get" in body, body[-600:]
 
 
+def test_composer_suggests_flags_and_observed_values(server, page, bearer):
+    """§7 observed flags end to end: real traffic renders with a value no rule names;
+    the writer flushes it; the composer's flag input suggests known names (tagged
+    'in rules') and its value input suggests both rule-named and observed values,
+    picked by keyboard and by mouse; the saved rule carries the picked value."""
+    import json as _json
+    import time as _time
+    import urllib.request as _url
+
+    key = bearer("POST", "/mgmt/keys", {"principal_name": "sugg-renderer", "role": "renderer",
+                                        "project_id": "support", "environment_id": "prod"})["key"]
+    req = _url.Request(server + "/prompt/support/system", method="POST",
+                       data=_json.dumps({"environment": "prod", "flags": {"tier": "gold"},
+                                         "variables": {"customer_name": "Acme", "history": []}}).encode(),
+                       headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    # A freshly minted key becomes usable once the mgmt request's session commits and the
+    # auth cache reloads (its teardown can run after the response is sent) — poll briefly
+    # instead of assuming the very next request wins that race.
+    deadline = _time.time() + 10
+    while True:
+        try:
+            with _url.urlopen(req, timeout=15) as r:
+                assert r.status == 200
+            break
+        except _url.HTTPError as e:
+            if e.code != 401 or _time.time() > deadline:
+                raise
+            _time.sleep(0.2)
+    # The writer runs every 0.5 s in this harness; wait for the value to land.
+    deadline = _time.time() + 10
+    vals = []
+    while _time.time() < deadline:
+        vals = bearer("GET", "/mgmt/envs/prod/flags/tier/values")["values"]
+        if any(v["value"] == "gold" for v in vals):
+            break
+        _time.sleep(0.25)
+    else:
+        raise AssertionError(f"observed value never flushed: {vals}")
+
+    page.goto(server + "/#/p/support%2Fsystem/rules")
+    signin(page)
+    page.wait_for_selector("text=Who sees what", timeout=15000)
+    page.click("text=＋ New rule")
+    page.wait_for_selector("text=People who match", timeout=8000)
+    page.click("text=＋ add condition")
+    page.wait_for_timeout(300)
+    row = page.locator(".cb-row").last
+    flag_in = row.locator("input").first
+    flag_in.click()
+    flag_in.type("ti")
+    # Focus opens the unfiltered list; typing refilters after a short debounce — wait for
+    # the filtered list (prefix matches first) before reading or picking.
+    page.wait_for_function(
+        "() => { const v = document.querySelector('.sugg .sugg-item .v'); return v && v.textContent === 'tier'; }",
+        timeout=5000)
+    sugg = page.inner_text(".sugg")
+    assert "tier" in sugg and "in rules" in sugg, sugg
+    # Keyboard pick: down then Enter — Enter must not submit anything.
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")
+    assert flag_in.input_value() == "tier"
+    assert page.locator(".sugg").count() == 0
+
+    val_in = row.locator("input").last
+    val_in.click()
+    page.wait_for_selector(".sugg .sugg-item", timeout=5000)
+    sugg = page.inner_text(".sugg")
+    assert "gold" in sugg and "enterprise" in sugg, sugg     # traffic AND rule-named values
+    assert "seen" in sugg and "in a rule" in sugg, sugg
+    val_in.type("go")
+    page.wait_for_timeout(400)
+    assert "enterprise" not in page.inner_text(".sugg")      # filtered by the query
+    page.locator(".sugg .sugg-item", has_text="gold").first.click()   # mouse pick
+    assert val_in.input_value() == "gold"
+
+    page.fill("#co-comment", "Gold tier via suggestion")
+    page.click("text=/^Create rule$/")
+    page.wait_for_timeout(1200)
+    assert "Gold tier via suggestion" in page.inner_text("#main")
+    rules = bearer("GET", "/mgmt/envs/prod/rules?prompt_id=support%2Fsystem")["rules"]
+    mine = next(r for r in rules if r.get("comment") == "Gold tier via suggestion")
+    assert mine["when"] == {"flag": "tier", "op": "eq", "value": "gold"}, mine["when"]
+
+
 def test_playground_renders_for_session_user(server, page):
     """The Playground must work for a signed-in (cookie-session) user: the serving
     API is bearer-only, so the UI previews through the mgmt door. Guards the
