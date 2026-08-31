@@ -1,13 +1,22 @@
 name: Release
 
-# Tag vX.Y.Z → build and publish the container image to GHCR. CI (ci.yml) gates
-# main; this workflow only packages what already passed.
+# Tag vX.Y.Z → build and publish the container image to GHCR and the Python packages
+# (incant-sdk, incant-mcp) to PyPI. CI (ci.yml) gates main; this workflow only packages
+# what already passed. `workflow_dispatch` re-runs just the PyPI publish (e.g. after
+# configuring PyPI trusted publishing for an already-tagged version).
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: "Publish incant-sdk + incant-mcp to PyPI"
+        type: boolean
+        default: true
 
 jobs:
   image:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -32,3 +41,42 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  pypi:
+    if: github.event_name == 'push' || inputs.publish_pypi
+    runs-on: ubuntu-latest
+    # PyPI Trusted Publishing (OIDC): register this repo + workflow + environment as the
+    # publisher of each project on pypi.org; no long-lived token needed. A PYPI_API_TOKEN
+    # repository secret, if present, is used instead.
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      HAS_TOKEN: ${{ secrets.PYPI_API_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Versions must match the tag
+        if: github.event_name == 'push'
+        run: |
+          python3 - <<'PY'
+          import os, sys, tomllib
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          bad = [p for p in ("sdk/python/pyproject.toml", "mcp/python/pyproject.toml")
+                 if tomllib.load(open(p, "rb"))["project"]["version"] != tag]
+          sys.exit(f"version != {tag} in: {bad}" if bad else 0)
+          PY
+      - name: Build
+        run: |
+          uv build --package incant-sdk -o dist
+          uv build --package incant-mcp -o dist
+          ls -la dist
+      - name: Publish (token)
+        if: env.HAS_TOKEN == 'true'
+        run: uv publish dist/*
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Publish (trusted publishing)
+        if: env.HAS_TOKEN != 'true'
+        run: uv publish --trusted-publishing always dist/*

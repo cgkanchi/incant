@@ -10,6 +10,11 @@ dependencies = [
     "mcp>=1.2",
 ]
 
+[project.urls]
+Homepage = "https://github.com/cgkanchi/incant"
+Repository = "https://github.com/cgkanchi/incant"
+Changelog = "https://github.com/cgkanchi/incant/blob/main/CHANGELOG.md"
+
 [project.scripts]
 incant-mcp = "incant_mcp.server:main"
 

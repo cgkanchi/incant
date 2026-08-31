@@ -1,6 +1,6 @@
 # incant-sdk
 
-Python client for [Incant](../../README.md) — render prompts through targeting,
+Python client for [Incant](https://github.com/cgkanchi/incant/blob/main/README.md) — render prompts through targeting,
 discover what to pass, and reproduce any render exactly.
 
 ```bash

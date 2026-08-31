@@ -1,6 +1,6 @@
 # incant-mcp
 
-MCP server for [Incant](../../README.md) — lets AI agents author, test, review,
+MCP server for [Incant](https://github.com/cgkanchi/incant/blob/main/README.md) — lets AI agents author, test, review,
 publish, and target prompts, doing everything the console can (minus deployment
 administration) within the configured API key's roles.
 
@@ -48,7 +48,7 @@ skills instruct agents to relay that confirmation to a human first.
 
 ## Skills
 
-The [`skills/`](../../skills) directory pairs this server with agent skills —
+The [`skills/`](https://github.com/cgkanchi/incant/tree/main/skills) directory pairs this server with agent skills —
 `incant-authoring` (draft → test → review → commit) and `incant-release`
 (publish → target → roll out → roll back) — that encode the workflows and
 guardrails. Install by copying into your agent's skills directory (e.g.
