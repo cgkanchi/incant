@@ -419,6 +419,35 @@ possible. Nodes hold rule snapshots in memory; a 2s control-plane poll propagate
 bumps (see Divergences: LISTEN/NOTIFY is deliberately unbuilt). Target: any
 targeting change — including "make live" — serves everywhere in **< 2 s**.
 
+### Observed flags
+
+The composer's typeahead. Every serving-API request already says "give me the prompt
+for THESE flags", so the server records the `(environment, flag, value)` triples it
+sees — no SDK protocol, every client in every language, and the *server's* truth about
+what arrives, including flags no rule consults yet. Three layers keep it honest:
+
+- **Request path** — a lock-free dict check per flag; a value not seen within the
+  dedupe window (`INCANT_OBSERVED_FLAGS_DEDUPE_SECONDS`) takes a lock, is marked, and
+  is queued. Never a DB write (§8): the queue is bounded and drops when full. Scalars
+  only, ≤ 128 chars, `INCANT_OBSERVED_FLAGS_EXCLUDE` names never recorded. Only the
+  serving API observes — mgmt previews are test traffic.
+- **Writer** — a background loop on the full node drains the queue every few seconds
+  into one upsert whose `last_seen` refresh is guarded (`WHERE last_seen < EXCLUDED -
+  1 h`), so many processes re-observing one value never churn dead tuples. A failed
+  flush un-marks the batch; the next request re-queues it.
+- **Census** — hourly: values unseen for `INCANT_OBSERVED_FLAGS_TTL_DAYS` are pruned;
+  any flag with more than `INCANT_OBSERVED_FLAGS_VALUE_CAP` distinct values is
+  **suppressed** — purged, dropped at the source, shown as "not suggested". The
+  observer also trips this locally mid-hour, so `user_id`-class flags can never fill
+  the table. Suppressions survive the TTL; an operator's *forget* clears them.
+
+Storage is `observed_flags(env, flag, value, value_type, first_seen, last_seen)` with a
+`pg_trgm` GIN index for infix search; the typeahead ranks prefix matches, then trigram
+similarity, then recency, and merges the values active rules already name. Values
+travel typed so a clause carries `42`, not `"42"`. Suggestions only: nothing about what
+serves depends on this table. Serve replicas run no observer (no write path) — v1
+records what the full node serves.
+
 ---
 
 ## 8. Rendering & performance
@@ -616,7 +645,8 @@ queue with comments on source or rendered output. A "tweak flow" affordance walk
 canonical loop: edit → commit → target to cohort → expand → make live.
 
 **Target & operate.** Per environment: rule list (global + per-prompt,
-reorderable), segment editor, rollout weights writing live, kill switches, live
+reorderable), segment editor — flag names and observed values suggested as you type
+(§7) — rollout weights writing live, kill switches, live
 pointers per prompt/version with advance/revert controls, the per-version pointer
 timeline (who made what live, when, why — the blame view), rendered old→new diffs,
 approval queue (protected envs), targeting history with one-click rollback. Controls
@@ -655,6 +685,9 @@ GET/POST /mgmt/envs/{env}/pointers             # make-live / revert (bulk-capabl
 POST /mgmt/envs/{env}/publish                  # pointer advance + default + rule archive, atomically
 POST /mgmt/envs/{env}/defaults                 # set default versions
 GET  /mgmt/envs/{env}/revisions                POST /mgmt/envs/{env}/rollback
+GET  /mgmt/envs/{env}/flags                    # observed + rule-consulted flag names (§7)
+GET  /mgmt/envs/{env}/flags/{flag}/values?q=   # typeahead: typed values, prefix → similarity → recency
+DELETE /mgmt/envs/{env}/flags/{flag}           # forget (operator): values + suppression
 
 # admin
 POST/PATCH /mgmt/projects[/{id}]               POST/PATCH/DELETE /mgmt/envs[/{env}]   POST /mgmt/envs/{env}/rename
@@ -753,6 +786,8 @@ segments(id, environment_id, name, clauses, version)
 rules(id, environment_id, scope, prompt_id?, priority, clauses, serve, status, comment)
 rule_revisions(environment_id, rule_id?, kind, rules_version, snapshot, state?, actor, at, comment)
                                                 -- state = full checkpoint every Kth revision (§7)
+observed_flags(environment_id, flag, value, value_type, first_seen, last_seen)   -- §7; gin_trgm on value
+observed_flag_suppressions(environment_id, flag, values_seen, suppressed_at)   -- high-cardinality flags
 remotes(id, url, auth_ref, enabled, last_pushed_sha, last_push_at)
 principals(id, kind, subject, name)
 users(principal_id, email, name, password_hash, status, invite_token_hash, invite_expires_at, last_login_at)
@@ -785,6 +820,9 @@ audit_log(actor, action, object_type, object_id, before, after, at)
 - Backup: `incant_backup_lag_seconds{remote}` (remote id, not URL — URLs may embed
   credentials) · `incant_backup_queue_depth` — bounds the content-durability
   exposure window.
+- Observed flags: `incant_observed_flags_total{outcome}` (`written` · `deduped` ·
+  `dropped` · `ignored` — a healthy node is almost all `deduped`; `dropped` means the
+  queue is full) · `incant_observed_flags_suppressed` (flags purged as high-cardinality).
 - Render-path structured logs carry the full version tuple, joinable to LLM traffic.
 
 ---

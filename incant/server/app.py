@@ -37,6 +37,10 @@ from ..registry import (
     sweep_expired_sessions,
 )
 from ..service import get_app
+from ..targeting.observed import (
+    flush_observations, load_suppressions, prune_and_census, record_suppressions,
+)
+from . import metrics
 from .auth import AuthError, _IMPLIES, ensure_bootstrap_admin
 from .deps import get_session
 from .mgmt import router as mgmt_router
@@ -161,18 +165,81 @@ async def _warm_retry_loop(app: FastAPI, ctx) -> None:
             log.exception("background readiness retry errored")
 
 
-async def _session_sweep_loop() -> None:
-    """Full mode: sweep expired browser sessions hourly so a long-running node doesn't
-    accumulate dead rows (the boot sweep only runs once). Logs only when it deletes."""
+async def _session_sweep_loop(ctx) -> None:
+    """Full mode, hourly: sweep expired browser sessions, and run the §7 observed-flags
+    census (TTL prune + high-cardinality suppression), reloading the observer's
+    suppressed set from DB truth. The boot sweep only runs once; this keeps a
+    long-running node from accumulating dead rows. Logs only when it changes something."""
     while True:
         await asyncio.sleep(_SESSION_SWEEP_SECONDS)
         try:
             def _pass() -> None:
                 with session_scope() as s:
                     sweep_expired_sessions(s)
+                settings = get_settings()
+                if settings.observe_flags:
+                    with session_scope() as s:
+                        res = prune_and_census(
+                            s, ttl_days=settings.observed_flags_ttl_days,
+                            value_cap=settings.observed_flags_value_cap)
+                        ctx.observer.set_suppressed(load_suppressions(s))
+                    metrics.observed_flags_suppressed.set(res.total_suppressed)
             await asyncio.to_thread(_pass)  # blocking DB work off the serving loop
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("periodic session sweep errored")
+
+
+_observed_flush_failing = False
+
+
+def _observed_flags_pass(ctx) -> int:
+    """One writer pass (run via to_thread): drain the observer's queue into one upsert,
+    persist any suppressions the observer tripped since the last pass, evict expired
+    marks, publish the §14 counters. A failed flush un-marks the batch so the next
+    request re-queues it; the failure is logged once until a pass succeeds again.
+    Returns rows written."""
+    global _observed_flush_failing
+    obs = ctx.observer.drain()
+    tripped = ctx.observer.take_new_suppressions()
+    written = 0
+    try:
+        if obs or tripped:
+            with session_scope() as s:
+                written = flush_observations(s, obs)
+                if tripped:
+                    record_suppressions(s, tripped, get_settings().observed_flags_value_cap)
+        if _observed_flush_failing:
+            log.info("observed flags: flush recovered")
+            _observed_flush_failing = False
+    except Exception as exc:
+        ctx.observer.unmark(obs)
+        if not _observed_flush_failing:
+            log.warning("observed flags: flush failed (%s: %s); will retry — "
+                        "observations are re-queued on the next request",
+                        type(exc).__name__, exc)
+            _observed_flush_failing = True
+        return 0
+    ctx.observer.sweep()
+    st = ctx.observer.stats
+    metrics.observed_flags_total.labels("written").inc(written)
+    metrics.observed_flags_total.labels("deduped").inc(st.deduped)
+    metrics.observed_flags_total.labels("dropped").inc(st.dropped)
+    metrics.observed_flags_total.labels("ignored").inc(st.ignored)
+    st.deduped = st.dropped = st.ignored = st.queued = 0
+    return written
+
+
+async def _observed_flags_loop(ctx) -> None:
+    """Full mode: the §7 observed-flags writer — every INCANT_OBSERVED_FLAGS_FLUSH_SECONDS,
+    move what the request path queued into Postgres. The request path itself never
+    writes; this loop is the only place observations touch the DB."""
+    interval = get_settings().observed_flags_flush_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(_observed_flags_pass, ctx)
+        except Exception:  # pragma: no cover - defensive; keep the loop alive
+            log.exception("observed flags writer pass errored")
 
 
 async def _reconcile_loop(ctx) -> None:
@@ -341,6 +408,11 @@ async def lifespan(app: FastAPI):
             reconcile_drafts(s, ctx.git)
             sweep_expired_sessions(s)
             ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
+            # §7 observed flags: the observer must know which flags are suppressed
+            # BEFORE the first request, or a suppressed user_id-class flag would
+            # re-accumulate up to the cap after every restart.
+            if settings.observe_flags:
+                ctx.observer.set_suppressed(load_suppressions(s))
 
     # Readiness (both modes) requires warming EVERY environment (content + snapshot) AND
     # priming the auth cache — so "ready" honestly means "can serve + authenticate with
@@ -358,12 +430,14 @@ async def lifespan(app: FastAPI):
     # Hourly expired-session sweep + periodic main-commit drift check + backup pushes
     # (full mode only — serve replicas have no sessions, never own the canonical main,
     # and never push). Serve replicas instead FOLLOW a backup remote for content.
-    sweep_task = reconcile_task = backup_task = fetch_task = None
+    sweep_task = reconcile_task = backup_task = fetch_task = observed_task = None
     if settings.mode == "full":
-        sweep_task = asyncio.create_task(_session_sweep_loop())
+        sweep_task = asyncio.create_task(_session_sweep_loop(ctx))
         reconcile_task = asyncio.create_task(_reconcile_loop(ctx))
         if settings.backup_poll_seconds > 0:
             backup_task = asyncio.create_task(_backup_push_loop(ctx))
+        if settings.observe_flags:
+            observed_task = asyncio.create_task(_observed_flags_loop(ctx))
     elif settings.content_fetch_seconds > 0:
         fetch_task = asyncio.create_task(_content_fetch_loop(app, ctx))
 
@@ -378,7 +452,7 @@ async def lifespan(app: FastAPI):
         # backup push, a reconcile sweep) finishes its cancellation cleanly instead
         # of dying mid-await when the loop is torn down.
         tasks = [t for t in (retry_task, sweep_task, reconcile_task, backup_task,
-                             fetch_task, poll_task) if t is not None]
+                             fetch_task, observed_task, poll_task) if t is not None]
         for task in tasks:
             task.cancel()
         for task in tasks:

@@ -124,11 +124,22 @@ def test_everything_present_returns_head():
     """A schema matching the current models (e.g. create_all) → stamp head, upgrade
     no-ops. This is the only state the old blanket stamp-head handled correctly."""
     ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
-    insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users"],
+    insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users", "observed_flags"],
                          unique_constraints=ucs,
                          columns={"rule_revisions": [{"name": "state"}],
                                   "reviews": [{"name": "reviewer_principal_id"}]})
     assert _adoption_revision(insp) == "head"
+
+
+def test_principal_identity_present_but_observed_flags_missing_adopts_at_e9a1():
+    """Principal-id columns present but no ``observed_flags`` table → f2a7c9d41e58
+    hasn't run; adopt at e9a1c4f27b63 so the observed-flags migration applies."""
+    ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
+    insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users"],
+                         unique_constraints=ucs,
+                         columns={"rule_revisions": [{"name": "state"}],
+                                  "reviews": [{"name": "reviewer_principal_id"}]})
+    assert _adoption_revision(insp) == "e9a1c4f27b63"
 
 
 def test_users_present_but_principal_review_identity_adopts_at_d7f3():
@@ -161,7 +172,7 @@ def test_prefix_uniqueness_detected_via_unique_index():
 def test_review_uniqueness_detected_via_unique_index():
     ucs = _prefix_unique_via_constraint()
     insp = FakeInspector(
-        tables=_CORE_TABLES + ["sessions", "users"],
+        tables=_CORE_TABLES + ["sessions", "users", "observed_flags"],
         unique_constraints=ucs,
         indexes={"reviews": [{"name": "some_unique_ix",
                               "column_names": ["draft_id", "reviewer"], "unique": True}]},
@@ -238,7 +249,11 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         insp = inspect(db.engine())
         with db.engine().connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "e9a1c4f27b63"
+        assert version == "f2a7c9d41e58"
+        assert "observed_flags" in insp.get_table_names()
+        assert "observed_flag_suppressions" in insp.get_table_names()
+        assert {ix["name"] for ix in insp.get_indexes("observed_flags")} >= {
+            "ix_observed_flags_value_trgm", "ix_observed_flags_last_seen"}
         assert _has_unique_columns(insp, "api_keys", ["prefix"])
         assert _has_unique_columns(
             insp, "reviews", ["draft_id", "reviewer_principal_id"]

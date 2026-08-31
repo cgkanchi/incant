@@ -109,8 +109,18 @@ class AppContext:
         # Lazy import avoids an import cycle (server.auth -> ... -> service).
         from .server.auth import AuthCache
         from .server.throttle import AuthThrottler
+        from .targeting.observed import FlagObserver
         self.auth = AuthCache(ttl=self.settings.auth_ttl)
         self.throttle = AuthThrottler()
+        # §7 observed flags: request-path recorder (dict check + bounded queue, never a
+        # DB write). Full mode only — serve replicas have no write path (v1).
+        self.observer = FlagObserver(
+            enabled=self.settings.observe_flags and self.settings.mode == "full",
+            dedupe_seconds=self.settings.observed_flags_dedupe_seconds,
+            max_pending=self.settings.observed_flags_max_pending,
+            value_cap=self.settings.observed_flags_value_cap,
+            exclude=self.settings.observed_flags_exclude_set(),
+        )
 
     # ── auth (in-memory; survives DB outages) ─────────────────────────
 

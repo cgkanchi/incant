@@ -134,6 +134,17 @@ as `pin` to replay: `pin.versions` replays exact content (only validated SHAs �
 can never surface draft or validation-failed content), `pin.rules_version` replays the
 recorded targeting state of that moment (DESIGN.md §9 for the precise semantics).
 
+### Observed flags
+
+The targeting composer suggests flag names and values as you type. Suggestions come
+from the serving API itself — every render already carries the caller's flags, so the
+full node records `(environment, flag, value, last_seen)` triples in memory and flushes
+them to Postgres off the request path. No SDK change, works for every client. Values
+unseen for 30 days age out; a flag with more than 50 000 distinct values (`user_id`,
+emails) is suppressed rather than stored. Suggestions only — nothing about what serves
+depends on them. Tune with `INCANT_OBSERVE_FLAGS`, `INCANT_OBSERVED_FLAGS_EXCLUDE`, and
+the caps below; `DELETE /mgmt/envs/{env}/flags/{flag}` forgets a flag.
+
 ## Backups and replicas
 
 The canonical repo's off-site durability is **backup remotes** (DESIGN.md §6): register
@@ -220,6 +231,13 @@ Chrome/Chromium binary if yours lives elsewhere.
 | `INCANT_AUTH_THROTTLE_LIMIT` | `20` | failed bearer auths per IP per window before `429`; `0` disables |
 | `INCANT_AUTH_THROTTLE_WINDOW` | `60.0` | sliding window (s) for the failed-auth throttle |
 | `INCANT_TRUSTED_PROXIES` | *(empty)* | comma-separated proxy IPs whose `X-Forwarded-For` is trusted for the client IP; empty ⇒ never trust XFF (use the direct peer) |
+| `INCANT_OBSERVE_FLAGS` | `true` | record flag values seen on the serving API for the composer's typeahead (full mode) |
+| `INCANT_OBSERVED_FLAGS_EXCLUDE` | *(empty)* | comma-separated flag names never recorded |
+| `INCANT_OBSERVED_FLAGS_DEDUPE_SECONDS` | `900.0` | per-process "seen recently" window — a value is queued at most once per window |
+| `INCANT_OBSERVED_FLAGS_FLUSH_SECONDS` | `5.0` | writer interval (queue → Postgres, off the request path) |
+| `INCANT_OBSERVED_FLAGS_MAX_PENDING` | `100000` | queue bound; drops (never blocks) when full |
+| `INCANT_OBSERVED_FLAGS_VALUE_CAP` | `50000` | distinct values per (env, flag) before the flag is suppressed as high-cardinality |
+| `INCANT_OBSERVED_FLAGS_TTL_DAYS` | `30` | values unseen this long are pruned (hourly) |
 
 ## Deploying
 

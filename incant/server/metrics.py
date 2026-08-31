@@ -64,6 +64,19 @@ backup_lag_seconds = Gauge(
     ["remote"],
 )
 
+# Observed flags (§7): request-path observations by outcome. `written` = rows inserted
+# or refreshed by the writer; `deduped` = seen within the window (no queue, no write);
+# `dropped` = queue full (Postgres down or a flood); `ignored` = non-scalar/too long/
+# excluded/suppressed. A healthy node is almost all `deduped`.
+observed_flags_total = Counter(
+    "incant_observed_flags_total", "Flag values observed on the serving API, by outcome",
+    ["outcome"],
+)
+observed_flags_suppressed = Gauge(
+    "incant_observed_flags_suppressed",
+    "Flags suppressed as high-cardinality (values purged, not suggested)",
+)
+
 # Governance drift (DESIGN.md §3 "git owns content, the DB owns state"; §5 "Validation
 # first"). `reconcile_main_commits` compares the git `main` tree against the DB control
 # plane; it runs at boot and then on INCANT_RECONCILE_INTERVAL_SECONDS. These gauges

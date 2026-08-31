@@ -10,11 +10,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..core.model import (
-    All, Any_, Clause, Condition, Not, SegmentRef, ServeLabel, ServeRollout,
-    ServeVersion,
-)
+from ..core.model import ServeLabel, ServeRollout, ServeVersion
 from ..service import AppContext, ServingError
+from ..targeting.observed import collect_rule_flags, typed_value
 from . import metrics
 from .auth import AuthError, Identity
 from .deps import app_context, get_readonly_session, serving_identity
@@ -102,6 +100,7 @@ def evaluate_prompt(
         res = app.evaluate(session, env, prompt_id, req.flags)
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
+    app.observer.observe(env, req.flags)  # §7 observed flags (memory only)
     return {
         "prompt_id": prompt_id, "version": res.version, "commit": res.commit,
         "label": res.label, "matched_rule": (
@@ -109,27 +108,6 @@ def evaluate_prompt(
             else {"scope": res.match_scope, "id": res.rule_id}
         ), "environment": env,
     }
-
-
-def _collect_flags(cond: Condition, segments: dict, out: dict[str, set]) -> None:
-    """Walk a condition tree collecting flag names + their enumerable values
-    (scalars from any clause), following segment references."""
-    if cond is None:
-        return
-    if isinstance(cond, Clause):
-        vals = out.setdefault(cond.flag, set())
-        for v in (cond.value, *cond.values):
-            if isinstance(v, (str, int, float, bool)):
-                vals.add(v)
-    elif isinstance(cond, (All, Any_)):
-        for c in cond.of:
-            _collect_flags(c, segments, out)
-    elif isinstance(cond, Not):
-        _collect_flags(cond.of, segments, out)
-    elif isinstance(cond, SegmentRef):
-        seg = segments.get(cond.name)
-        if seg is not None:
-            _collect_flags(seg.condition, segments, out)
 
 
 @router.get("/prompt/{prompt_id:path}/spec", summary="What to pass to render this prompt")
@@ -164,9 +142,8 @@ def prompt_spec(
     candidates: set[int] = set()
     if default_v is not None:
         candidates.add(default_v)
-    flags: dict[str, set] = {}
+    flags: dict[str, set] = collect_rule_flags(snap, rules)
     for r in rules:
-        _collect_flags(r.when, snap.segments, flags)
         serve = r.serve
         if isinstance(serve, ServeVersion):
             candidates.add(serve.version)
@@ -175,7 +152,6 @@ def prompt_spec(
             if v is not None:
                 candidates.add(v)
         elif isinstance(serve, ServeRollout):
-            flags.setdefault(serve.bucket_by, set())
             for band in serve.weights:
                 if band.version is not None:
                     candidates.add(band.version)
@@ -200,17 +176,35 @@ def prompt_spec(
                 if not row.get(k) and var.get(k):
                     row[k] = var[k]
 
+    # §7 observed flags: values real traffic has sent for the flags these rules consult
+    # (top 25 by recency) — so a caller can see `plan in [pro, team]` from real values.
+    # Renderer keys pushed these values in the first place; same environment scope.
+    flags_out = []
+    for name, vals in sorted(flags.items()):
+        suppressed = app.observer.is_suppressed(env, name) or session.get(
+            models.ObservedFlagSuppression, (env, name)) is not None
+        observed: list = []
+        if not suppressed:
+            rows = session.execute(
+                select(models.ObservedFlag.value, models.ObservedFlag.value_type)
+                .where(models.ObservedFlag.environment_id == env, models.ObservedFlag.flag == name)
+                .order_by(models.ObservedFlag.last_seen.desc()).limit(25)
+            ).all()
+            observed = [typed_value(v, t) for v, t in rows]
+        merged_vals = set(vals) | set(observed)
+        flags_out.append({
+            "name": name,
+            "values": sorted(merged_vals, key=lambda v: (type(v).__name__, str(v))),
+            "observed": bool(observed),
+            "suppressed": suppressed,
+        })
     return {
         "prompt_id": prompt_id,
         "environment": env,
         "default_version": default_v,
         "resolvable_versions": sorted(candidates),
         "variables": sorted(merged.values(), key=lambda r: r["name"]),
-        "flags": [
-            {"name": name,
-             "values": sorted(vals, key=lambda v: (type(v).__name__, str(v)))}
-            for name, vals in sorted(flags.items())
-        ],
+        "flags": flags_out,
         "includes": _includes_of(app, prompt_id, default_v) if default_v else [],
     }
 
@@ -239,6 +233,7 @@ def render_prompt(
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail={"detail": exc.detail, **exc.extra})
     metrics.render_seconds.observe(time.perf_counter() - start)
+    app.observer.observe(env, req.flags)  # §7 observed flags (memory only, never a DB write)
     metrics.renders_total.labels(prompt_id, env, str(resp["stale_rules"]).lower()).inc()
     if resp["content_fallback"]:
         metrics.content_fallbacks_total.labels(prompt_id, env).inc()
@@ -268,6 +263,7 @@ def evaluate_all(
         results = app.evaluate_all(session, env, req.flags)
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
+    app.observer.observe(env, req.flags)  # §7 observed flags (memory only)
     out = {}
     for pid, res in results.items():
         if not ident.has("renderer", project=_project_of(pid), environment=env):

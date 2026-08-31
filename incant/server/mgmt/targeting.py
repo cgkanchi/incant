@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ... import models
 from ...targeting import TargetingError
+from ...targeting.audit import record_audit
+from ...targeting.observed import (
+    all_rules, collect_rule_flags, forget_flag, load_suppressions, typed_value,
+)
 from ..auth import Identity
 from ..deps import app_context, get_session, identity
 from ...service import AppContext
@@ -518,3 +522,142 @@ def kill_switch(
     tgt.set_kill(env, prompt_id, req.engaged)
     app.invalidate_after_commit(session, env)
     return {"ok": True, "engaged": req.engaged}
+
+
+# ── §7 observed flags: the composer's typeahead ──────────────────────
+
+def _env_or_404(session: Session, env: str) -> models.Environment:
+    e = session.get(models.Environment, env)
+    if e is None:
+        raise HTTPException(404, f"unknown environment {env!r}")
+    return e
+
+
+def _ilike_escape(q: str) -> str:
+    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@router.get("/envs/{env}/flags")
+def list_observed_flags(
+    env: str,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    """Every flag known in this environment: names seen on the serving API (with distinct
+    value counts and recency), names the active rules consult (`in_rules`), and flags
+    suppressed as high-cardinality (`suppressed`, never suggested). Viewer-gated."""
+    _require(ident, "viewer", environment=env)
+    _env_or_404(session, env)
+    observed = {
+        flag: (int(n), last)
+        for flag, n, last in session.execute(
+            select(models.ObservedFlag.flag, func.count(), func.max(models.ObservedFlag.last_seen))
+            .where(models.ObservedFlag.environment_id == env)
+            .group_by(models.ObservedFlag.flag)
+        ).all()
+    }
+    suppressed = {
+        r.flag: r for r in session.execute(
+            select(models.ObservedFlagSuppression)
+            .where(models.ObservedFlagSuppression.environment_id == env)
+        ).scalars()
+    }
+    try:
+        snap = app.get_snapshot(session, env)
+        in_rules = set(collect_rule_flags(snap, all_rules(snap)))
+    except Exception:  # a degraded environment still lists what traffic saw
+        in_rules = set()
+    names = sorted(set(observed) | set(suppressed) | in_rules)
+    out = []
+    for name in names:
+        n, last = observed.get(name, (0, None))
+        sup = suppressed.get(name)
+        out.append({
+            "name": name,
+            "values_seen": sup.values_seen if sup else n,
+            "last_seen": last.isoformat() if last else None,
+            "in_rules": name in in_rules,
+            "suppressed": sup is not None,
+        })
+    return {"environment": env, "flags": out}
+
+
+@router.get("/envs/{env}/flags/{flag}/values")
+def observed_flag_values(
+    env: str, flag: str,
+    q: str = Query("", max_length=128),
+    limit: int = Query(25, ge=1, le=100),
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    """Typeahead: values seen for `flag` matching `q` (infix, case-insensitive), prefix
+    matches first, then trigram similarity, then recency; empty `q` = most recent.
+    Values the active rules already name are merged in (`sources` says which). Values
+    come back typed (`value_type`) so a clause can carry them faithfully."""
+    _require(ident, "viewer", environment=env)
+    _env_or_404(session, env)
+    sup = session.get(models.ObservedFlagSuppression, (env, flag))
+    if sup is not None:
+        return {"environment": env, "flag": flag, "q": q, "values": [],
+                "suppressed": True, "values_seen": sup.values_seen}
+    col = models.ObservedFlag.value
+    stmt = select(col, models.ObservedFlag.value_type, models.ObservedFlag.last_seen).where(
+        models.ObservedFlag.environment_id == env, models.ObservedFlag.flag == flag)
+    q = q.strip()
+    if q:
+        esc = _ilike_escape(q)
+        stmt = stmt.where(col.ilike(f"%{esc}%", escape="\\")).order_by(
+            col.ilike(f"{esc}%", escape="\\").desc(),
+            func.similarity(col, q).desc(),
+            models.ObservedFlag.last_seen.desc(),
+        )
+    else:
+        stmt = stmt.order_by(models.ObservedFlag.last_seen.desc())
+    rows = session.execute(stmt.limit(limit)).all()
+    values = [
+        {"value": typed_value(v, t), "value_type": t, "last_seen": last.isoformat(),
+         "sources": ["traffic"]}
+        for v, t, last in rows
+    ]
+    # Rule-named values for this flag (the zero-traffic baseline), merged by value.
+    try:
+        snap = app.get_snapshot(session, env)
+        rule_vals = collect_rule_flags(snap, all_rules(snap)).get(flag, set())
+    except Exception:
+        rule_vals = set()
+    by_value = {(r["value_type"], str(r["value"])): r for r in values}
+    for rv in rule_vals:
+        if q and q.lower() not in str(rv).lower():
+            continue
+        vt = ("bool" if isinstance(rv, bool) else "int" if isinstance(rv, int)
+              else "float" if isinstance(rv, float) else "str")
+        key = (vt, "true" if rv is True else "false" if rv is False else str(rv))
+        if key in by_value:
+            by_value[key]["sources"].append("rules")
+        else:
+            row = {"value": rv, "value_type": vt, "last_seen": None, "sources": ["rules"]}
+            values.append(row)
+            by_value[key] = row
+    return {"environment": env, "flag": flag, "q": q, "values": values[:limit],
+            "suppressed": False}
+
+
+@router.delete("/envs/{env}/flags/{flag}")
+def forget_observed_flag(
+    env: str, flag: str,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_session),
+    ident: Identity = Depends(identity),
+):
+    """Operator reset: drop everything observed for `flag` here, including a
+    high-cardinality suppression, so it can be suggested again. Audited."""
+    _require(ident, "operator", environment=env)
+    _env_or_404(session, env)
+    removed = forget_flag(session, env, flag)
+    record_audit(session, ident.name, "observed_flag.forget", "observed_flag", f"{env}/{flag}",
+                 before={"values_removed": removed})
+    session.flush()
+    app.observer.set_suppressed(load_suppressions(session))
+    return {"ok": True, "environment": env, "flag": flag, "values_removed": removed}

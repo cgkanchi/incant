@@ -118,6 +118,17 @@ class Settings(BaseSettings):
     # off the hot path. Storage: O(N/K) states instead of O(N).
     revision_checkpoint_interval: int = Field(default=20, ge=1)
 
+    # Observed flags (§7): flag/value pairs seen on the serving API feed the targeting
+    # composer's typeahead. The request path does a dict check + a bounded queue put —
+    # never a DB write; a background writer on the full node flushes the queue.
+    observe_flags: bool = True
+    observed_flags_exclude: str = ""                                     # comma-separated names never recorded
+    observed_flags_dedupe_seconds: float = Field(default=900.0, gt=0)     # per-process "seen recently" window
+    observed_flags_flush_seconds: float = Field(default=5.0, gt=0)
+    observed_flags_max_pending: int = Field(default=100_000, ge=1_000)    # queue bound (drops when full)
+    observed_flags_value_cap: int = Field(default=50_000, ge=100)         # distinct values per (env, flag) before suppression
+    observed_flags_ttl_days: int = Field(default=30, ge=1)
+
     # Failed-auth throttling: per-client-IP sliding window over FAILED bearer auths.
     # After `limit` failures within `window` seconds, that IP gets 429 (Retry-After)
     # until the window drains. Successful auth is never throttled. limit=0 disables.
@@ -151,6 +162,9 @@ class Settings(BaseSettings):
 
     def trusted_proxy_set(self) -> set[str]:
         return {p.strip() for p in self.trusted_proxies.split(",") if p.strip()}
+
+    def observed_flags_exclude_set(self) -> set[str]:
+        return {f.strip() for f in self.observed_flags_exclude.split(",") if f.strip()}
 
     def repo_dir(self) -> Path:
         return Path(self.repo_path).resolve()

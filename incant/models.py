@@ -9,15 +9,18 @@ import datetime as dt
 from typing import Any, Optional
 
 from sqlalchemy import (
+    DDL,
     JSON,
     Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -395,3 +398,44 @@ class AuditLog(Base):
     before: Mapped[Any] = mapped_column(JSON, nullable=True)
     after: Mapped[Any] = mapped_column(JSON, nullable=True)
     at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+
+
+class ObservedFlag(Base):
+    """§7 observed flags: (environment, flag, value) triples seen on the serving API —
+    the targeting composer's typeahead. Scalars only, length-capped, excluded names
+    never recorded, high-cardinality flags suppressed (see ObservedFlagSuppression).
+    Suggestions only: nothing about what serves depends on this table."""
+
+    __tablename__ = "observed_flags"
+    __table_args__ = (
+        # Infix search (`value ILIKE '%q%'`) + similarity ranking for the typeahead.
+        Index("ix_observed_flags_value_trgm", "value",
+              postgresql_using="gin", postgresql_ops={"value": "gin_trgm_ops"}),
+        Index("ix_observed_flags_last_seen", "last_seen"),
+    )
+    environment_id: Mapped[str] = mapped_column(
+        ForeignKey("environments.id", ondelete="CASCADE"), primary_key=True)
+    flag: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String, primary_key=True)
+    value_type: Mapped[str] = mapped_column(String)                     # str | int | float | bool
+    first_seen: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    last_seen: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+# The trigram index needs pg_trgm. The migration creates the extension explicitly; this
+# hook does the same for create_all'd databases (tests, dev) so the two paths agree.
+event.listen(ObservedFlag.__table__, "before_create",
+             DDL("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+
+
+class ObservedFlagSuppression(Base):
+    """A flag whose distinct observed values exceeded the cap (user ids, emails): its
+    values are purged, further observations are dropped, and the composer shows it as
+    not suggested. Exempt from the TTL prune — cleared only by an operator's forget."""
+
+    __tablename__ = "observed_flag_suppressions"
+    environment_id: Mapped[str] = mapped_column(
+        ForeignKey("environments.id", ondelete="CASCADE"), primary_key=True)
+    flag: Mapped[str] = mapped_column(String, primary_key=True)
+    values_seen: Mapped[int] = mapped_column(Integer)
+    suppressed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
