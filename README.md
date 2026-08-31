@@ -72,6 +72,31 @@ curl -s localhost:8080/prompt/support/system \
 
 ```
 incant/
+Discovery for the same credential: `GET /prompts?environment=…` lists what the key can
+render (ids, descriptions, versions, defaults, labels — renderer-scoped), and
+`GET /prompt/{id}/spec` says what to pass — variables merged across the versions
+targeting can currently serve, plus the flags active rules consult.
+
+Or use the Python SDK ([`sdk/python`](sdk/python/README.md)):
+
+```python
+from incant_sdk import Incant
+
+client = Incant()   # INCANT_URL, INCANT_API_KEY, INCANT_ENVIRONMENT
+r = client.render("support/system", flags={"user_id": "u_12"},
+                  variables={"customer_name": "Acme", "history": []})
+r.text     # the rendered prompt
+r.pin      # log it beside the LLM call; pass back to replay this render exactly
+
+client.prompts()                   # what this key can render
+client.prompt("support/system")    # variables to pass + flags targeting consults
+```
+
+AI agents get the same reach through the MCP server ([`mcp/python`](mcp/python/README.md)) —
+curated tools for authoring, testing, publishing, and targeting under the API
+key's roles — paired with the agent skills in [`skills/`](skills) that encode
+the workflows and guardrails (`incant-authoring`, `incant-release`).
+
 ├── core/        # pure library: evaluator, sandboxed renderer, variable inference,
 │                #   include resolution — no I/O, exhaustively unit-tested
 ├── gitstore/    # canonical bare repo (git plumbing), commit + validation pipeline,

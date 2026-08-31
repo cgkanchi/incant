@@ -16,6 +16,10 @@ RUN useradd --create-home --uid 10001 incant \
     && mkdir -p /var/lib/incant/repo /var/lib/incant/cache \
     && chown -R incant:incant /var/lib/incant
 
+# Workspace members must be present for uv to load the workspace, even though
+# --no-dev leaves them uninstalled (they are dev-group deps for the test suites).
+COPY sdk/python/pyproject.toml sdk/python/
+COPY mcp/python/pyproject.toml mcp/python/
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project   # deps layer, cached across code changes

@@ -23,6 +23,8 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "httpx>=0.27",
+    "incant-sdk",   # workspace member (sdk/python) — tests/test_sdk.py drives it
+    "incant-mcp",   # workspace member (mcp/python) — tests/test_mcp.py drives it
 ]
 # Opt-in browser end-to-end suite (tests/browser). Not installed by default: run with
 # `uv run --group browser ...`. Drives the real UI with Playwright's sync API (no
@@ -54,3 +56,10 @@ filterwarnings = [
     # UserWarning category) until an upgrade path actually exists.
     "ignore:Using `httpx` with `starlette.testclient` is deprecated:UserWarning",
 ]
+
+[tool.uv.workspace]
+members = ["sdk/python", "mcp/python"]
+
+[tool.uv.sources]
+incant-sdk = { workspace = true }
+incant-mcp = { workspace = true }

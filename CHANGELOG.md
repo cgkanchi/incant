@@ -31,5 +31,18 @@ and publish; services render with full reproducibility (`versions` map +
 - First run: the default environment exists from boot; admin "Get set up"
   checklist; one-click example dataset on an empty library; backup-remote
   management in the UI (add/push/disable with live sync state).
+- Python SDK (`sdk/python`, `pip install incant-sdk`): sync + async clients over
+  the serving API — render with a one-attribute reproducibility `pin`, typed
+  errors, automatic retries, and discovery (`prompts()`, `prompt(id)` spec via
+  the new renderer-scoped `GET /prompt/{id}/spec`: variables merged across
+  resolvable versions, targeting flags with known values, includes). The
+  serving `GET /prompts` listing is renderer-scoped now, so production keys can
+  discover what they can render.
+- MCP server (`mcp/python`, `pip install incant-mcp`): 23 curated, task-shaped
+  tools giving agents the console's reach (minus deployment admin) under the
+  API key's roles — discovery, real-path render/evaluate, the draft lifecycle,
+  review, atomic publish, targeting, and recovery; `--read-only` mode; paired
+  agent skills in `skills/` (incant-authoring, incant-release) with plan/confirm
+  gates for protected environments.
 
 See DESIGN.md for the architecture and §17 for deliberate divergences.

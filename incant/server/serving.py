@@ -6,9 +6,14 @@ import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..core.model import (
+    All, Any_, Clause, Condition, Not, SegmentRef, ServeLabel, ServeRollout,
+    ServeVersion,
+)
 from ..service import AppContext, ServingError
 from . import metrics
 from .auth import AuthError, Identity
@@ -106,6 +111,110 @@ def evaluate_prompt(
     }
 
 
+def _collect_flags(cond: Condition, segments: dict, out: dict[str, set]) -> None:
+    """Walk a condition tree collecting flag names + their enumerable values
+    (scalars from any clause), following segment references."""
+    if cond is None:
+        return
+    if isinstance(cond, Clause):
+        vals = out.setdefault(cond.flag, set())
+        for v in (cond.value, *cond.values):
+            if isinstance(v, (str, int, float, bool)):
+                vals.add(v)
+    elif isinstance(cond, (All, Any_)):
+        for c in cond.of:
+            _collect_flags(c, segments, out)
+    elif isinstance(cond, Not):
+        _collect_flags(cond.of, segments, out)
+    elif isinstance(cond, SegmentRef):
+        seg = segments.get(cond.name)
+        if seg is not None:
+            _collect_flags(seg.condition, segments, out)
+
+
+@router.get("/prompt/{prompt_id:path}/spec", summary="What to pass to render this prompt")
+def prompt_spec(
+    prompt_id: str, environment: str | None = None,
+    app: AppContext = Depends(app_context),
+    session: Session = Depends(get_readonly_session),
+    ident: Identity = Depends(serving_identity),
+):
+    """SDK discovery: everything a caller needs to know BEFORE rendering — the
+    variables (names, types, required/optional, defaults, descriptions; merged
+    across every version targeting can currently serve) and the flags that the
+    active rules governing this prompt actually consult (with their enumerable
+    values from eq/in-style clauses, plus any rollout bucketing flag). Renderer-
+    scoped, same as render: this describes only what the credential could
+    already observe by rendering."""
+    env = _env(app, environment)
+    _require_render(ident, prompt_id, env)
+    try:
+        snap = app.get_snapshot(session, env)
+    except ServingError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+    default_v = snap.defaults.get(prompt_id)
+    known = snap.versions.get(prompt_id, {})
+    if default_v is None and not known:
+        raise HTTPException(404, f"unknown prompt {prompt_id!r} in {env!r} — it has "
+                                 "no versions and no default here")
+
+    # Versions a render could currently resolve to: the default plus anything an
+    # active rule serves (explicit version, label, or rollout band).
+    rules = snap.prompt_rules(prompt_id) + snap.global_rules()
+    candidates: set[int] = set()
+    if default_v is not None:
+        candidates.add(default_v)
+    flags: dict[str, set] = {}
+    for r in rules:
+        _collect_flags(r.when, snap.segments, flags)
+        serve = r.serve
+        if isinstance(serve, ServeVersion):
+            candidates.add(serve.version)
+        elif isinstance(serve, ServeLabel):
+            v = snap.version_for_label(prompt_id, serve.label)
+            if v is not None:
+                candidates.add(v)
+        elif isinstance(serve, ServeRollout):
+            flags.setdefault(serve.bucket_by, set())
+            for band in serve.weights:
+                if band.version is not None:
+                    candidates.add(band.version)
+                elif band.label is not None:
+                    v = snap.version_for_label(prompt_id, band.label)
+                    if v is not None:
+                        candidates.add(v)
+    candidates &= set(known)  # spec only versions that actually exist here
+
+    # Variables: the mgmt-side merge (refinements + template extraction, includes
+    # walked) per candidate version, folded by name. Required anywhere ⇒ required
+    # (over-passing is harmless; under-passing 422s for some cohort).
+    from .mgmt.helpers import _effective_variables, _includes_of
+    merged: dict[str, dict] = {}
+    for v in sorted(candidates):
+        for var in _effective_variables(app, session, prompt_id, v):
+            row = merged.setdefault(var["name"], {**var, "versions": []})
+            row["versions"].append(v)
+            row["required"] = row["required"] or var["required"]
+            row["inferred_required"] = row["inferred_required"] or var["inferred_required"]
+            for k in ("type", "default", "description"):
+                if not row.get(k) and var.get(k):
+                    row[k] = var[k]
+
+    return {
+        "prompt_id": prompt_id,
+        "environment": env,
+        "default_version": default_v,
+        "resolvable_versions": sorted(candidates),
+        "variables": sorted(merged.values(), key=lambda r: r["name"]),
+        "flags": [
+            {"name": name,
+             "values": sorted(vals, key=lambda v: (type(v).__name__, str(v)))}
+            for name, vals in sorted(flags.items())
+        ],
+        "includes": _includes_of(app, prompt_id, default_v) if default_v else [],
+    }
+
+
 @router.post("/prompt/{prompt_id:path}", summary="Render a prompt")
 def render_prompt(
     prompt_id: str, req: RenderRequest, response: Response,
@@ -183,14 +292,20 @@ def list_prompts(
         snap = app.get_snapshot(session, env)
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
+    # Renderer-scoped (not viewer): a production render key must be able to
+    # DISCOVER what it can render — this lists only ids/versions/labels of
+    # prompts the credential could already render one by one.
+    descriptions = {p.id: p.description or "" for p in
+                    session.execute(select(models.Prompt)).scalars()}
     out = []
     for pid in snap.all_prompt_ids():
-        if not ident.has("viewer", project=_project_of(pid), environment=env):
+        if not ident.has("renderer", project=_project_of(pid), environment=env):
             continue
         vers = snap.versions.get(pid, {})
         default_v = snap.defaults.get(pid)
         out.append({
             "prompt_id": pid,
+            "description": descriptions.get(pid, ""),
             "versions": sorted(vers.keys()),
             "default": default_v,
             "labels": {v.version: v.label for v in vers.values() if v.label},

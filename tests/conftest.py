@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 # Pin git commit dates so seeded test repos are byte-identical across runs.
@@ -137,3 +138,78 @@ def vinfo(version, live=None, tip=None, label=None, previous=(), status="active"
 
 def snapshot(environment="prod", rules_version=1, **kw) -> EnvSnapshot:
     return EnvSnapshot(environment=environment, rules_version=rules_version, **kw)
+
+
+# ── live-server boot (shared by the SDK and MCP suites) ──────────────────────
+
+@contextmanager
+def live_incant_server(tmp_path, db_suffix: str, admin_key: str = "incant_sk_dev_admin"):
+    """A real uvicorn subprocess over a dedicated `<db>_<suffix>` database wiped
+    and rebuilt through the real Alembic migrations, seeded with the example
+    dataset. Yields the base URL. Used by tests that must exercise the true wire
+    (incant-sdk, incant-mcp) rather than the in-process TestClient."""
+    import os
+    import socket
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+
+    u = make_url(TEST_DATABASE_URL)
+    base = (u.database or "incant").removesuffix("_test")
+    db_name = f"{base}_{db_suffix}"
+    # Same safety rail as reset_schema(): this helper DROPs the public schema.
+    if not db_name.endswith("_test"):
+        raise RuntimeError(f"Refusing to wipe {db_name!r}: live-server suites must use a '_test' database")
+    db_url = u.set(database=db_name).render_as_string(hide_password=False)
+    _ensure_pg_database(db_url)
+    eng = create_engine(db_url, isolation_level="AUTOCOMMIT", future=True)
+    try:
+        with eng.connect() as c:
+            c.execute(text("DROP SCHEMA public CASCADE"))
+            c.execute(text("CREATE SCHEMA public"))
+    finally:
+        eng.dispose()
+
+    env = dict(os.environ)
+    env.update({
+        "INCANT_DATABASE_URL": db_url,
+        "INCANT_REPO_PATH": f"{tmp_path}/repo",
+        "INCANT_ALLOW_DEV_KEY": "1",
+        "INCANT_BOOTSTRAP_ADMIN_KEY": admin_key,
+        "INCANT_MODE": "full",
+    })
+    for step in ("init", "seed"):
+        r = subprocess.run([sys.executable, "-m", "incant.cli", step],
+                           env=env, capture_output=True, text=True)
+        assert r.returncode == 0, f"incant {step}: {r.stdout}\n{r.stderr}"
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    base_url = f"http://127.0.0.1:{port}"
+    log_path = f"{tmp_path}/server.log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "incant.server:app",
+             "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
+            env=env, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"server died:\n{open(log_path).read()[-3000:]}")
+            try:
+                with urllib.request.urlopen(base_url + "/readyz", timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.2)
+        else:
+            raise RuntimeError(f"not ready:\n{open(log_path).read()[-3000:]}")
+        yield base_url
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
