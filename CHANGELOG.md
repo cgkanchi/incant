@@ -1,19 +1,6 @@
 # Changelog
 
-## Unreleased
-
-- **Observed flags** (DESIGN.md §7): the targeting composer suggests flag names and
-  values as you type. The serving API records the flag/value pairs it sees — in memory
-  on the request path, flushed to Postgres by a background writer, pruned and
-  high-cardinality-suppressed hourly — so suggestions come from real traffic with no
-  SDK change. New: `GET /mgmt/envs/{env}/flags`, `GET …/flags/{flag}/values?q=`
-  (trigram-ranked typeahead, typed values), `DELETE …/flags/{flag}` (forget);
-  `GET /prompt/{id}/spec` merges observed values into `flags[].values`; migration
-  `f2a7c9d41e58` (creates `pg_trgm`). Config: `INCANT_OBSERVE_FLAGS`,
-  `INCANT_OBSERVED_FLAGS_*`. Metrics: `incant_observed_flags_total{outcome}`,
-  `incant_observed_flags_suppressed`.
-
-## 1.0.0 — 2026-08-29
+## 1.0.0 — 2026-08-31
 
 First stable release.
 
@@ -57,5 +44,16 @@ and publish; services render with full reproducibility (`versions` map +
   review, atomic publish, targeting, and recovery; `--read-only` mode; paired
   agent skills in `skills/` (incant-authoring, incant-release) with plan/confirm
   gates for protected environments.
+
+- **Observed flags** (DESIGN.md §7): the targeting composer suggests flag names and
+  values as you type. The serving API records the flag/value pairs it sees — in memory
+  on the request path, flushed to Postgres by a background writer, pruned and
+  high-cardinality-suppressed hourly — so suggestions come from real traffic with no
+  SDK change. New: `GET /mgmt/envs/{env}/flags`, `GET …/flags/{flag}/values?q=`
+  (trigram-ranked typeahead, typed values), `DELETE …/flags/{flag}` (forget);
+  `GET /prompt/{id}/spec` merges observed values into `flags[].values`; migration
+  `f2a7c9d41e58` (creates `pg_trgm`). Config: `INCANT_OBSERVE_FLAGS`,
+  `INCANT_OBSERVED_FLAGS_*`. Metrics: `incant_observed_flags_total{outcome}`,
+  `incant_observed_flags_suppressed`.
 
 See DESIGN.md for the architecture and §17 for deliberate divergences.
