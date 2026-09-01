@@ -130,7 +130,7 @@ def create_session(
     req: SessionLoginRequest,
     request: Request,
     response: Response,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ):
     """Sign in. Humans present email + password; machines/recovery may present an
     API key. Every failure path is throttled per IP, and the error text never
@@ -165,7 +165,7 @@ def create_session(
 
 
 @router.get("/setup")
-def setup_status(session: Session = Depends(get_session)):
+def setup_status(session: Session = Depends(get_session, scope="function")):
     """Public: does this instance still need its first admin account? Reveals only
     whether setup has happened — the UI uses it to pick the first-run screen."""
     return {"needs_setup": user_count(session) == 0}
@@ -176,7 +176,7 @@ def initial_setup(
     req: SetupRequest,
     request: Request,
     response: Response,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ):
     """First boot: create the initial admin ACCOUNT (no API key involved) and sign
     them in. Works exactly once — refused the moment any user exists. Run it right
@@ -219,7 +219,7 @@ def accept_invite(
     req: AcceptInviteRequest,
     request: Request,
     response: Response,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ):
     """Redeem an invite (or password-reset) link: set a password, activate the
     account, sign in. The token is single-use — redemption clears it."""
@@ -254,7 +254,7 @@ def accept_invite(
 def change_password(
     req: PasswordChangeRequest,
     request: Request,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ):
     """Change the signed-in user's own password (cookie + CSRF). Requires the
     current password, and signs out every OTHER session — a stolen session must not
@@ -287,7 +287,7 @@ def change_password(
 @router.get("/session")
 def read_session(
     request: Request,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ):
     """Cookie-authenticated whoami. 401 when the cookie is absent/expired/unknown."""
     row = lookup_session(session, request.cookies.get(SESSION_COOKIE) or "")
@@ -303,7 +303,7 @@ def read_session(
 @router.delete("/session", status_code=204)
 def delete_session(
     request: Request,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ):
     """Sign out: requires a valid session + matching CSRF header, deletes the row and
     clears the cookie."""
@@ -332,7 +332,7 @@ def _session_row(row: "models.Session", *, current: bool) -> dict:
 def list_sessions(
     request: Request,
     authorization: str | None = Header(default=None),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ):
     """The caller's own active sessions. Cookie OR bearer auth: a cookie caller sees its
     sessions with ``current: true`` on the one making the request; a bearer caller sees
@@ -358,7 +358,7 @@ def list_sessions(
 def delete_all_sessions(
     request: Request,
     authorization: str | None = Header(default=None),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ):
     """Sign out everywhere: delete every session for the caller's principal, including
     the current one. Cookie OR bearer auth; in cookie mode ``_authenticate`` enforces

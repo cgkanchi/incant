@@ -112,12 +112,16 @@ def _warm_all(ctx) -> dict[str, bool]:
     """
     with session_scope() as s:
         from .. import models
+        from ..targeting.snapshot import load_validated_index
         env_ids = [e.id for e in s.execute(select(models.Environment)).scalars()]
+        # One scan of commit_validations for the whole boot, shared by every snapshot
+        # (the same set object) instead of one scan and one copy per environment.
+        validated_index = load_validated_index(s)
     results: dict[str, bool] = {}
     for env_id in env_ids:
         try:
             with session_scope() as s:
-                ctx.warm(s, env_id)
+                ctx.warm(s, env_id, validated_index=validated_index)
             results[env_id] = True
         except Exception:
             log.exception("warm failed for environment %s", env_id)
@@ -792,7 +796,7 @@ def create_app() -> FastAPI:
     @app.get("/metrics")
     def metrics_endpoint(
         authorization: str | None = Header(default=None),
-        session: Session = Depends(get_session),
+        session: Session = Depends(get_session, scope="function"),
     ):
         # Two ways in: a Prometheus scraper with no principal presents the shared
         # INCANT_METRICS_TOKEN, or any authenticated principal holding `viewer`.

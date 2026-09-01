@@ -114,6 +114,12 @@ function resolveAutosaveConflict(choice) {
 // ── draft page: header pieces ────────────────────────────────────────
 function lintChipHtml(draft) {
   const lint = draft.lint || {};
+  if (lint.status === "valid" && lint.render_checked === false) {
+    // Static checks passed but the test-context render could not run (no default
+    // environment / snapshot): say so instead of a plain green — the render is the
+    // check that catches include and variable problems.
+    return `<span class="pill warn" title="${esc(lint.render_skipped_reason || "")}">✓ lint clean · render check skipped</span>`;
+  }
   return lint.status === "valid"
     ? `<span class="pill live">✓ lint clean</span>`
     : `<span class="pill danger">${esc(lint.error || "invalid")}</span>`;

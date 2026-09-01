@@ -44,7 +44,7 @@ def _get_remote(session: Session, remote_id: int) -> models.Remote:
 @router.get("/remotes")
 def list_remotes(
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Every remote with its queue state: pending commits and lag (the §6 exposure
@@ -56,7 +56,7 @@ def list_remotes(
 @router.post("/remotes")
 def create_remote(
     req: RemoteRequest,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -80,7 +80,7 @@ def create_remote(
 @router.patch("/remotes/{remote_id}")
 def update_remote(
     remote_id: int, req: RemotePatchRequest,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -107,7 +107,7 @@ def update_remote(
 @router.delete("/remotes/{remote_id}")
 def delete_remote(
     remote_id: int,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -122,7 +122,7 @@ def delete_remote(
 def push_remote_now(
     remote_id: int,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Push this remote immediately (restore tooling, or verifying a new remote

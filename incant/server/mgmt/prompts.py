@@ -48,7 +48,7 @@ _VERSION_HISTORY_LIMIT = 50
 
 @router.get("/whoami")
 def whoami(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # `email` is present iff the principal is a human account (users table) — the UI
@@ -73,7 +73,7 @@ def whoami(
 def overview(
     environment: str = "prod",
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # The body below filters projects by viewer scope, but a principal holding NO
@@ -158,7 +158,7 @@ def get_versions(
     prompt_id: str,
     environment: str = "prod",
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Versions ARE environment-divisible — the response carries this env's live pointer,
@@ -220,7 +220,7 @@ def update_version(
     version_number: int,
     req: VersionUpdateRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Edit version metadata or archive/reactivate a version explicitly."""
@@ -248,7 +248,7 @@ def update_version(
 def create_prompt(
     req: CreatePromptRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "editor", project=_project_of(req.prompt_id))
@@ -264,7 +264,7 @@ def create_prompt(
 def preview_prompt(
     prompt_id: str, req: RenderRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Render a prompt through the REAL serving resolution, for the UI's Playground
@@ -290,7 +290,7 @@ def preview_prompt(
 def get_variables(
     prompt_id: str, version: int,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # A prompt's variable schema describes the template itself, not any one environment, so
@@ -305,7 +305,7 @@ def get_variables(
 def put_variable(
     prompt_id: str, version: int, req: RefinementRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "editor", project=_project_of(prompt_id))
@@ -320,7 +320,7 @@ def put_variable(
 def get_test_contexts(
     prompt_id: str,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Test contexts (named flag/variable sets) belong to the prompt, not an environment —
@@ -337,7 +337,7 @@ def get_test_contexts(
 def put_test_context(
     prompt_id: str, req: TestContextRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "editor", project=_project_of(prompt_id))
@@ -369,7 +369,7 @@ def diff_versions(
     a_sha: str | None = None, b_sha: str | None = None,
     mode: str = "source", environment: str = "prod", test_context: str | None = None,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Comparing two versions of a prompt is a read of prompt content, not an env-divisible

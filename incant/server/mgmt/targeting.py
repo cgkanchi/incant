@@ -47,7 +47,7 @@ def _require_stored_scope(ident: Identity, existing: models.Rule, env: str) -> N
 @router.get("/envs")
 def list_envs(
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Viewer in ANY scope. Every other mgmt read is role-guarded; this one was open to a
@@ -72,7 +72,7 @@ def get_rules(
     env: str,
     project: str | None = None,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Access model. The full env-wide rule list needs env-WIDE viewer. But the UI gates its
@@ -156,7 +156,7 @@ def _unservable_reason(snap, r: models.Rule) -> str | None:
 def upsert_rule(
     env: str, req: RuleRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Requested authority: operator on the prompt's project + env.
@@ -187,7 +187,7 @@ def upsert_rule(
 def upsert_rules_batch(
     env: str, req: RuleBatchRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Apply a set of rule upserts as ONE atomic act.
@@ -246,7 +246,7 @@ def upsert_rules_batch(
 def patch_rule(
     env: str, rule_id: str, req: RuleStatusRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     r = session.get(models.Rule, rule_id)
@@ -266,7 +266,7 @@ def patch_rule(
 def get_revisions(
     env: str, limit: int = 100, project: str | None = None,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Access model mirrors get_rules. The full env-wide change log needs env-WIDE viewer,
@@ -303,7 +303,7 @@ def get_revisions(
 def rollback_targeting(
     env: str, req: RollbackRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Rollback touches every prompt's targeting at once, so it needs env-wide operator.
@@ -322,7 +322,7 @@ def rollback_targeting(
 def pointer_timeline(
     env: str, prompt_id: str, version: int,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # This history is per-(prompt, version), so its natural scope is the prompt's project in
@@ -346,7 +346,7 @@ def pointer_timeline(
 def make_live(
     env: str, req: PointerRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Pointer moves are unilateral and releaser-gated — no propose→approve ceremony.
@@ -368,7 +368,7 @@ def make_live(
 def publish(
     env: str, req: PublishRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Advance the live pointer AND archive the now-redundant test rules in ONE atomic act.
@@ -421,7 +421,7 @@ def publish(
 def set_default(
     env: str, req: DefaultRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "operator", project=_project_of(req.prompt_id), environment=env)
@@ -442,7 +442,7 @@ def set_default(
 def kill_switch(
     env: str, prompt_id: str, req: KillRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "operator", project=_project_of(prompt_id), environment=env)
@@ -469,7 +469,7 @@ def _ilike_escape(q: str) -> str:
 def list_observed_flags(
     env: str,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Every flag known in this environment: names seen on the serving API (with distinct
@@ -517,7 +517,7 @@ def observed_flag_values(
     q: str = Query("", max_length=128),
     limit: int = Query(25, ge=1, le=100),
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Typeahead: values seen for `flag` matching `q` (infix, case-insensitive), prefix
@@ -576,7 +576,7 @@ def observed_flag_values(
 def forget_observed_flag(
     env: str, flag: str,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Operator reset: drop everything observed for `flag` here, including a

@@ -20,7 +20,7 @@ def get_audit(
     action: str | None = None,
     object: str | None = None,     # substring match on object_id
     limit: int = 100,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "viewer")

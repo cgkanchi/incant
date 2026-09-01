@@ -340,8 +340,12 @@ const Actions = {
       errEl.textContent = "Enter a path like project/name (needs at least one “/”).";
       return;
     }
-    if (!/^[a-z0-9]([a-z0-9._\/-]*[a-z0-9])?$/i.test(id)) {
-      errEl.textContent = "Use letters, numbers, dashes, dots, and “/” only.";
+    // Same grammar the server enforces (incant/core/ids.py): lowercase segments of
+    // letters/digits/./_/- that start and end alphanumeric, joined by single "/".
+    const seg = /^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$/;
+    const parts = id.split("/");
+    if (parts.length < 2 || id.length > 200 || !parts.every((s) => seg.test(s))) {
+      errEl.textContent = "Use project/name in lowercase letters, digits, dots, dashes and underscores — each part starts and ends with a letter or digit.";
       return;
     }
     errEl.textContent = "";

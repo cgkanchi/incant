@@ -77,7 +77,7 @@ def _issued(raw: str, principal_id: str, expires_at: dt.datetime | None, **extra
 def create_project(
     req: ProjectRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -93,7 +93,7 @@ def create_project(
 @router.patch("/projects/{project_id}")
 def update_project(
     project_id: str, req: ProjectSettingsRequest,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -113,7 +113,7 @@ def update_project(
 def create_env(
     req: EnvironmentRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -135,7 +135,7 @@ def create_env(
 def update_env(
     env: str, req: EnvSettingsRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -162,7 +162,7 @@ def delete_env(
     env: str,
     confirm: str | None = None,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Delete an environment and EVERYTHING scoped to it — rules, defaults, kill
@@ -218,7 +218,7 @@ def delete_env(
 def rename_env(
     env: str, req: RenameEnvRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Rename an environment: give it a new id and move EVERYTHING scoped to it across.
@@ -271,7 +271,7 @@ def rename_env(
 
 @router.get("/setup-status")
 def setup_status(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """The first-run checklist's live state (admin): what this deployment still
@@ -301,7 +301,7 @@ def setup_status(
 @router.post("/seed-example")
 def seed_example(
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Load the design's example dataset into an EMPTY library — the fastest way
@@ -326,7 +326,7 @@ def seed_example(
 def create_key(
     req: KeyRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -351,7 +351,7 @@ def create_key(
 
 @router.get("/principals")
 def list_principals(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -370,7 +370,7 @@ def list_principals(
 def add_binding(
     pid: str, req: BindingRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -391,7 +391,7 @@ def add_binding(
 def remove_binding(
     pid: str, binding_id: int,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -409,7 +409,7 @@ def remove_binding(
 @router.delete("/principals/{pid}/sessions")
 def revoke_principal_sessions(
     pid: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Admin: revoke every browser session for a principal (sign them out everywhere).
@@ -430,7 +430,7 @@ def issue_key(
     pid: str,
     req: IssueKeyRequest = IssueKeyRequest(),
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -449,7 +449,7 @@ def rotate_key(
     key_id: int,
     req: IssueKeyRequest = IssueKeyRequest(),
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Atomically issue a replacement key for the old key's principal and revoke the
@@ -476,7 +476,7 @@ def rotate_key(
 def revoke_key(
     key_id: int,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")

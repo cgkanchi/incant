@@ -39,7 +39,7 @@ router = APIRouter()
 def create_draft(
     prompt_id: str, req: CreateDraftRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "editor", project=_project_of(prompt_id))
@@ -61,7 +61,7 @@ def create_draft(
 def get_draft(
     draft_id: str,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -80,7 +80,7 @@ def get_draft(
 def put_draft_content(
     draft_id: str, req: DraftContentRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -106,7 +106,7 @@ def put_draft_content(
 def render_draft(
     draft_id: str, req: DraftRenderRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -140,7 +140,7 @@ def diff_draft(
     mode: str = "source", environment: str = "prod", test_context: str | None = None,
     flags: str | None = None, variables: str | None = None,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -203,7 +203,7 @@ def diff_draft(
 def review_draft(
     draft_id: str, req: ReviewRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -237,7 +237,7 @@ def review_draft(
 def get_comments(
     draft_id: str,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -256,7 +256,7 @@ def get_comments(
 def create_comment(
     draft_id: str, req: CommentRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -284,7 +284,7 @@ def create_comment(
 def commit_draft(
     draft_id: str, req: CommitRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -352,7 +352,7 @@ def commit_draft(
 def discard_draft(
     draft_id: str,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     reg = app.registry(session, ident.name)
@@ -372,7 +372,7 @@ def discard_draft(
 def list_drafts(
     prompt_id: str,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     # Listing a prompt's open drafts is env-agnostic (drafts carry no env); ANY_ENVIRONMENT

@@ -46,7 +46,7 @@ def _invite_response(user: models.User, token: str) -> dict:
 
 @router.get("/users")
 def list_users(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     _require(ident, "admin")
@@ -60,7 +60,7 @@ def list_users(
 def invite_user(
     req: InviteUserRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Invite a person: create their account (status ``invited``, no password) with
@@ -91,7 +91,7 @@ def invite_user(
 @router.post("/users/{user_id}/reset")
 def reset_user(
     user_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """A fresh invite/reset link: re-invites someone who lost theirs, or resets an
@@ -111,7 +111,7 @@ def reset_user(
 def set_user_status(
     user_id: str, req: UserStatusRequest,
     app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
     ident: Identity = Depends(identity),
 ):
     """Disable (or re-enable) an account. Disabling is immediate and total: every

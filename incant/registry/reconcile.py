@@ -51,6 +51,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..gitstore import GitStore
 from ..gitstore.store import ConcurrentUpdate
+from ..targeting.service import bump_content_version
 
 log = logging.getLogger("incant.reconcile")
 
@@ -208,6 +209,10 @@ def adopt_content_tree(session: Session, git: GitStore) -> AdoptResult | None:
         valid += int(result.ok)
         invalid += int(not result.ok)
     session.flush()
+    if versions:
+        # New Version + CommitValidation rows are snapshot content: bump so a warm
+        # replica (the periodic reconcile runs long after boot) rebuilds on its poll.
+        bump_content_version(session)
 
     out = AdoptResult(project=project_id, prompts=len(prompt_ids), versions=versions,
                       valid_tips=valid, invalid_tips=invalid)
@@ -441,6 +446,9 @@ def recover_pending_promotions(session: Session, git: GitStore) -> PendingRecove
         _release_lock()
         raise
 
+    if rebased:
+        # Replayed commits are new validated SHAs — content a warm replica must learn.
+        bump_content_version(session)
     if not staged:
         _release_lock()
     else:

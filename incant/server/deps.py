@@ -22,7 +22,11 @@ from .auth import (
 
 
 def get_session() -> Iterator[Session]:
-    """Writing (mgmt/session) session. Refused outright once this node has lost the
+    """Writing (mgmt/session) session. Every route takes it as
+    ``Depends(get_session, scope="function")``: FastAPI >= 0.118 otherwise runs this
+    generator's exit code — the COMMIT — after the response has been sent, so a client
+    could read straight after its own write and miss it. Function scope commits before
+    the response leaves. Refused outright once this node has lost the
     single-writer role and could not get it back (§15): another full node may now
     own the database and repo, so a management write here could race it. The node
     is already fail-stopping (readyz 503, SIGTERM pending); this closes the last
@@ -156,7 +160,7 @@ def _authenticate(
 def identity(
     request: Request,
     authorization: str | None = Header(default=None),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session, scope="function"),
 ) -> Identity:
     return _authenticate(request, session, authorization, allow_cookie=True)
 

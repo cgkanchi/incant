@@ -57,6 +57,72 @@ unified, cleaner audience/content abstraction is planned for v1.5/v2.
   `Var.inferred_required`, `Flag.observed`/`suppressed` are surfaced; `incant-mcp`
   requires `incant-sdk>=1.1`.
 
+**Hardening from the architecture review** (all verified against the code before
+fixing):
+
+- **Security — remote credentials could execute shell commands.** `auth_ref` and
+  `INCANT_KNOWN_HOSTS_PATH` are shell-quoted in `GIT_SSH_COMMAND` and the https
+  credential helper, and `--` precedes every URL git receives. An admin-supplied
+  credential path could previously run arbitrary commands on every node (backup loop,
+  replica fetch loop, `POST /mgmt/remotes/{id}/push`). Remote URLs are restricted to
+  `https://`, `http://`, `ssh://`, scp-like `user@host:path`, `file://` and absolute
+  paths (`ext::` etc. refused, 422); `auth_ref` must be an absolute path of
+  `[A-Za-z0-9._/@-]`. `INCANT_BOOTSTRAP_REMOTE(_KEY)` pass the same grammar and fail
+  the boot loudly otherwise.
+- **Security:** `GET /mgmt/envs` requires `viewer` in some scope; renderer-only keys can
+  no longer enumerate environments.
+- **Serve replicas learn about content changes.** A deployment-wide
+  `environments.content_version` (migration `b3d8f5a17c92`) rides the control-plane poll
+  beside `rules_version`: new validated commits (tips and the servable index), new
+  versions, variable-refinement defaults and reconcile-adopted content now reach
+  replicas within the poll interval. Previously a replica served a stale tip
+  indefinitely and 409'd `pin.versions` naming a freshly validated SHA. The full node no
+  longer empties its snapshot cache after a commit: affected snapshots are rebuilt inside
+  the write and swapped in at commit, so there is no cold-build/503 window.
+- **The single-writer role is monitored and fenced.** The advisory-lock connection is
+  held in autocommit (never idle-in-transaction), ownership is re-checked every
+  control-poll tick, a dropped connection is re-claimed, and if another full node holds
+  the role the node fail-stops: readyz/healthz 503, management writes 503, writer loops
+  halted, SIGTERM. New gauge `incant_writer_lock_held`. Full nodes must not sit behind a
+  transaction-pooling PgBouncer (documented).
+- **Kill switches beat replay for included fragments too:** a `pin.rules_version` replay
+  is refused (409, `error: "killed"`) when any prompt that contributed to the render is
+  killed in the current state, not only the root or pinned prompts.
+- **Diverged publish recovery keeps the original SHA** — anchored at
+  `refs/incant/recovered/<draft>` (mirror-pushed, never auto-deleted) so pointers, pins
+  and replicas referencing it keep resolving; replays land their `CommitValidation` row
+  before `main` moves (staged + `after_commit`, like a live publish); stranded refs are
+  recovered in chain order; replayed content is statically re-validated against the tree
+  it lands in (render verdict inherited).
+- **Commit validation is never a 500 and never silently skipped:** a render-time include
+  cycle/depth overrun or unfetchable content is an `invalid` verdict naming the test
+  context (on commit and on the draft payload, which previously 500'd the editor); a
+  missing default environment logs a warning and reports `render_checked: false` with
+  `render_skipped_reason` on the commit response and the draft `lint`.
+- **Observed flags survive DB outages:** retrying a failed flush no longer inflates the
+  distinct-value count, so a flag with an ordinary number of values cannot be permanently
+  suppressed by downtime; suppressions tripped during a failed pass persist on the next
+  successful one.
+- **Budgets:** `INCANT_MAX_REQUEST_BYTES` (1 MiB; 413 by Content-Length or mid-stream)
+  and `INCANT_MAX_RENDER_BYTES` (2 MiB; 422 render error). Match the proxy's body limit.
+- **Read-your-writes on the management API:** FastAPI ≥ 0.118 runs a yield-dependency's
+  exit code after the response is sent, so the session commit landed after the client's
+  200 — a client's immediate follow-up read could miss its own write. Writing routes now
+  commit before the response (`scope="function"`).
+- Prompt ids follow one grammar (`project/name`; lowercase segments of letters, digits,
+  `.`, `_`, `-`; single `/`; ≤ 200 chars) at the API (422) and service layer. `acme/foo/`
+  or `..` previously created an orphan row and a permanent 500 on the first draft write,
+  and an empty id could bind a fresh deployment to project `""`. `GitStore.list_files`
+  uses `ls-tree -z` so unusual paths are not dropped from DR adoption.
+- The legacy→peppered key re-hash runs only on the full node (replicas are read-only)
+  and a failed upgrade retries on the next cache reload, not per request.
+- One validated-commit index is loaded per refresh pass / boot and shared across
+  environments (was one full scan and one copy per environment).
+- Docs: content reaches replicas within `INCANT_BACKUP_POLL_SECONDS` +
+  `INCANT_CONTENT_FETCH_SECONDS` (~45 s worst case), covered by the §10 within-version
+  fallback — not "one fetch interval"; the boot migration creates `pg_trgm` itself
+  (trusted on PG13+; PG12 or allow-listed managed instances must pre-create it).
+
 ## 1.0.0 — 2026-08-31
 
 First stable release.
