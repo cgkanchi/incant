@@ -149,6 +149,16 @@ class Settings(BaseSettings):
     # (default) ⇒ never trust XFF — a client can't spoof its IP past an untrusted hop.
     trusted_proxies: str = ""
 
+    # Request/response budgets (§8). Every request body is capped — by Content-Length
+    # up front, and by counting streamed bytes for chunked bodies — so a renderer key
+    # cannot hand the node an arbitrarily large `variables` payload. 1 MiB is generous:
+    # renders carry a few KB and the largest shipped template is well under 10 KB. Set
+    # the reverse proxy's body limit to match. Rendered output is capped too: a template
+    # looping over a caller-supplied list can otherwise emit tens of MB from a tiny
+    # request; over the cap renders fail as a 422 render error, never a 500.
+    max_request_bytes: int = Field(default=1_048_576, ge=4096)
+    max_render_bytes: int = Field(default=2_097_152, ge=1024)
+
     @model_validator(mode="after")
     def _cross_field(self) -> "Settings":
         # Fail at BOOT with the actual problem, not at 3am with a tight loop or a

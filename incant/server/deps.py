@@ -8,7 +8,7 @@ from typing import Iterator
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from ..db import session_factory
+from ..db import session_factory, writer_role_lost
 from ..service import AppContext, get_app
 from .auth import (
     CSRF_HEADER,
@@ -22,6 +22,14 @@ from .auth import (
 
 
 def get_session() -> Iterator[Session]:
+    """Writing (mgmt/session) session. Refused outright once this node has lost the
+    single-writer role and could not get it back (§15): another full node may now
+    own the database and repo, so a management write here could race it. The node
+    is already fail-stopping (readyz 503, SIGTERM pending); this closes the last
+    door until the process is gone. The serving path uses get_readonly_session and
+    keeps answering — it never writes."""
+    if writer_role_lost():
+        raise HTTPException(status_code=503, detail="writer role lost — this node is restarting")
     s = session_factory()()
     try:
         yield s

@@ -208,27 +208,46 @@ class FlagObserver:
         return [Observation(env, flag, value, vt, at) for (env, flag, value), (vt, at) in items]
 
     def unmark(self, observations: Iterable[Observation]) -> None:
-        """A flush failed: forget these marks so the next request re-queues them."""
+        """A flush failed: forget these marks so the next request re-queues them.
+
+        The distinct-value count is unwound with the mark. A key that is re-queued
+        and re-marked on every failed pass while its old increment stays behind
+        ratchets ``_distinct`` up by one per retry — and after ~cap/values failed
+        passes (a flag with 5k live values: ~10 five-second passes, under a minute of
+        DB downtime) an ordinary flag trips permanent suppression on retries alone.
+        Only keys still marked are decremented: the count must mirror ``_seen``."""
         with self._lock:
             for o in observations:
-                self._seen.pop((o.env, o.flag, o.value), None)
+                if self._seen.pop((o.env, o.flag, o.value), None) is not None:
+                    self._decrement_locked((o.env, o.flag))
+
+    def _decrement_locked(self, pair: tuple[str, str]) -> None:
+        n = self._distinct.get(pair, 0) - 1
+        if n <= 0:
+            self._distinct.pop(pair, None)
+        else:
+            self._distinct[pair] = n
 
     def sweep(self) -> int:
-        """Evict expired marks (bounds memory). Returns how many were evicted."""
+        """Evict expired marks (bounds memory). Returns how many were evicted.
+
+        ``_distinct`` is REBUILT from the surviving marks rather than decremented: the
+        eviction scan already walks every mark, so the rebuild is the same O(n) pass,
+        and it makes the count self-healing — any bookkeeping slip between mark and
+        unmark is corrected within one writer pass instead of accumulating toward a
+        false high-cardinality suppression. The pathological-size reset falls out of
+        the same rebuild."""
         now = self._clock()
         with self._lock:
             expired = [k for k, exp in self._seen.items() if exp <= now]
             for k in expired:
                 del self._seen[k]
-                pair = (k[0], k[1])
-                n = self._distinct.get(pair, 0) - 1
-                if n <= 0:
-                    self._distinct.pop(pair, None)
-                else:
-                    self._distinct[pair] = n
             if len(self._seen) > 2 * self._max_pending:   # pathological; start over
                 self._seen.clear()
-                self._distinct.clear()
+            distinct: dict[tuple[str, str], int] = {}
+            for env, flag, _value in self._seen:
+                distinct[(env, flag)] = distinct.get((env, flag), 0) + 1
+            self._distinct = distinct
         return len(expired)
 
     def _suppress_locked(self, env: str, flag: str) -> None:
@@ -243,6 +262,15 @@ class FlagObserver:
         with self._lock:
             out, self._new_suppressions = self._new_suppressions, set()
             return out
+
+    def restore_suppressions(self, pairs: Iterable[tuple[str, str]]) -> None:
+        """The writer pass that took these suppressions failed before persisting them:
+        put them back so the next successful pass records them. Without this a trip
+        that coincided with a DB outage would be enforced in memory (values dropped
+        at the source) yet never reach the table — invisible to the UI and forgotten
+        on restart, re-accumulating up to the cap all over again."""
+        with self._lock:
+            self._new_suppressions.update(pairs)
 
     def set_suppressed(self, pairs: Iterable[tuple[str, str]]) -> None:
         """Replace the suppressed set with DB truth (boot, census, forget)."""

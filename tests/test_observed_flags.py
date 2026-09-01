@@ -427,3 +427,88 @@ def test_deleting_an_environment_cascades_observed_rows(client):
     with session_scope() as s:
         assert s.execute(text("SELECT count(*) FROM observed_flags WHERE environment_id='scratch'")).scalar() == 0
         assert s.execute(text("SELECT count(*) FROM observed_flag_suppressions WHERE environment_id='scratch'")).scalar() == 0
+
+
+# ── retries must never masquerade as cardinality ─────────────────────
+
+def test_failed_flushes_never_ratchet_toward_suppression():
+    """unmark unwinds the distinct count with the mark. A single live value re-queued on
+    every failed pass used to leave one orphan increment per retry, so cap+1 failed
+    passes suppressed a one-value flag; now the count mirrors the marks exactly."""
+    o = _obs(value_cap=5)
+    for _ in range(3 * 5):                                   # far more retries than the cap
+        assert o.observe("prod", {"plan": "pro"}) == 1
+        o.unmark(o.drain())                                  # the writer's failure path
+    assert not o.is_suppressed("prod", "plan") and o.take_new_suppressions() == set()
+    # And the count really is back at zero: cap-many distinct values still don't trip.
+    for i in range(5):
+        o.observe("prod", {"plan": f"p{i}"})
+    assert not o.is_suppressed("prod", "plan")
+
+
+def test_unmark_of_an_already_swept_key_does_not_underflow():
+    clock = Clock()
+    o = _obs(clock, value_cap=2)
+    o.observe("prod", {"a": "1", "a2": "1"})
+    batch = o.drain()
+    clock.t += 61
+    o.sweep()                                                # marks expired: count rebuilt to 0
+    o.unmark(batch)                                          # nothing left to decrement
+    o.observe("prod", {"a": "x"}); o.observe("prod", {"a": "y"})
+    assert not o.is_suppressed("prod", "a")                  # 2 live values == cap, no trip
+
+
+def test_sweep_rebuilds_distinct_counts_from_live_marks():
+    """Belt and braces: the count is re-derived from the surviving marks on every
+    sweep, so even a slipped increment cannot accumulate toward a false suppression."""
+    o = _obs(value_cap=3)
+    o.observe("prod", {"a": "1"})
+    o._distinct[("prod", "a")] = 99                          # a slipped count, by hand
+    o.sweep()
+    assert o._distinct == {("prod", "a"): 1}
+
+
+def test_restore_suppressions_keeps_a_trip_pending():
+    o = _obs(value_cap=2)
+    for i in range(3):
+        o.observe("prod", {"uid": f"u{i}"})
+    tripped = o.take_new_suppressions()
+    assert tripped == {("prod", "uid")} and o.take_new_suppressions() == set()
+    o.restore_suppressions(tripped)                          # the pass that took it failed
+    assert o.take_new_suppressions() == {("prod", "uid")}
+
+
+def test_writer_pass_retries_never_suppress_an_ordinary_flag(tmp_path, monkeypatch):
+    import sys
+    appmod = sys.modules["incant.server.app"]
+    with make_client(tmp_path, observed_flags_value_cap=100) as client:
+        def boom(session, obs):
+            raise RuntimeError("db down")
+        monkeypatch.setattr(appmod, "flush_observations", boom)
+        for _ in range(105):                                 # > cap failed passes, ONE value
+            _render(client, {"tier": "pro"})
+            assert _flush(client) == 0
+        assert not get_app().observer.is_suppressed("prod", "tier")
+        assert get_app().observer.take_new_suppressions() == set()
+
+
+def test_writer_pass_keeps_a_tripped_suppression_pending_across_a_failed_flush(tmp_path, monkeypatch):
+    import sys
+    appmod = sys.modules["incant.server.app"]
+    with make_client(tmp_path, observed_flags_value_cap=100) as client:
+        for i in range(101):
+            _render(client, {"uid": f"u{i}"})
+        assert get_app().observer.is_suppressed("prod", "uid")
+        real = appmod.flush_observations
+
+        def boom(session, obs):
+            raise RuntimeError("db down")
+        monkeypatch.setattr(appmod, "flush_observations", boom)
+        assert _flush(client) == 0
+        with session_scope() as s:
+            assert load_suppressions(s) == set()             # not persisted yet…
+        monkeypatch.setattr(appmod, "flush_observations", real)
+        _flush(client)
+        with session_scope() as s:
+            assert load_suppressions(s) == {("prod", "uid")}  # …but not lost either
+        assert _rows(flag="uid") == []

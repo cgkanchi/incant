@@ -14,9 +14,14 @@ Two run modes (INCANT_MODE):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import signal
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -28,7 +33,18 @@ from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
-from ..db import claim_full_writer_role, engine, release_full_writer_role, session_scope
+from ..core.render import configure_limits
+from ..db import (
+    WriterRoleTaken,
+    claim_full_writer_role,
+    engine,
+    mark_writer_role_lost,
+    reclaim_full_writer_role,
+    release_full_writer_role,
+    session_scope,
+    writer_role_held,
+    writer_role_lost,
+)
 from ..registry import (
     adopt_content_tree,
     reconcile_drafts,
@@ -165,26 +181,42 @@ async def _warm_retry_loop(app: FastAPI, ctx) -> None:
             log.exception("background readiness retry errored")
 
 
+async def _writer_pass(fn: Callable[..., Any], *args: Any) -> Any:
+    """Run one pass of a full-node WRITER loop off the event loop — unless this node has
+    lost the single-writer role (§15). Then the pass is skipped outright: the node is
+    fail-stopping and another full node may already own the database, the canonical
+    repo and the backup remotes, so one more reconcile, census, flush or `--mirror`
+    push from here could race — or overwrite — the rightful writer. The one gate for
+    every writer loop; the serve-side loops (poll, fetch, warm) never pass through it."""
+    if writer_role_lost():
+        return None
+    return await asyncio.to_thread(fn, *args)
+
+
+def _sweep_pass(ctx) -> None:
+    """One hourly hygiene pass (run via _writer_pass): expired browser sessions, then
+    the §7 observed-flags census (TTL prune + high-cardinality suppression), reloading
+    the observer's suppressed set from DB truth."""
+    with session_scope() as s:
+        sweep_expired_sessions(s)
+    settings = get_settings()
+    if settings.observe_flags:
+        with session_scope() as s:
+            res = prune_and_census(
+                s, ttl_days=settings.observed_flags_ttl_days,
+                value_cap=settings.observed_flags_value_cap)
+            ctx.observer.set_suppressed(load_suppressions(s))
+        metrics.observed_flags_suppressed.set(res.total_suppressed)
+
+
 async def _session_sweep_loop(ctx) -> None:
     """Full mode, hourly: sweep expired browser sessions, and run the §7 observed-flags
-    census (TTL prune + high-cardinality suppression), reloading the observer's
-    suppressed set from DB truth. The boot sweep only runs once; this keeps a
-    long-running node from accumulating dead rows. Logs only when it changes something."""
+    census. The boot sweep only runs once; this keeps a long-running node from
+    accumulating dead rows. Logs only when it changes something."""
     while True:
         await asyncio.sleep(_SESSION_SWEEP_SECONDS)
         try:
-            def _pass() -> None:
-                with session_scope() as s:
-                    sweep_expired_sessions(s)
-                settings = get_settings()
-                if settings.observe_flags:
-                    with session_scope() as s:
-                        res = prune_and_census(
-                            s, ttl_days=settings.observed_flags_ttl_days,
-                            value_cap=settings.observed_flags_value_cap)
-                        ctx.observer.set_suppressed(load_suppressions(s))
-                    metrics.observed_flags_suppressed.set(res.total_suppressed)
-            await asyncio.to_thread(_pass)  # blocking DB work off the serving loop
+            await _writer_pass(_sweep_pass, ctx)  # blocking DB work off the serving loop
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("periodic session sweep errored")
 
@@ -193,11 +225,12 @@ _observed_flush_failing = False
 
 
 def _observed_flags_pass(ctx) -> int:
-    """One writer pass (run via to_thread): drain the observer's queue into one upsert,
-    persist any suppressions the observer tripped since the last pass, evict expired
-    marks, publish the §14 counters. A failed flush un-marks the batch so the next
-    request re-queues it; the failure is logged once until a pass succeeds again.
-    Returns rows written."""
+    """One writer pass (run via _writer_pass): drain the observer's queue into one
+    upsert, persist any suppressions the observer tripped since the last pass, evict
+    expired marks, publish the §14 counters. A failed flush un-marks the batch so the
+    next request re-queues it, and hands back the tripped suppressions so the next
+    successful pass persists them; the failure is logged once until a pass succeeds
+    again. Returns rows written."""
     global _observed_flush_failing
     obs = ctx.observer.drain()
     tripped = ctx.observer.take_new_suppressions()
@@ -213,6 +246,7 @@ def _observed_flags_pass(ctx) -> int:
             _observed_flush_failing = False
     except Exception as exc:
         ctx.observer.unmark(obs)
+        ctx.observer.restore_suppressions(tripped)
         if not _observed_flush_failing:
             log.warning("observed flags: flush failed (%s: %s); will retry — "
                         "observations are re-queued on the next request",
@@ -237,9 +271,17 @@ async def _observed_flags_loop(ctx) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            await asyncio.to_thread(_observed_flags_pass, ctx)
+            await _writer_pass(_observed_flags_pass, ctx)
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("observed flags writer pass errored")
+
+
+def _reconcile_pass(ctx) -> None:
+    """One drift-check pass (run via _writer_pass): recover staged promotions, then take
+    the main-commit census and record it on the ctx."""
+    with session_scope() as s:
+        recover_pending_promotions(s, ctx.git)
+        ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
 
 
 async def _reconcile_loop(ctx) -> None:
@@ -253,17 +295,13 @@ async def _reconcile_loop(ctx) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            def _pass() -> None:
-                with session_scope() as s:
-                    recover_pending_promotions(s, ctx.git)
-                    ctx.record_reconcile(reconcile_main_commits(s, ctx.git))
-            await asyncio.to_thread(_pass)  # DB + git subprocess work off the loop
+            await _writer_pass(_reconcile_pass, ctx)  # DB + git subprocess work off the loop
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("periodic main reconcile errored")
 
 
 def _backup_pass(ctx) -> None:
-    """One synchronous pusher pass on its own session (run via to_thread — a remote
+    """One synchronous pusher pass on its own session (run via _writer_pass — a remote
     push blocks on the network and must not stall the event loop)."""
     with session_scope() as s:
         ctx.backup.push_pending(s)
@@ -279,7 +317,7 @@ async def _backup_push_loop(ctx) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            await asyncio.to_thread(_backup_pass, ctx)
+            await _writer_pass(_backup_pass, ctx)
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("backup push pass errored")
 
@@ -311,7 +349,77 @@ async def _content_fetch_loop(app: FastAPI, ctx) -> None:
             log.exception("content fetch pass errored")
 
 
-async def _control_poll_loop(ctx) -> None:
+_FAIL_STOP_GRACE_SECONDS = 2.0
+
+
+def _terminate_process() -> None:
+    """Default fail-stop action: ask the process to exit the way the orchestrator would.
+    SIGTERM → uvicorn's graceful shutdown (in-flight requests finish, the lifespan
+    teardown cancels the loops and releases what is left) → container exit → restart,
+    and the restart's boot claim either wins the role back or refuses to start as a
+    second writer. Delayed a beat so the CRITICAL log line and the first 503s reach
+    whoever is watching before the listener closes. os.kill rather than raise_signal:
+    this runs on a worker thread and the handler belongs to the main thread. Module-
+    level so tests substitute a recorder instead of terminating pytest."""
+    timer = threading.Timer(_FAIL_STOP_GRACE_SECONDS, os.kill, (os.getpid(), signal.SIGTERM))
+    timer.daemon = True
+    timer.start()
+
+
+def _fail_stop_writer(app: FastAPI, reason: str) -> None:
+    """The single-writer role is gone and another node holds it. Fail-STOP, never limp:
+    readiness off (readyz 503 → out of rotation), management writes refused
+    (deps.get_session → 503), every writer loop sits out (_writer_pass), liveness off
+    (healthz 503 — the orchestrator's own restart path should the signal not land), and
+    the process is asked to exit. Serving keeps answering until the listener closes:
+    the read path never writes, so it is safe to the end."""
+    log.critical("writer role LOST and not re-claimable (%s) — fail-stopping this node: "
+                 "readyz/healthz 503, management writes refused, SIGTERM in %.0fs",
+                 reason, _FAIL_STOP_GRACE_SECONDS)
+    mark_writer_role_lost()
+    app.state.ready = False
+    metrics.writer_lock_held.set(0)
+    _terminate_process()
+
+
+_writer_reclaim_failing = False
+
+
+def _writer_role_pass(app: FastAPI) -> None:
+    """One re-check of the single-writer role (full mode, every control-poll tick; run
+    via to_thread). The boot-time claim alone is a promise about the past: the lock
+    lives on one connection, and if that connection dies — backend terminated, server
+    restarted, proxy reset — the lock is silently gone while this node keeps writing and
+    a second full node can now claim it. So: confirm the lock is still granted to our
+    backend; on loss re-claim ONCE on a fresh connection (a blip nobody else exploited
+    heals); if another node holds it, fail-stop. A connection error on the re-claim is
+    an OUTAGE, not contention — nobody can take the lock from a Postgres that is down —
+    and §10 serves frozen through outages, so that path warns once and retries next
+    tick: the first tick after Postgres returns wins the role back or finds it taken."""
+    global _writer_reclaim_failing
+    if writer_role_lost():
+        return  # already fail-stopping; nothing further to decide
+    if writer_role_held():
+        metrics.writer_lock_held.set(1)
+        return
+    metrics.writer_lock_held.set(0)
+    try:
+        reclaim_full_writer_role()
+    except WriterRoleTaken as exc:
+        _fail_stop_writer(app, str(exc))
+        return
+    except Exception as exc:
+        if not _writer_reclaim_failing:
+            log.warning("writer role: lock connection lost and Postgres unreachable (%s: %s); "
+                        "will re-claim as soon as it answers", type(exc).__name__, exc)
+            _writer_reclaim_failing = True
+        return
+    log.warning("writer role: lock connection was lost and re-claimed on a fresh connection")
+    metrics.writer_lock_held.set(1)
+    _writer_reclaim_failing = False
+
+
+async def _control_poll_loop(app: FastAPI, ctx) -> None:
     """Background control-plane poll — the piece that keeps the serving hot path DB-free.
 
     Every INCANT_CONTROL_POLL_SECONDS it opens a session and calls
@@ -319,10 +427,12 @@ async def _control_poll_loop(ctx) -> None:
     reload into memory so requests never read the DB (§8 "No DB per request"; §10 "the DB
     is never on the per-request path") and cross-replica changes land within the interval
     — the poll fallback for §7's Postgres LISTEN/NOTIFY. Runs in BOTH full and serve modes
-    because it feeds the serving hot path itself. Never raises out: refresh_control_plane
-    absorbs a DB outage (flipping the stale flag), and anything else is logged so the loop
-    stays alive."""
+    because it feeds the serving hot path itself. In full mode the same tick re-checks the
+    single-writer role (:func:`_writer_role_pass`) — the poll cadence bounds how long a
+    lost lock can go unnoticed. Never raises out: refresh_control_plane absorbs a DB
+    outage (flipping the stale flag), and anything else is logged so the loop stays alive."""
     interval = get_settings().control_poll_seconds
+    full = get_settings().mode == "full"
     while True:
         await asyncio.sleep(interval)
         try:
@@ -330,6 +440,8 @@ async def _control_poll_loop(ctx) -> None:
                 with session_scope() as s:
                     ctx.refresh_control_plane(s)
             await asyncio.to_thread(_pass)  # snapshot rebuilds must not stall renders
+            if full:
+                await asyncio.to_thread(_writer_role_pass, app)
         except Exception:  # pragma: no cover - defensive; keep the loop alive
             log.exception("control-plane poll errored")
 
@@ -344,7 +456,9 @@ async def lifespan(app: FastAPI):
     else:
         # Exactly one full writer per deployment: claim the role before touching
         # anything (a second full node fails fast here, not mid-double-reconcile).
+        # The control-poll loop re-checks it every tick from here on.
         claim_full_writer_role()
+        metrics.writer_lock_held.set(1)
         # First-boot content bootstrap (§6): with INCANT_BOOTSTRAP_REMOTE set and an
         # EMPTY repo volume, clone the remote — a populated Incant repo gets adopted
         # below; a blank one means "start fresh and push here" (initialize() seeds
@@ -443,7 +557,7 @@ async def lifespan(app: FastAPI):
 
     # Control-plane poll (BOTH modes): the serving hot path never reads the DB itself;
     # this loop pulls targeting bumps + auth changes into memory (§7 poll fallback, §8/§10).
-    poll_task = asyncio.create_task(_control_poll_loop(ctx))
+    poll_task = asyncio.create_task(_control_poll_loop(app, ctx))
 
     try:
         yield
@@ -470,8 +584,101 @@ def _has_viewer_anywhere(ident) -> bool:
     return any("viewer" in _IMPLIES.get(b.role, set()) for b in ident.bindings)
 
 
+def _too_large_detail(limit: int) -> str:
+    return f"request body exceeds the {limit}-byte limit (INCANT_MAX_REQUEST_BYTES)"
+
+
+class _BodyTooLarge(HTTPException):
+    """Raised from the wrapped ``receive`` once a streamed body passes the cap. An
+    HTTPException on purpose: FastAPI re-raises HTTPExceptions from its body read
+    untouched (anything else becomes a 400 "error parsing the body"), so the route's
+    normal exception handling turns this into the 413 the client should see."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(status_code=413, detail=_too_large_detail(limit),
+                         headers={"connection": "close"})
+
+
+def _content_length(scope) -> int | None:
+    for name, value in scope.get("headers", ()):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None  # malformed; the framework's own parsing rejects it
+    return None
+
+
+class _RequestBodyLimit:
+    """Pure-ASGI request-body cap (INCANT_MAX_REQUEST_BYTES), the first budget on the
+    request path: without it a renderer key can POST an arbitrarily large `variables`
+    payload and exhaust memory with no template cooperation at all.
+
+    Two doors. A Content-Length over the cap is refused before a byte of body is read
+    (413 + Connection: close, so the server drops the unread body instead of draining
+    it). A chunked body with no Content-Length is counted as it streams through the
+    wrapped ``receive`` and cut off at the cap. Pure ASGI rather than
+    BaseHTTPMiddleware because only the raw interface can intercept ``receive``.
+    Route-agnostic: mgmt drafts carry templates of a few KB and render variables are
+    smaller still, so one cap fits every surface.
+    """
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = int(max_bytes)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = _content_length(scope)
+        if declared is not None and declared > self.max_bytes:
+            await self._reject(send)
+            return
+        received = 0
+        response_started = False
+
+        async def counted_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise _BodyTooLarge(self.max_bytes)
+            return message
+
+        async def tracking_send(message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, counted_receive, tracking_send)
+        except _BodyTooLarge:
+            # Reached only when the body was read OUTSIDE FastAPI's exception handling
+            # (a middleware or raw ASGI app between us and the router). Answer 413
+            # ourselves while we still can; once a response has started the status is
+            # spoken for, and the propagated error makes the server abort the connection.
+            if response_started:
+                raise
+            await self._reject(send)
+
+    async def _reject(self, send) -> None:
+        body = json.dumps({"detail": _too_large_detail(self.max_bytes)}).encode()
+        await send({"type": "http.response.start", "status": 413, "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+            (b"connection", b"close"),
+        ]})
+        await send({"type": "http.response.body", "body": body})
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
+    # The core is a pure library and reads no settings; hand it the deployment's render
+    # budget here, once, before any warm or request can render.
+    configure_limits(max_render_bytes=settings.max_render_bytes)
     app = FastAPI(
         title="Incant",
         version="1.1.0",
@@ -500,6 +707,10 @@ def create_app() -> FastAPI:
                 "JSON body; send the header 'Content-Type: application/json'"
             )
         return JSONResponse(status_code=422, content=body)
+
+    # Registered BEFORE the security-headers middleware so that one wraps it (Starlette
+    # stacks later additions outermost) and even a 413 carries the standard headers.
+    app.add_middleware(_RequestBodyLimit, max_bytes=settings.max_request_bytes)
 
     @app.middleware("http")
     async def _security_headers(request: Request, call_next):
@@ -548,6 +759,12 @@ def create_app() -> FastAPI:
                           if not ok)
         if degraded:
             body["degraded_environments"] = degraded
+        # The one thing that DOES flip liveness: the single-writer role is lost to
+        # another node (§15). Unlike drift this node must not keep running — it is
+        # already fail-stopping — and a failed liveness probe is the orchestrator's own
+        # way to restart it should the SIGTERM not land.
+        if writer_role_lost():
+            return JSONResponse({"status": "writer_role_lost", **body}, status_code=503)
         if body:
             return JSONResponse({"status": "ok", **body})
         return PlainTextResponse("ok")

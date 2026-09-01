@@ -191,6 +191,12 @@ with no consumer edited.
 - Any prompt may include any other in the deployment (RBAC governs who can *edit*, not who can include). Sharing fragments across deployments is deliberately not a feature — teams that share style share a deployment.
 - **Cycles:** validation-time static check over the include graph at current defaults,
   plus a render-time depth limit (32) as backstop — resolution is flag-dependent.
+- **Budgets:** the sandbox bounds what a template can do alone (`range` ≤ 100k, include
+  depth, cycles); two caps bound what a *caller* can make it cost — request bodies at
+  `INCANT_MAX_REQUEST_BYTES` (1 MiB, 413 by Content-Length or cut off mid-stream) and
+  rendered output at `INCANT_MAX_RENDER_BYTES` (2 MiB, a 422 render error) — so a
+  template looping over a caller-supplied list cannot emit tens of MB from a small
+  request. A wall-clock budget is deferred.
 - Every response reports the resolved version *and SHA* of the prompt and every
   included prompt (§9) — fragment indirection never costs reproducibility.
 
@@ -862,7 +868,12 @@ not duplicated here. The properties this design relies on:
   enabled backup remote on first boot — and follows by periodic mirror-fetch
   (`INCANT_CONTENT_FETCH_SECONDS`; §6), so fresh targeting always finds its content;
   a shared volume works too (set the interval to 0). One `full` instance owns the
-  canonical repo, commits, and backup pushing. Run one worker process per container:
+  canonical repo, commits, and backup pushing — enforced by a session-level Postgres
+  advisory lock on an autocommit connection, claimed at boot and RE-CHECKED every
+  control-poll tick: a dropped connection is re-claimed if nobody else took the role,
+  and a role held by another node fail-stops this one (readyz/healthz 503, management
+  writes refused, writer loops halted, SIGTERM for the orchestrator to restart it) —
+  never two writers force-pushing one remote. Run one worker process per container:
   the snapshot/auth caches and the failed-auth throttle are per-process.
 - Kubernetes: StatefulSet (or Deployment + PVC) for the full node, Deployment for serve
   replicas, Secret mounts, managed Postgres; `readyz` as the readiness probe.

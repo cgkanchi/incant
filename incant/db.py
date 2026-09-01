@@ -57,9 +57,29 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # claim is a SESSION-level Postgres advisory lock held on a dedicated connection
 # for the process lifetime — a second full node fails fast at boot instead of
 # quietly double-running the background jobs. If this connection ever drops, the
-# lock releases with it (crashed writers don't wedge the deployment).
+# lock releases with it (crashed writers don't wedge the deployment) — which is
+# also why the role is RE-CHECKED every control-poll tick (server.app): a dropped
+# connection would otherwise leave this node writing while another full node can
+# now claim the role, and two writers force-pushing one remote destroy lineage.
 _FULL_WRITER_LOCK_ID = 0x496E6332  # ASCII "Inc2" — distinct from the setup lock
 _writer_conn = None
+# Set once the role was lost and could NOT be re-claimed (another node holds it).
+# From then on the writing session dependency refuses with 503, the writer loops sit
+# out, and the process is asked to exit (server.app fail-stop). Reset by release.
+_writer_lost = False
+
+
+class WriterRoleTaken(RuntimeError):
+    """The full-writer lock is held by another node — contention, not an outage."""
+
+
+def _lock_connection():
+    # AUTOCOMMIT is essential, not cosmetic: a plain connection begins a transaction
+    # on its first execute() and, never committed, sits "idle in transaction" for the
+    # process lifetime — exactly what hosted Postgres' idle_in_transaction_session_
+    # timeout terminates (silently releasing the lock) and it pins an xmin against
+    # vacuum. Autocommit leaves the backend plain `idle` between checks.
+    return engine().connect().execution_options(isolation_level="AUTOCOMMIT")
 
 
 def claim_full_writer_role() -> None:
@@ -67,11 +87,15 @@ def claim_full_writer_role() -> None:
     if _writer_conn is not None:
         return
     from sqlalchemy import func, select
-    conn = engine().connect()
-    got = conn.execute(select(func.pg_try_advisory_lock(_FULL_WRITER_LOCK_ID))).scalar()
+    conn = _lock_connection()
+    try:
+        got = conn.execute(select(func.pg_try_advisory_lock(_FULL_WRITER_LOCK_ID))).scalar()
+    except Exception:
+        conn.close()
+        raise
     if not got:
         conn.close()
-        raise RuntimeError(
+        raise WriterRoleTaken(
             "another `full` Incant node already owns this database (and its canonical "
             "repo). Exactly one full writer per deployment — run additional nodes "
             "with INCANT_MODE=serve, or stop the other full node first."
@@ -79,8 +103,58 @@ def claim_full_writer_role() -> None:
     _writer_conn = conn
 
 
-def release_full_writer_role() -> None:
+def writer_role_held() -> bool:
+    """Is the advisory lock still granted to OUR lock connection's backend?
+
+    Asked on the lock connection itself, so a dead connection (backend terminated,
+    server restarted, proxy dropped it) surfaces as a DBAPI error — and a dead
+    connection means the session lock is gone, hence False. pg_locks stores a 64-bit
+    advisory key split as classid = high 32 bits, objid = low 32 bits, objsubid = 1
+    (verified against Postgres 17 in tests/test_writer_lock.py). Cheap: one catalog
+    read on a connection that is otherwise idle, which doubles as its keepalive.
+    """
+    conn = _writer_conn
+    if conn is None:
+        return False
+    from sqlalchemy import text
+    try:
+        return bool(conn.execute(
+            text("SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = :hi "
+                 "AND objid = :lo AND objsubid = 1 AND granted AND pid = pg_backend_pid()"),
+            {"hi": _FULL_WRITER_LOCK_ID >> 32, "lo": _FULL_WRITER_LOCK_ID & 0xFFFFFFFF},
+        ).scalar())
+    except Exception:
+        return False
+
+
+def reclaim_full_writer_role() -> None:
+    """After :func:`writer_role_held` turned False: drop the dead connection and claim
+    again on a fresh one. A blip (Postgres restart, a proxy reset) where nobody else
+    took the role heals silently. Raises :class:`WriterRoleTaken` when another node
+    holds the lock; a connection error propagates as-is (Postgres unreachable — an
+    outage the caller must not mistake for contention)."""
     global _writer_conn
+    old, _writer_conn = _writer_conn, None
+    if old is not None:
+        try:
+            old.close()
+        except Exception:  # pragma: no cover - the connection is already dead
+            pass
+    claim_full_writer_role()
+
+
+def mark_writer_role_lost() -> None:
+    global _writer_lost
+    _writer_lost = True
+
+
+def writer_role_lost() -> bool:
+    return _writer_lost
+
+
+def release_full_writer_role() -> None:
+    global _writer_conn, _writer_lost
+    _writer_lost = False
     if _writer_conn is not None:
         try:
             # Unlock explicitly: a pooled connection's close() returns it to the

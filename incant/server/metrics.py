@@ -86,6 +86,16 @@ observed_flags_suppressed = Gauge(
     "Flags suppressed as high-cardinality (values purged, not suggested)",
 )
 
+# Single-writer role (§15): 1 while this node holds the full-writer advisory lock, 0
+# once it is lost. Set only on `full` nodes — a serve replica never claims the role and
+# exports the gauge's default 0, so alert on full nodes' scrape targets only. A lost
+# role fail-stops the node (readyz 503, mgmt writes 503, then SIGTERM), so 0 on a full
+# node is "restarting", not "degraded".
+writer_lock_held = Gauge(
+    "incant_writer_lock_held",
+    "1 while this full node holds the single-writer advisory lock, 0 once lost",
+)
+
 # Governance drift (DESIGN.md §3 "git owns content, the DB owns state"; §5 "Validation
 # first"). `reconcile_main_commits` compares the git `main` tree against the DB control
 # plane; it runs at boot and then on INCANT_RECONCILE_INTERVAL_SECONDS. These gauges

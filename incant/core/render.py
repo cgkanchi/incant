@@ -31,6 +31,24 @@ from .variables import extract
 
 DEPTH_LIMIT = 32
 
+# Rendered-output budget (UTF-8 bytes). The sandbox bounds what a template can do on
+# its own (`range` ≤ 100k, include depth, cycle detection) but not what it can do
+# with a caller-supplied list: `{% for m in history %}` over a few thousand items
+# emits tens of MB from a small request. The core is a pure library and must not
+# read deployment settings, so the cap is a module default the server configures at
+# startup via :func:`configure_limits` — threading it through every render() call
+# would push a deployment knob into the pure API, and the render caller
+# (service.py) has no settings of its own to hand down.
+MAX_RENDER_BYTES = 2 * 1024 * 1024
+_max_render_bytes = MAX_RENDER_BYTES
+
+
+def configure_limits(*, max_render_bytes: int | None = None) -> None:
+    """Set process-wide render limits (server startup; tests restore the default)."""
+    global _max_render_bytes
+    if max_render_bytes is not None:
+        _max_render_bytes = int(max_render_bytes)
+
 
 @dataclass
 class RenderResult:
@@ -369,6 +387,15 @@ def _render_compiled(
         raise RenderError(str(exc), prompt_id=prompt_id, lineno=getattr(exc, "lineno", None))
     finally:
         _current.reset(token)
+
+    # A RenderError (not a new type) so every existing mapping holds: 422 on the
+    # serving and preview paths, a failed validation at commit time.
+    size = len(text.encode("utf-8"))
+    if size > _max_render_bytes:
+        raise RenderError(
+            f"rendered output is {size} bytes, over the {_max_render_bytes}-byte "
+            "render limit", prompt_id=prompt_id,
+        )
 
     return RenderResult(
         text=text,

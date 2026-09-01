@@ -1,8 +1,9 @@
 # Deploying Incant
 
 One deployment = one project = one canonical repo + one Postgres database, with
-**exactly one `full` node** (enforced by a boot-time advisory lock) and any number
-of `INCANT_MODE=serve` replicas.
+**exactly one `full` node** (enforced by a Postgres advisory lock that is claimed at
+boot and re-checked every control-poll tick — see "The single-writer lock") and any
+number of `INCANT_MODE=serve` replicas.
 
 ## Topology
 
@@ -30,7 +31,9 @@ of `INCANT_MODE=serve` replicas.
    `INCANT_BOOTSTRAP_ADMIN_KEY` or capture the one printed at first boot.
 2. **TLS at the proxy.** Incant speaks plain HTTP; terminate TLS in front and set
    `INCANT_ENFORCE_TLS=1` so responses carry HSTS and cookies are `Secure`. Set
-   `INCANT_TRUSTED_PROXIES` to the proxy's IP(s) so throttling sees real clients.
+   `INCANT_TRUSTED_PROXIES` to the proxy's IP(s) so throttling sees real clients,
+   and give the proxy a request-body limit that matches `INCANT_MAX_REQUEST_BYTES`
+   (see "Request and render budgets").
 3. **One worker per container** (the shipped CMD does this). Scale render capacity
    with `INCANT_MODE=serve` replicas, never with `--workers`.
 4. **First run.** Open the UI → the setup screen creates the initial admin account
@@ -42,7 +45,9 @@ of `INCANT_MODE=serve` replicas.
    snapshots). The DB holds SHAs and state, never template text.
 7. **Probes.** `/readyz` for rotation (gates on the default environment + auth
    cache), `/healthz` for liveness — it stays green under governance drift but
-   names it (`drift`, `degraded_environments`).
+   names it (`drift`, `degraded_environments`). The one condition that fails BOTH
+   is a lost single-writer lock (`{"status": "writer_role_lost"}`, 503): that node
+   must be restarted, and it is already asking to be.
 8. **Kubernetes.** StatefulSet (or Deployment + PVC) for the full node; Deployment
    for serve replicas (no durable volume needed — the repo copy hydrates from a
    remote on boot, so an ephemeral `INCANT_REPO_PATH` is fine); managed Postgres;
@@ -127,9 +132,61 @@ INCANT_DATABASE_URL=postgresql+psycopg://incant:PASS@db.internal:5432/incant?ssl
 - The role needs to own its database (DDL at boot: Alembic migrations) plus
   ordinary DML. No superuser, no extensions required.
 - `sslmode=require` (or `verify-full` with a CA bundle) for anything off-host.
+- **No transaction-pooling PgBouncer in front of the full node.** The single-writer
+  lock is a *session*-level advisory lock; a transaction-mode pooler hands every
+  statement a different backend, so the lock is taken on one and checked on
+  another — the full node would fail-stop on its first poll tick. Session pooling
+  or a direct connection is fine (serve replicas take no lock and may use either).
+- `idle_in_transaction_session_timeout` may stay at whatever your host sets: the
+  lock connection is autocommit and sits plain `idle`, never `idle in transaction`,
+  and the 2-second re-check doubles as its keepalive against `idle_session_timeout`.
 - With docker compose, drop the bundled db: `docker compose up incant --no-deps`.
 - Upgrades: **full node first** (it runs migrations at boot, before readiness),
   then serve replicas.
+
+## The single-writer lock: monitored, fail-stop
+
+The full node's claim on the database is a session-level advisory lock on one
+dedicated connection. Postgres releases it the moment that connection dies — a
+server restart, a failover, a proxy reset, a terminated backend — and nothing tells
+the process. Left unchecked, the node would keep reconciling, pushing `--mirror` to
+your remotes and accepting management writes while a second full node could now
+claim the role: two writers force-pushing one remote destroy the lineage. So the
+lock is **re-checked every `INCANT_CONTROL_POLL_SECONDS`** (2 s) and the node reacts:
+
+- **Lost, nobody else took it** (a blip): the node re-claims on a fresh connection
+  and logs a warning. Nothing else changes.
+- **Lost, Postgres unreachable**: an outage, not contention — nobody can take the
+  lock from a server that is down. The node keeps serving from memory with
+  `stale_rules: true`, warns once, and retries every tick; the first tick after
+  Postgres answers re-claims or finds the lock taken.
+- **Lost, another node holds it**: the node **fail-stops**. It logs CRITICAL, flips
+  `/readyz` and `/healthz` to 503 (`writer_role_lost`), refuses every management
+  write with 503 `writer role lost`, stops its writer loops (backup push,
+  reconcile, sweeps, observed-flags flush), and ~2 s later sends itself SIGTERM so
+  uvicorn shuts down gracefully and the orchestrator restarts it. The restart
+  either wins the role back or refuses to boot as a second writer. Serving stays up
+  until the listener closes: reads are safe to the end.
+
+Watch `incant_writer_lock_held` (1 while held; 0 is "restarting", not "degraded")
+on full nodes — serve replicas never claim the role and export 0. Give the full
+node a restart policy (`restart: unless-stopped`, a Deployment/StatefulSet): the
+fail-stop *relies* on being restarted.
+
+## Request and render budgets
+
+Two caps bound what a single request can cost, independent of any template:
+
+| Setting | Default | What it bounds |
+|---|---|---|
+| `INCANT_MAX_REQUEST_BYTES` | `1048576` (1 MiB) | any request body — refused with 413 by Content-Length up front, or cut off at the cap while a chunked body streams |
+| `INCANT_MAX_RENDER_BYTES` | `2097152` (2 MiB) | rendered output — a template looping over a caller-supplied list fails with a 422 render error instead of emitting tens of MB |
+
+1 MiB is headroom: renders carry a few KB of variables and mgmt drafts a few KB of
+template. Set the **reverse proxy's body limit to the same value** (nginx
+`client_max_body_size 1m`, Traefik `maxRequestBodyBytes`, an ingress annotation) so
+oversized uploads are dropped before they reach a node at all. The render cap
+applies on the serving API, the mgmt preview and at commit-time validation alike.
 
 ## Secrets: what lives where
 

@@ -318,3 +318,32 @@ def test_compiled_cache_thread_safe_under_churn(monkeypatch):
         results = [f.result() for f in [pool.submit(churn, w) for w in range(8)]]
     assert results == ["ok"] * 8
     assert len(render_mod._COMPILED) <= 4 and len(render_mod._EXTRACT) <= 4
+
+
+# ── rendered-output budget ────────────────────────────────────────────
+
+@pytest.fixture()
+def tiny_render_budget():
+    from incant.core.render import MAX_RENDER_BYTES, configure_limits
+    configure_limits(max_render_bytes=64)
+    yield
+    configure_limits(max_render_bytes=MAX_RENDER_BYTES)
+
+
+def test_output_over_the_render_budget_is_a_render_error(tiny_render_budget):
+    # The sandbox bounds `range`, not a caller-supplied list: this is the unbounded case.
+    content = DictContent({(SYS, "c1"): "{% for m in items %}{{ m }}{% endfor %}"})
+    snap = snapshot(versions={SYS: {1: vinfo(1, live="c1")}}, defaults={SYS: 1})
+    assert render(snap, SYS, {}, {"items": ["x"] * 64}, content).text == "x" * 64  # at the cap
+    with pytest.raises(RenderError) as e:
+        render(snap, SYS, {}, {"items": ["x"] * 65}, content)
+    assert "65 bytes" in str(e.value) and "64-byte" in str(e.value)
+    assert e.value.prompt_id == SYS
+    # Measured in encoded bytes, not characters: 40 two-byte characters is 80 bytes.
+    with pytest.raises(RenderError):
+        render(snap, SYS, {}, {"items": ["é"] * 40}, content)
+
+
+def test_render_budget_default_is_generous():
+    from incant.core.render import MAX_RENDER_BYTES, _max_render_bytes
+    assert _max_render_bytes == MAX_RENDER_BYTES == 2 * 1024 * 1024
