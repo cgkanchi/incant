@@ -229,7 +229,18 @@ and change nothing; serving changes are pointer moves and are governed.**
 Every commit is validated on landing (Jinja compiles, includes resolve, cycle check,
 strict render against the prompt's test contexts); results are recorded per SHA. Only
 validated SHAs can ever be referenced by a pointer or rule — a broken template can
-exist in history but can never serve.
+exist in history but can never serve. Validation is a verdict, never an exception:
+a render-time include cycle or depth overrun (a live pointer, not the newest version,
+closing the loop — invisible to the static check) and unfetchable resolved content
+are recorded `invalid`, so the commit endpoint and the draft editor keep working on
+exactly the draft that needs fixing. The verdict is not a pure function of the
+content — the cycle check walks the tree, the render check resolves includes through
+the default environment's live pointers — and when the render check could not run at
+all (no test contexts; the default environment's snapshot could not be built) the
+result says so (`render_checked: false` + a reason) in the commit response and the
+draft payload, and the skip is logged. A missing default environment does not fail
+the commit — a fresh deployment publishes before its environment exists — but it is
+never silent.
 
 ### The flows
 
@@ -298,8 +309,16 @@ the DB for status.
   to the already-recorded SHA. A failed transaction leaves `main` untouched (the
   pending ref is discarded; the draft stays open and editable); a crash between the
   two phases leaves a pending ref that boot/interval recovery promotes or discards by
-  consulting the DB. The reconcile sweep remains as an invariant check, not a drift
-  janitor.
+  consulting the DB. Stranded refs are recovered in chain order (parents first), so
+  a multi-publish transaction fast-forwards link by link. When `main` has diverged
+  the content is replayed as a fresh commit through the same staged protocol — row
+  first, promotion in `after_commit`, so a failed replay leaves no unvalidated tip —
+  and the ORIGINAL SHA (already handed to the client, possibly a pointer target) is
+  anchored at `refs/incant/recovered/<draft>`: mirror-pushed and mirror-fetched like
+  every ref, never deleted automatically, the durable identity for anything that
+  references it. The replay re-runs the static checks against the final tree and
+  inherits the render verdict. The reconcile sweep remains as an invariant check,
+  not a drift janitor.
 - **Backup pushes are asynchronous and queued**: the queue is the commit range
   between a remote's recorded `last_pushed_sha` (DB) and `main`; a background pass
   (`INCANT_BACKUP_POLL_SECONDS`) force-pushes the full ref set (`--mirror`, drafts
@@ -591,7 +610,7 @@ for the control plane and sits on the refresh/write paths only, never per-reques
 | Rule resolves to something unservable | Skipped, evaluation continues; counted + surfaced. |
 | Version's current live SHA unservable (cache lost + store unreachable — compound failure) | **Within-version fallback**: serve the most recent *previous live* SHA of the same version that is still servable. Loud: `content_fallback` in the response, header, error-level logs, `incant_content_fallbacks_total` alerts. Never a different version. |
 | Nothing in the version's pointer history is servable | `409` for that request — never substitute another version. |
-| Publish interrupted (crash/rollback between git and DB) | Staged publish (§6): a rolled-back transaction leaves `main` untouched and the draft editable — no residue. A crash between DB commit and promotion leaves a pending ref that recovery promotes (or rebases, with the same validation verdict) at boot and on the reconcile interval. |
+| Publish interrupted (crash/rollback between git and DB) | Staged publish (§6): a rolled-back transaction leaves `main` untouched and the draft editable — no residue. A crash between DB commit and promotion leaves a pending ref that recovery promotes at boot and on the reconcile interval — or, if `main` diverged, replays through the same staged protocol with the original SHA anchored at `refs/incant/recovered/<draft>`. |
 | Repo volume lost | Restore by cloning a remote (full history, no reconstruction). Between backup pushes, the queue metric bounds the exposure window. Serve replicas hydrate themselves from a remote the same way (§6). |
 | Node restart | Caches rebuild from the repo + DB; re-warm before `readyz` goes green. Readiness is gated on the **default environment** (plus the auth cache): a broken scratch environment must not hold new capacity out of rotation for a healthy prod — it is retried in the background, answered per-request by this table meanwhile, and named in `/healthz` (`degraded_environments`). |
 | Missing required variable / render error | `422` — caller-input problem, never a fallback trigger. |

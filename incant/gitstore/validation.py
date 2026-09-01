@@ -24,6 +24,14 @@ class ValidationResult:
     status: str                       # "valid" | "invalid"
     error: str | None = None
     extracted_variables: dict = field(default_factory=dict)
+    # Whether the §5 strict render against test contexts actually RAN. A "valid"
+    # verdict with render_checked=False is only the static checks (compile, includes
+    # known, no cycle) — the caller must be able to tell the two apart, or a
+    # deployment whose render check silently stopped running (no default
+    # environment, snapshot build failing) records every commit as valid and nobody
+    # notices. ``render_skipped_reason`` says why when it did not run.
+    render_checked: bool = False
+    render_skipped_reason: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -69,11 +77,13 @@ def validate_source(
         return ValidationResult("invalid", "include cycle: " + " -> ".join(cycle),
                                 ev.as_dict())
 
-    # 4. Strict render against test contexts (only when contexts are supplied).
+    # 4. Strict render against test contexts (only when a renderer is supplied; the
+    #    caller records WHY when it is not — see ValidationResult.render_checked).
     if test_render is not None:
         err = test_render(source)
         if err:
-            return ValidationResult("invalid", err, ev.as_dict())
+            return ValidationResult("invalid", err, ev.as_dict(), render_checked=True)
+        return ValidationResult("valid", None, ev.as_dict(), render_checked=True)
 
     return ValidationResult("valid", None, ev.as_dict())
 

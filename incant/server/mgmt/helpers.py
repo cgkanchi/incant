@@ -288,7 +288,12 @@ def _draft_payload(app, reg, d) -> dict:
         "title": d.title, "author": d.author, "status": d.status,
         "content": content,
         "variables": ev.as_dict(),
-        "lint": {"status": val.status, "error": val.error},
+        # render_checked=False + a reason = only the static checks ran (no test
+        # contexts, or the default-env snapshot could not be built) — a "valid" lint
+        # then says less than it appears to, and the UI/agent must be able to tell.
+        "lint": {"status": val.status, "error": val.error,
+                 "render_checked": val.render_checked,
+                 "render_skipped_reason": val.render_skipped_reason},
         "project": _project_of(d.prompt_id),
         "review_policy": project.review_policy if project else 0,
         "allow_self_review": project.allow_self_review if project else True,

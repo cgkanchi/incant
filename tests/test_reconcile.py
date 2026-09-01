@@ -309,15 +309,213 @@ def test_recovery_rebases_when_main_diverged(app):
         result = recover_pending_promotions(s, app.git)
     assert result.rebased == 1
     assert app.git.list_pending_refs() == []
+    assert not app.git.draft_ref_exists(draft_id)
     # The stranded content was replayed atop the diverged main with a fresh,
     # equally-validated commit.
     assert app.git.read("support/system/v1.j2") == "hi {{ x }} (stranded edit)"
     tip = app.git.head()
+    assert tip != sha and app.git.is_ancestor(other)
     with session_scope() as s:
         rows = s.execute(
             select(models.CommitValidation).where(models.CommitValidation.sha == tip)
         ).scalars().all()
         assert len(rows) == 1 and rows[0].status == "valid"
+    # The ORIGINAL sha — already returned to the client as full_sha, possibly a
+    # pointer's to_sha, still listed as a validated commit — must not become
+    # unreachable garbage in a reflog-less bare repo. It is anchored, and its content
+    # is still readable by sha (a §9 pin replay / a pointer at it keeps working).
+    assert app.git.recovered_sha(draft_id) == sha
+    assert app.git.head(app.git.recovered_ref(draft_id)) == sha
+    assert app.git.read("support/system/v1.j2", ref=sha) == "hi {{ x }} (stranded edit)"
+
+
+def test_recovery_replay_commits_row_before_main_moves(app, caplog):
+    """The replay must follow the staged protocol: its CommitValidation row lands in
+    the caller's transaction and main moves only in after_commit. A failure after the
+    row is added but before commit therefore leaves main untouched and the pending
+    ref in place (no unvalidated tip, nothing lost), and the next pass completes."""
+    from incant.registry import recover_pending_promotions
+
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        d0 = reg.create_draft("support/system", version_number=1, author="sam",
+                              content="hi {{ x }}")
+        reg.commit_draft(d0.id, author="sam")
+    draft_id, sha, _ = _stranded_publish(app, content="hi {{ x }} (stranded edit)")
+    other = app.git.commit_version("support/system", 1, "hi {{ x }} (newer)",
+                                   author_name="sam", author_email="sam@x", message="newer")
+    with session_scope() as s:
+        s.add(models.CommitValidation(
+            sha=other, blob_sha="", path="support/system/v1.j2",
+            prompt_id="support/system", version_number=1, status="valid",
+            extracted_variables={},
+        ))
+
+    # Pass 1 inside a transaction we then ROLL BACK ("failure after the row was added").
+    s = session_factory()()
+    try:
+        result = recover_pending_promotions(s, app.git)
+        assert result.rebased == 1
+        assert app.git.head() == other                    # main has NOT moved
+        pending = app.git.list_pending_refs()
+        assert len(pending) == 1 and pending[0][0] == draft_id
+        replay_sha = pending[0][1]
+        assert replay_sha != sha                          # the pending ref now holds the replay
+        assert app.git.recovered_sha(draft_id) == sha     # the original was anchored FIRST
+        s.flush()
+        s.rollback()
+    finally:
+        s.close()
+
+    # After the rollback: main untouched, no row for the replay, no unvalidated tip,
+    # pending residue still there for the next pass, original still reachable.
+    assert app.git.head() == other
+    assert len(app.git.list_pending_refs()) == 1
+    with session_scope() as s:
+        assert s.execute(select(models.CommitValidation).where(
+            models.CommitValidation.sha == replay_sha)).first() is None
+        assert reconcile_main_commits(s, app.git).unvalidated_tips == 0
+    assert app.git.read("support/system/v1.j2", ref=sha) == "hi {{ x }} (stranded edit)"
+
+    # Pass 2 (a committed transaction) converges: the pending ref holds a row-less
+    # replay, but the anchor names the committed original → replayed again and promoted.
+    with caplog.at_level("WARNING", logger="incant.reconcile"):
+        with session_scope() as s:
+            result = recover_pending_promotions(s, app.git)
+    assert result.rebased == 1 and result.discarded == 0
+    assert app.git.list_pending_refs() == []
+    assert app.git.read("support/system/v1.j2") == "hi {{ x }} (stranded edit)"
+    tip = app.git.head()
+    with session_scope() as s:
+        rows = s.execute(select(models.CommitValidation).where(
+            models.CommitValidation.sha == tip)).scalars().all()
+        assert len(rows) == 1 and rows[0].status == "valid"
+        assert reconcile_main_commits(s, app.git).unvalidated_tips == 0
+    assert app.git.recovered_sha(draft_id) == sha
+    assert "promoted as" in caplog.text
+
+
+def test_recovery_replays_stranded_chain_in_order(app):
+    """One transaction stages publishes as a chain (B's parent is A). If recovery
+    walked them by refname, B ('d_aaa') would come first, fail to fast-forward and be
+    replayed as a synthetic sha — then A too. In chain order both simply promote."""
+    from incant.registry import recover_pending_promotions
+
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        d0 = reg.create_draft("support/system", version_number=1, author="sam",
+                              content="hi {{ x }}")
+        reg.commit_draft(d0.id, author="sam")
+    head = app.git.head()
+    # Draft ids chosen so refname order is the REVERSE of chain order.
+    sha_a, parent_a = app.git.commit_version_pending(
+        "support/system", 1, "A {{ x }}", author_name="sam", author_email="sam@x",
+        message="A", draft_id="d_zzz")
+    sha_b, parent_b = app.git.commit_version_pending(
+        "support/system", 1, "B {{ x }}", author_name="sam", author_email="sam@x",
+        message="B", draft_id="d_aaa", parent=sha_a)
+    assert parent_a == head and parent_b == sha_a
+    assert [d for d, _ in app.git.list_pending_refs()] == ["d_aaa", "d_zzz"]
+    with session_scope() as s:
+        for sha in (sha_a, sha_b):
+            s.add(models.CommitValidation(
+                sha=sha, blob_sha="", path="support/system/v1.j2",
+                prompt_id="support/system", version_number=1, status="valid",
+                extracted_variables={},
+            ))
+
+    with session_scope() as s:
+        result = recover_pending_promotions(s, app.git)
+    assert result.promoted == 2 and result.rebased == 0 and result.discarded == 0
+    assert app.git.head() == sha_b and app.git.is_ancestor(sha_a)
+    assert app.git.read("support/system/v1.j2") == "B {{ x }}"
+    assert app.git.list_pending_refs() == []
+    # Nothing diverged, so nothing needed anchoring.
+    assert app.git.recovered_sha("d_zzz") is None and app.git.recovered_sha("d_aaa") is None
+
+
+def test_recovered_ref_reaches_replicas_by_mirror_fetch(app, tmp_path):
+    """Replicas only ever see refs/* through mirror fetches; the anchor must travel
+    with them so a pointer at the original sha resolves content on every node."""
+    import subprocess
+
+    from incant.gitstore import GitStore
+    from incant.registry import recover_pending_promotions
+
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        d0 = reg.create_draft("support/system", version_number=1, author="sam",
+                              content="hi {{ x }}")
+        reg.commit_draft(d0.id, author="sam")
+    remote = str(tmp_path / "backup.git")
+    subprocess.run(["git", "init", "--bare", "--quiet", remote], check=True)
+    app.git.push_mirror(remote)
+    replica = GitStore(tmp_path / "replica")
+    replica.clone_mirror(remote)                          # hydrated BEFORE the recovery
+
+    draft_id, sha, _ = _stranded_publish(app, content="hi {{ x }} (stranded edit)")
+    other = app.git.commit_version("support/system", 1, "hi {{ x }} (newer)",
+                                   author_name="sam", author_email="sam@x", message="newer")
+    with session_scope() as s:
+        s.add(models.CommitValidation(
+            sha=other, blob_sha="", path="support/system/v1.j2",
+            prompt_id="support/system", version_number=1, status="valid",
+            extracted_variables={},
+        ))
+    with session_scope() as s:
+        assert recover_pending_promotions(s, app.git).rebased == 1
+
+    app.git.push_mirror(remote)
+    replica.mirror_fetch(remote)                          # the steady-state follow path
+    assert replica.head() == app.git.head()
+    assert replica.recovered_sha(draft_id) == sha
+    assert replica.read("support/system/v1.j2", ref=sha) == "hi {{ x }} (stranded edit)"
+
+
+def test_recovery_revalidates_replay_against_final_tree(app, caplog):
+    """The verdict is not a pure function of the content: a fragment edited while the
+    publish was stranded can close an include cycle. The replay re-runs the static
+    checks against the tree it actually lands in and records THAT verdict."""
+    from incant.registry import recover_pending_promotions
+
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        reg.create_prompt("support/frag")
+        df = reg.create_draft("support/frag", version_number=1, author="sam", content="FRAG")
+        reg.commit_draft(df.id, author="sam")
+        d0 = reg.create_draft("support/system", version_number=1, author="sam",
+                              content="hi {{ x }}")
+        reg.commit_draft(d0.id, author="sam")
+    stranded = '{% include "support/frag" %} {{ x }}'
+    draft_id, sha, _ = _stranded_publish(app, content=stranded)   # valid when staged
+    with session_scope() as s:
+        row = s.execute(select(models.CommitValidation).where(
+            models.CommitValidation.sha == sha)).scalar_one()
+        assert row.status == "valid"
+    # While stranded, the fragment starts including support/system: the replayed
+    # content now closes a cycle on the tree it will land in.
+    other = app.git.commit_version("support/frag", 1, '{% include "support/system" %}',
+                                   author_name="sam", author_email="sam@x", message="loop")
+    with session_scope() as s:
+        s.add(models.CommitValidation(
+            sha=other, blob_sha="", path="support/frag/v1.j2",
+            prompt_id="support/frag", version_number=1, status="valid",
+            extracted_variables={},
+        ))
+    with caplog.at_level("WARNING", logger="incant.reconcile"):
+        with session_scope() as s:
+            assert recover_pending_promotions(s, app.git).rebased == 1
+    tip = app.git.head()
+    assert app.git.read("support/system/v1.j2") == stranded
+    with session_scope() as s:
+        new_row = s.execute(select(models.CommitValidation).where(
+            models.CommitValidation.sha == tip)).scalar_one()
+        assert new_row.status == "invalid" and "include cycle" in (new_row.error or "")
+        # The original sha's verdict is history, untouched.
+        old_row = s.execute(select(models.CommitValidation).where(
+            models.CommitValidation.sha == sha)).scalar_one()
+        assert old_row.status == "valid"
+    assert "is invalid on the current tree" in caplog.text
 
 
 # ── reconcile-result exposure seam (ctx holder + metrics gauges) ──────────────

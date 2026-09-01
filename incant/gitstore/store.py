@@ -727,6 +727,49 @@ class GitStore:
         except GitError:
             return None
 
+    def commit_time(self, sha: str) -> int:
+        """Committer timestamp (unix seconds) of ``sha`` — the tie-breaking order key
+        pending recovery uses so refs stranded by one transaction replay oldest-first."""
+        return int(self._git("show", "-s", "--format=%ct", sha).strip())
+
+    # ── recovered publishes ──────────────────────────────────────────
+    #
+    # When recovery cannot fast-forward a stranded publish (main diverged) it
+    # re-commits the same content as a NEW sha. The ORIGINAL sha was already handed
+    # to the client, may already be a pointer's to_sha, and is selectable as a
+    # validated commit — so it must stay reachable forever: a bare repo has no
+    # reflog, and replicas only ever mirror-fetch ``refs/*``. The anchor lives under
+    # refs/incant/recovered/ (mirror-pushed/fetched like every other ref) and is
+    # never deleted automatically: it IS the durable identity for anything that
+    # already references the sha.
+
+    def recovered_ref(self, draft_id: str) -> str:
+        return f"refs/incant/recovered/{draft_id}"
+
+    def anchor_recovered(self, draft_id: str, sha: str) -> str:
+        """Pin ``sha`` under refs/incant/recovered/ and return the ref written.
+
+        The first anchor for a draft takes ``recovered/<draft>``. A LATER, different
+        sha for the same draft (a replay whose row committed but whose promotion
+        lost a race, then diverged again) must not overwrite that identity, so it
+        goes to ``recovered/<draft>-<sha7>`` instead. Idempotent for a repeat of the
+        same sha."""
+        ref = self.recovered_ref(draft_id)
+        current = self.recovered_sha(draft_id)
+        if current is not None and current != sha:
+            ref = f"{ref}-{sha[:7]}"
+        self._git("update-ref", ref, sha)
+        return ref
+
+    def recovered_sha(self, draft_id: str) -> str | None:
+        """The original sha anchored for ``draft_id``, or None if never recovered."""
+        proc = subprocess.run(
+            ["git", "--git-dir", str(self.repo), "rev-parse", "--verify", "--quiet",
+             self.recovered_ref(draft_id)],
+            capture_output=True, text=True,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
     # ── drafts ───────────────────────────────────────────────────────
 
     def draft_ref(self, draft_id: str) -> str:

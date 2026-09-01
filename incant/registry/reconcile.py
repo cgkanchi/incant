@@ -45,11 +45,12 @@ import datetime as dt
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, event, func, select
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..gitstore import GitStore
+from ..gitstore.store import ConcurrentUpdate
 
 log = logging.getLogger("incant.reconcile")
 
@@ -147,7 +148,7 @@ def adopt_content_tree(session: Session, git: GitStore) -> AdoptResult | None:
     Rebuilds: the single project (from the tree's top directory — a repo with
     several top directories predates one-project-per-deployment and is refused),
     prompt and version rows, and a fresh ``CommitValidation`` for each version's
-    TIP (validation is a pure function of content: compile + include resolution +
+    TIP (the static checks against the adopted tree: compile + include resolution +
     cycle check; test contexts don't exist yet, so no render check). Targeting,
     users, RBAC, and audit live in Postgres — restoring those needs the DB backup.
     """
@@ -221,12 +222,89 @@ def adopt_content_tree(session: Session, git: GitStore) -> AdoptResult | None:
 @dataclass
 class PendingRecoveryResult:
     promoted: int      # DB committed, main was at the staged parent → fast-forwarded
-    rebased: int       # DB committed, main diverged → re-committed atop current main
+    rebased: int       # DB committed, main diverged → replay staged; lands at commit
     discarded: int     # DB never committed → staging residue deleted, draft intact
 
     def summary(self) -> str:
         return (f"pending recovery: promoted {self.promoted}, rebased {self.rebased}, "
                 f"discarded {self.discarded} staged publish(es)")
+
+
+def _validation_for(session: Session, sha: str | None) -> models.CommitValidation | None:
+    if sha is None:
+        return None
+    return session.execute(
+        select(models.CommitValidation).where(models.CommitValidation.sha == sha)
+    ).scalars().first()
+
+
+def _ordered_pending_refs(git: GitStore) -> list[tuple[str, str]]:
+    """Stranded pending refs in REPLAY order: parents before children, oldest first.
+
+    ``list_pending_refs`` yields refname order, which means nothing here: one
+    transaction stages several publishes as a CHAIN (each onto the previous staged
+    sha — see ``commit_draft``), and replaying a chain out of order would drive every
+    later link down the diverged branch — a synthetic sha per link, the original shas
+    orphaned — when the whole chain could simply fast-forward. So: roots (a parent
+    that is not itself pending) by commit time, each followed depth-first by the
+    pending commits built on it.
+    """
+    rows = git.list_pending_refs()
+    by_sha = {sha: draft_id for draft_id, sha in rows}
+    parent = {sha: git.commit_parent(sha) for sha in by_sha}
+    order_key = {sha: (git.commit_time(sha), sha) for sha in by_sha}
+    children: dict[str, list[str]] = {}
+    roots: list[str] = []
+    for sha in by_sha:
+        if parent[sha] in by_sha:
+            children.setdefault(parent[sha], []).append(sha)
+        else:
+            roots.append(sha)
+
+    ordered: list[tuple[str, str]] = []
+
+    def walk(sha: str) -> None:
+        ordered.append((by_sha[sha], sha))
+        for child in sorted(children.get(sha, ()), key=order_key.__getitem__):
+            walk(child)
+
+    for root in sorted(roots, key=order_key.__getitem__):
+        walk(root)
+    return ordered
+
+
+def _revalidate_replay(session: Session, git: GitStore, cv: models.CommitValidation,
+                       content: str, tree_sha: str) -> tuple[str, str | None, dict]:
+    """(status, error, extracted_variables) for ``content`` replayed into the tree at
+    ``tree_sha``.
+
+    Validation is NOT a pure function of the content: the static cycle check walks
+    the include graph of the tree it lands in, and the render check resolves includes
+    through the default environment's live pointers. Both can differ between the
+    original staging and now — a fragment edited while the publish was stranded can
+    close a cycle. The static checks are cheap and need only git + the version
+    registry, so they run again against the FINAL tree. The render check needs the
+    default-env snapshot (and the environment name) that recovery does not have at
+    boot, so its verdict is INHERITED from the original sha; the log line and the
+    replay's commit message say so. Conservative merge: a failure on either side is
+    a failure — the original verdict was what the client saw for this content, and a
+    replay never silently upgrades it."""
+    from ..gitstore import validate_source
+
+    def include_source(target: str) -> str | None:
+        top = session.execute(
+            select(func.max(models.Version.number)).where(models.Version.prompt_id == target)
+        ).scalar()
+        return git.read(f"{target}/v{top}.j2", ref=tree_sha) if top else None
+
+    static = validate_source(
+        content, cv.prompt_id,
+        is_known_prompt=lambda pid: session.get(models.Prompt, pid) is not None,
+        include_source=include_source, test_render=None,
+    )
+    if not static.ok:
+        return "invalid", static.error, static.extracted_variables
+    return cv.status, cv.error, static.extracted_variables
 
 
 def recover_pending_promotions(session: Session, git: GitStore) -> PendingRecoveryResult:
@@ -235,76 +313,177 @@ def recover_pending_promotions(session: Session, git: GitStore) -> PendingRecove
     ``commit_draft`` stages each publish on ``refs/incant/pending/<draft>`` and
     promotes it to main only after the control-plane transaction commits. A crash in
     between leaves the pending ref; the DB is the arbiter of which side of the line
-    the publish died on:
+    the publish died on — a ``CommitValidation`` row for the staged sha (or, see
+    below, for its recovered anchor) means the transaction COMMITTED and the
+    promotion is owed; no row means it never did, so the staging residue is deleted
+    and the draft ref + still-open row remain the recoverable source of truth.
 
-    * a ``CommitValidation`` row exists for the staged SHA → the transaction
-      COMMITTED, so the promotion is owed: fast-forward main if it is still at the
-      staged parent (or already contains the SHA — a double-run), else re-commit the
-      same content atop the current main (recording a fresh validation row for the
-      new SHA, same verdict — validation is a pure function of the content);
-    * no row → the transaction never committed: the staging residue is deleted, and
-      the draft ref + still-open row remain the recoverable source of truth.
+    An owed promotion fast-forwards main when main is still at the staged parent (or
+    already contains the sha — a double-run). When main has DIVERGED the same content
+    is replayed as a fresh commit, and that replay follows the live publish protocol
+    exactly rather than a shortcut:
 
-    Runs at boot and on the reconcile interval, under the publish lock so it never
-    races a live publish. Caller owns the transaction."""
+    * **The original sha stays reachable.** It was already returned to the client,
+      may already be a pointer's ``to_sha``, and is selectable as a validated commit;
+      a bare repo has no reflog and replicas only mirror-fetch ``refs/*``. So before
+      anything else it is anchored at ``refs/incant/recovered/<draft>`` — never
+      deleted automatically: that ref IS the durable identity for whatever already
+      references the sha (see ``GitStore.anchor_recovered``).
+    * **The DB row lands before git moves.** The replay is staged on the draft's
+      pending ref (``commit_version_pending``, chained onto anything already staged
+      in this transaction), its ``CommitValidation`` row is added to the CALLER's
+      transaction, and main moves + the pending/draft refs are dropped only in an
+      ``after_commit`` hook — the same mechanism as ``commit_draft``. A rollback or
+      crash after staging leaves the pending ref holding a row-less replay and the
+      anchor holding the committed original: that is the "no row, but anchored"
+      clause of the arbiter, and the next pass replays again from the anchor.
+      Nothing is ever left as an unvalidated tip on main.
+    * **Stranded refs replay in chain order** (``_ordered_pending_refs``), so a
+      multi-publish transaction that died fast-forwards link by link instead of
+      needlessly diverging. Once a replay is staged in a pass, every later ref is
+      replayed onto it too — a fast-forward would move main out from under the
+      staged replay's CAS.
+    * **The replayed content is re-validated statically against the final tree**;
+      the render verdict is inherited (``_revalidate_replay``).
+
+    Runs at boot and on the reconcile interval. Holds the publish lock from the
+    first ref through the deferred promotion so it never races a live publish.
+    Caller owns the transaction."""
     promoted = rebased = discarded = 0
-    with git.publish_lock:
-        for draft_id, sha in git.list_pending_refs():
-            cv = session.execute(
-                select(models.CommitValidation).where(models.CommitValidation.sha == sha)
-            ).scalars().first()
-            if cv is None:
-                git.delete_pending(draft_id)
-                discarded += 1
-                log.warning(
-                    "pending recovery: discarded staged publish %s for draft %s — its "
-                    "control-plane transaction never committed; the draft is intact.",
-                    sha, draft_id,
-                )
-                continue
+    lock = git.publish_lock
+    lock.acquire()
+    released = False
 
-            if git.is_ancestor(sha):
+    def _release_lock() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            lock.release()
+
+    # Publishes staged but not yet promoted in THIS transaction (shared with
+    # commit_draft so a publish in the same transaction chains onto our replays).
+    chain: list[str] = session.info.setdefault("incant_pending_chain", [])
+    staged: list[tuple[str, str, str, str]] = []  # (draft_id, original, new_sha, parent)
+    try:
+        for draft_id, sha in _ordered_pending_refs(git):
+            cv = _validation_for(session, sha)
+            original = sha
+            if cv is None:
+                # No row for the staged sha: plain residue of a transaction that
+                # never committed — unless an anchor says this pending ref holds a
+                # replay whose own transaction failed; then the anchored original
+                # is the committed identity and the replay is still owed.
+                original = git.recovered_sha(draft_id)
+                cv = _validation_for(session, original)
+                if cv is None:
+                    git.delete_pending(draft_id)
+                    discarded += 1
+                    log.warning(
+                        "pending recovery: discarded staged publish %s for draft %s — its "
+                        "control-plane transaction never committed; the draft is intact.",
+                        sha, draft_id,
+                    )
+                    continue
+            elif git.is_ancestor(sha):
                 git.delete_pending(draft_id)
                 git.delete_draft(draft_id)
                 continue  # promotion already happened (crash after CAS, before cleanup)
-
-            parent = git.commit_parent(sha)
-            if parent is not None and git.head() == parent:
-                git.promote_pending(sha, parent)
-                git.delete_pending(draft_id)
-                git.delete_draft(draft_id)
-                promoted += 1
-                log.warning(
-                    "pending recovery: promoted staged publish %s for draft %s "
-                    "(crash between DB commit and ref promotion).", sha, draft_id,
-                )
             else:
-                # Main diverged while the publish was stranded: replay the same
-                # content as a fresh commit and record its (identical) verdict.
-                content = git.read(cv.path, ref=sha)
-                if content is None:  # pragma: no cover - staged object vanished
-                    log.error("pending recovery: staged content for %s unreadable; "
-                              "leaving the ref for a human", draft_id)
+                parent = git.commit_parent(sha)
+                if not chain and parent is not None and git.head() == parent:
+                    git.promote_pending(sha, parent)
+                    git.delete_pending(draft_id)
+                    git.delete_draft(draft_id)
+                    promoted += 1
+                    log.warning(
+                        "pending recovery: promoted staged publish %s for draft %s "
+                        "(crash between DB commit and ref promotion).", sha, draft_id,
+                    )
                     continue
-                new_sha = git.commit_version(
-                    cv.prompt_id, cv.version_number, content,
-                    author_name="Incant recovery", author_email="incant@localhost",
-                    message=f"recovered publish (draft {draft_id})", draft_id=draft_id,
-                )
-                session.add(models.CommitValidation(
-                    sha=new_sha, blob_sha=cv.blob_sha, path=cv.path,
-                    prompt_id=cv.prompt_id, version_number=cv.version_number,
-                    status=cv.status, error=cv.error,
-                    extracted_variables=cv.extracted_variables,
-                ))
-                git.delete_pending(draft_id)
-                git.delete_draft(draft_id)
-                rebased += 1
+
+            # Diverged (or queued behind a replay staged earlier in this transaction).
+            content = git.read(cv.path, ref=original)
+            if content is None:  # pragma: no cover - staged object vanished
+                log.error("pending recovery: staged content for %s unreadable; "
+                          "leaving the ref for a human", draft_id)
+                continue
+            anchor_ref = git.anchor_recovered(draft_id, original)
+            new_sha, parent = git.commit_version_pending(
+                cv.prompt_id, cv.version_number, content,
+                author_name="Incant recovery", author_email="incant@localhost",
+                message=(f"recovered publish (draft {draft_id}): replays {original} atop a "
+                         "diverged main; static checks re-run, render verdict inherited"),
+                draft_id=draft_id, parent=chain[-1] if chain else None,
+            )
+            chain.append(new_sha)
+            status, error, variables = _revalidate_replay(session, git, cv, content, new_sha)
+            if status != cv.status:
                 log.warning(
-                    "pending recovery: main diverged from staged publish %s for draft "
-                    "%s — re-committed as %s with the same validation verdict.",
-                    sha, draft_id, new_sha,
+                    "pending recovery: replay of %s for draft %s is %s on the current tree "
+                    "(originally %s): %s", original, draft_id, status, cv.status, error,
                 )
+            # A deterministic replay (same tree, parent, message, second) can reproduce
+            # a sha whose row already committed on an earlier pass; never duplicate it.
+            if _validation_for(session, new_sha) is None:
+                session.add(models.CommitValidation(
+                    sha=new_sha, blob_sha=git.blob_sha(cv.path, ref=new_sha) or "",
+                    path=cv.path, prompt_id=cv.prompt_id, version_number=cv.version_number,
+                    status=status, error=error, extracted_variables=variables,
+                ))
+            staged.append((draft_id, original, new_sha, parent))
+            rebased += 1
+            log.warning(
+                "pending recovery: main diverged from staged publish %s for draft %s — "
+                "replay staged as %s (original anchored at %s); main moves when the "
+                "transaction commits.", original, draft_id, new_sha, anchor_ref,
+            )
+    except BaseException:
+        _release_lock()
+        raise
+
+    if not staged:
+        _release_lock()
+    else:
+        def _promote(_session: Session) -> None:
+            try:
+                for draft_id, original, new_sha, parent in staged:
+                    try:
+                        git.promote_pending(new_sha, parent)
+                    except ConcurrentUpdate:
+                        if not git.is_ancestor(new_sha):
+                            log.critical(
+                                "pending recovery: could not promote replay %s for draft %s "
+                                "— main moved under it. The row is committed and the "
+                                "pending + recovered refs are kept; the next pass replays "
+                                "again.", new_sha, draft_id,
+                            )
+                            break  # every later link chains onto this one
+                    git.delete_pending(draft_id)
+                    git.delete_draft(draft_id)
+                    log.warning(
+                        "pending recovery: replayed publish %s for draft %s promoted as %s.",
+                        original, draft_id, new_sha,
+                    )
+            except Exception:  # pragma: no cover - best-effort post-commit cleanup
+                log.warning("pending recovery: post-commit promotion hit an error; the "
+                            "next pass converges it.", exc_info=True)
+            finally:
+                for _, _, new_sha, _ in staged:
+                    if new_sha in chain:
+                        chain.remove(new_sha)
+                _release_lock()
+
+        def _abandon(_session: Session) -> None:
+            # Nothing to undo in git: the pending refs hold row-less replays and the
+            # anchors hold the committed originals — exactly what the "no row, but
+            # anchored" clause re-derives on the next pass.
+            for _, _, new_sha, _ in staged:
+                if new_sha in chain:
+                    chain.remove(new_sha)
+            _release_lock()
+
+        event.listen(session, "after_commit", _promote, once=True)
+        event.listen(session, "after_rollback", _abandon, once=True)
 
     result = PendingRecoveryResult(promoted=promoted, rebased=rebased, discarded=discarded)
     if promoted or rebased or discarded:

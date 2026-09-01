@@ -458,39 +458,67 @@ class RegistryService:
         return self.git.read(f"{target_prompt_id}/v{top}.j2")
 
     def validate(self, prompt_id: str, source: str):
-        return validate_source(
+        """Full §5 validation of ``source`` as a commit candidate for ``prompt_id``.
+        Never raises for a bad template or a bad tree — every render-time failure is
+        a verdict, not an exception (the draft editor calls this on every GET, so an
+        exception here would lock the author out of the very draft they need to fix).
+        When the render check could not run, the result says so and why."""
+        test_render, skipped = self._make_test_render(prompt_id)
+        result = validate_source(
             source, prompt_id,
             is_known_prompt=self.prompt_exists,
             include_source=self._include_source,
-            test_render=self._make_test_render(prompt_id),
+            test_render=test_render,
         )
+        if test_render is None:
+            result.render_skipped_reason = skipped
+        return result
 
     def _make_test_render(self, prompt_id: str):
-        """A strict-render check over the prompt's test contexts (§5). Returns a
-        callable(source)->error|None, or None when there are no contexts to render
-        against or the default-env snapshot can't be built."""
+        """A strict-render check over the prompt's test contexts (§5). Returns
+        ``(callable(source)->error|None, None)``, or ``(None, reason)`` when the check
+        cannot run — no contexts, or the default-env snapshot can't be built.
+
+        The snapshot failure is the dangerous one: a misconfigured
+        ``INCANT_DEFAULT_ENVIRONMENT`` would otherwise disable the render check
+        deployment-wide while every commit is still recorded ``valid``. It stays
+        non-fatal on purpose (a fresh deployment commits before its environment
+        exists), but it is logged and carried on the result so the commit response and
+        the draft payload show the check did not run."""
         contexts = self.get_test_contexts(prompt_id)
         if not contexts:
-            return None
+            return None, f"no test contexts for {prompt_id!r}"
         # Lazy imports avoid an import cycle (targeting/core -> registry).
-        from ..core import MissingVariable, RenderError, Unservable, render_source
-        from ..core.errors import UnresolvedPrompt
+        from ..core import render_source
+        from ..core.errors import CoreError
         from ..targeting import build_snapshot
         try:
             snap = build_snapshot(self.s, self.default_env)
-        except Exception:
-            return None  # no snapshot (e.g. env missing) -> skip render check
+        except Exception as exc:  # noqa: BLE001 - any snapshot failure is a skipped check
+            reason = (f"default environment {self.default_env!r} snapshot unavailable "
+                      f"({type(exc).__name__}: {exc})")
+            log.warning("validate: render check for %s skipped — %s", prompt_id, reason)
+            return None, reason
 
         def check(source: str) -> str | None:
             for c in contexts:
                 try:
                     render_source(snap, prompt_id, source, c.flags or {}, c.variables or {},
                                   self.content)
-                except (MissingVariable, RenderError, Unservable, UnresolvedPrompt) as exc:
+                except CoreError as exc:
+                    # Every core failure is a verdict: missing variable, render error,
+                    # unresolvable/unservable include — AND the include cycle / depth
+                    # errors, which the static check cannot see when a live pointer
+                    # (not the newest version) is what closes the cycle.
                     return f"render failed for test context {c.name!r}: {exc}"
+                except KeyError as exc:
+                    # ContentStore.get: a resolved SHA whose file is not in the repo.
+                    detail = exc.args[0] if exc.args else exc
+                    return (f"render failed for test context {c.name!r}: resolved "
+                            f"content missing from store ({detail})")
             return None
 
-        return check
+        return check, None
 
     def commit_draft(
         self, draft_id: str, *, author: str, email: str = "", message: str = "",
@@ -650,6 +678,8 @@ class RegistryService:
         return CommitOutcome(sha, blob_sha, d.version_number, {
             "status": result.status, "error": result.error,
             "variables": result.extracted_variables,
+            "render_checked": result.render_checked,
+            "render_skipped_reason": result.render_skipped_reason,
         })
 
     def _required_approvals(self, draft: models.Draft) -> int:
