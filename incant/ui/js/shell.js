@@ -146,8 +146,6 @@ function sidebar() {
     <a class="nav ${State.route.name === "prompts" ? "active" : ""}" href="#/prompts" data-act="go" data-hash="#/prompts">
       <span class="gl">◈</span><span>Prompts</span></a>
     ${subnav(pid)}
-    <a class="nav ${State.route.name === "segments" ? "active" : ""}" href="#/segments" data-act="go" data-hash="#/segments">
-      <span class="gl">⬡</span><span>Segments</span></a>
     <a class="nav ${State.route.name === "play" ? "active" : ""}" href="#/play" data-act="go" data-hash="#/play">
       <span class="gl">▶</span><span>Playground</span></a>
     ${canRole("viewer") ? `<a class="nav ${State.route.name === "audit" ? "active" : ""}" href="#/audit" data-act="go" data-hash="#/audit">

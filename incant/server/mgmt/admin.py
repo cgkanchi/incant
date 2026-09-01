@@ -46,14 +46,14 @@ def _validate_env_id(env_id: str) -> None:
         )
 
 
-# Every table whose rows are scoped to one environment by ``environment_id``. Rule, Segment,
+# Every table whose rows are scoped to one environment by ``environment_id``. Rule,
 # EnvDefault, KillSwitch, PointerMove and the observed-flags tables carry a real FK to
 # ``environments.id`` (the observed-flags ones with ON DELETE CASCADE); RuleRevision and
 # RoleBinding hold it as a plain string. Delete/rename fan out across all nine — rename
 # MUST repoint the cascading tables too, or deleting the old parent row would take the
 # observed flags and suppressions with it.
 _ENV_SCOPED_MODELS = (
-    models.Rule, models.Segment, models.EnvDefault, models.KillSwitch,
+    models.Rule, models.EnvDefault, models.KillSwitch,
     models.PointerMove, models.RuleRevision, models.RoleBinding,
     models.ObservedFlag, models.ObservedFlagSuppression,
 )
@@ -165,7 +165,7 @@ def delete_env(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    """Delete an environment and EVERYTHING scoped to it — rules, segments, defaults, kill
+    """Delete an environment and EVERYTHING scoped to it — rules, defaults, kill
     switches, the whole live-pointer history, rule revisions, and any env-scoped role
     bindings — in one request/transaction.
 
@@ -198,7 +198,7 @@ def delete_env(
                                f"retype '{env}' to confirm"},
         )
     before = {"protected": e.protected, "track_tip": e.track_tip}
-    # FK-bearing children (Rule/Segment/EnvDefault/KillSwitch/PointerMove) must go before the
+    # FK-bearing children (Rule/EnvDefault/KillSwitch/PointerMove) must go before the
     # parent env row; RuleRevision/RoleBinding hold the id as a plain string (order-free).
     counts = {
         m.__tablename__: (session.execute(

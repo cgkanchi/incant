@@ -4,7 +4,7 @@ Roles (DESIGN.md §11), most-privileged last, with implication:
     renderer   — serving API only
     viewer     — read prompts/versions/rules/history, previews
     editor      = viewer + authoring (drafts, commits subject to review policy)
-    operator    = viewer + targeting (rules, segments, ramps, kills, pointers, defaults)
+    operator    = viewer + targeting (rules, kills, pointers, defaults)
     releaser    = operator + approvals for protected pointer-class changes
     admin       — everything
 Bindings are (principal, role, scope); scope = instance | project | (project, env).

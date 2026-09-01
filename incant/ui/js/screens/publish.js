@@ -75,8 +75,7 @@ async function openPublishModal({ v, toSha, toShort, mode }) {
   let tcs = [];
   try { const t = await GET(`/mgmt/prompts/${enc(pid)}/test-contexts`); tcs = t.test_contexts || []; } catch (_) {}
   const vrow = dv.versions.find((x) => x.version === v) || {};
-  // Prompt-scoped rules serving this prompt @tip become redundant once tip is live —
-  // mirror stopTestPublish's safety (never auto-archive a global rule).
+  // Rules serving this prompt @tip become redundant once tip is live.
   const tipRules = activeRulesFor(rd.rules, pid).filter((r) => r.prompt_id && (serveTarget(r.serve) || {}).tip);
   window._publish = {
     pid, env, mode, v, toSha,

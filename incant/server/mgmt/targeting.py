@@ -1,4 +1,4 @@
-"""Rules, segments, revisions, rollback, pointers, defaults, kill switches, envs (read)."""
+"""Rules, revisions, rollback, pointers, defaults, kill switches, envs (read)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from ...targeting.audit import record_audit
 from ...targeting.observed import (
     all_rules, collect_rule_flags, forget_flag, load_suppressions, typed_value,
 )
-from ...targeting.service import _segment_refs
 from ..auth import Identity
 from ..deps import app_context, get_session, identity
 from ...service import AppContext
@@ -25,9 +24,8 @@ from ..schemas import (
     RuleBatchRequest,
     RuleRequest,
     RuleStatusRequest,
-    SegmentRequest,
 )
-from .helpers import _confirm_lock, _project_of, _references_segment, _require
+from .helpers import _confirm_lock, _project_of, _require
 
 router = APIRouter()
 
@@ -36,20 +34,14 @@ def _require_stored_scope(ident: Identity, existing: models.Rule, env: str) -> N
     """Rehoming defense: require authority over where a rule lives NOW.
 
     Rule ids are globally unique, client-supplied strings that GET /rules surfaces, and
-    ``TargetingService.upsert_rule`` loads any existing rule by id then freely overwrites its
-    ``scope``/``prompt_id`` (it guards ONLY cross-ENVIRONMENT capture). So authorizing the
-    REQUEST scope alone is not enough: a project-A operator could POST a GLOBAL rule's id
-    re-scoped to A (neutering an env-wide rule with only project authority) or take a known
-    project-B rule id and rehome it into A. scope/prompt are legitimately editable — the
-    composer offers scope switching — so ownership is NOT immutable; the invariant is instead
-    DUAL authorization: authority over BOTH the stored scope and the requested scope. Creating
-    a rule (no existing row) needs only the requested-scope check; editing one needs both.
-    Callers apply this only when the rule already lives in THIS env — the cross-env case is
-    rejected by the service with its own clear message."""
-    if existing.prompt_id:
-        _require(ident, "operator", project=_project_of(existing.prompt_id), environment=env)
-    else:
-        _require(ident, "operator", environment=env)
+    ``TargetingService.upsert_rule`` loads any existing rule by id then overwrites its
+    ``prompt_id`` (it guards ONLY cross-ENVIRONMENT capture). So authorizing the REQUEST
+    prompt alone is not enough: a project-A operator could take a known project-B rule id
+    and rehome it into A. The invariant is DUAL authorization — authority over BOTH the
+    stored prompt's project and the requested one. Creating a rule (no existing row) needs
+    only the requested check; editing one needs both. Callers apply this only when the rule
+    already lives in THIS env — the cross-env case is rejected by the service."""
+    _require(ident, "operator", project=_project_of(existing.prompt_id), environment=env)
 
 
 @router.get("/envs")
@@ -81,11 +73,8 @@ def get_rules(
     # single project reaches prompt screens that fetch this list and, with only the env-wide
     # door, sees a swallowed 403 as an empty (i.e. wrong) rule set. The optional `project`
     # param opens a narrower door: with it we require viewer on THAT project (in this env)
-    # and return only the rules that govern the project's prompts — the project's own
-    # prompt-scoped rules PLUS every *global* rule. Global rules target labels/segments that
-    # apply across every project's prompts (including this one), so a project viewer
-    # legitimately needs to see them. Without the param, behaviour is unchanged: env-wide
-    # viewer, the full unfiltered list.
+    # and return only the rules on the project's prompts. Without the param, behaviour is
+    # unchanged: env-wide viewer, the full unfiltered list.
     if project is not None:
         _require(ident, "viewer", project=project, environment=env)
     else:
@@ -106,17 +95,14 @@ def get_rules(
     snap = app.get_snapshot(session, env)
 
     rules = [
-        {"id": r.id, "scope": r.scope, "prompt_id": r.prompt_id, "priority": r.priority,
+        {"id": r.id, "prompt_id": r.prompt_id, "priority": r.priority,
          "when": r.clauses, "serve": r.serve, "status": r.status, "comment": r.comment,
          "unservable_reason": _unservable_reason(snap, r)}
         for r in tgt.list_rules(env)
-        # Scoped read keeps global rules (they govern this project's prompts too) plus the
-        # project's own prompt-scoped rules; other projects' rules stay hidden.
-        if project is None or r.scope == "global" or _in_project(r.prompt_id)
+        if project is None or _in_project(r.prompt_id)
     ]
-    # Kills and defaults are always prompt-scoped (never global), so the scoped read filters
-    # them to the project alone — keeping the response's testing/kill/default facts internally
-    # consistent with the (filtered) rule list the caller can see.
+    # Kills and defaults are prompt-scoped too, so the scoped read filters them to the
+    # project alone — keeping the response's facts consistent with the visible rule list.
     kills = {k.prompt_id: k.engaged for k in session.execute(
         select(models.KillSwitch).where(models.KillSwitch.environment_id == env)
     ).scalars() if project is None or _in_project(k.prompt_id)}
@@ -137,43 +123,25 @@ def _unservable_reason(snap, r: models.Rule) -> str | None:
     learns "this can never serve" at save time, not after 30 baffling requests."""
     if r.status != "active":
         return None
-    missing = sorted(_segment_refs(r.clauses) - set(snap.segments))
-    if missing:
-        return f"segment {missing[0]!r} does not exist"
     serve = r.serve if isinstance(r.serve, dict) else {}
-    if r.scope == "global":
-        label = serve.get("label") or (serve.get("rollout") or {}).get("label")
-        if label and not any(
-            snap.version_for_label(pid, label) is not None for pid in snap.versions):
-            return f"label {label!r} has no participating prompts"
-        if "version" in serve:
-            v = int(serve["version"])
-            if not any((vi := snap.version_info(pid, v)) is not None and vi.status != "archived"
-                       for pid in snap.versions):
-                return f"v{v} exists (active) for no prompt"
-        return None
+    if "version" not in serve:
+        return "serve target is not a version"
     pid = r.prompt_id
-    targets: list[tuple[int, str | None, str | None]] = []
-    if "version" in serve:
-        targets.append((int(serve["version"]), serve.get("at"), serve.get("sha")))
-    for band in (serve.get("rollout") or {}).get("weights", []):
-        if band.get("version") is not None and not band.get("default"):
-            targets.append((int(band["version"]), None, None))
-    for version, at, sha in targets:
-        vinfo = snap.version_info(pid, version)
-        if vinfo is None:
-            return f"v{version} does not exist"
-        if vinfo.status == "archived":
-            return f"v{version} is archived — unarchive it to serve"
-        if at == "tip":
-            if vinfo.tip_sha is None:
-                return f"v{version} has no validated tip"
-        elif at == "sha":
-            if not sha or not snap.servable(pid, version, sha):
-                return f"pinned SHA for v{version} is not servable"
-        elif vinfo.live_sha is None or not snap.servable(pid, version, vinfo.live_sha):
-            if not any(snap.servable(pid, version, s) for s in vinfo.previous_live):
-                return f"v{version} has no servable live content"
+    version, at, sha = int(serve["version"]), serve.get("at"), serve.get("sha")
+    vinfo = snap.version_info(pid, version)
+    if vinfo is None:
+        return f"v{version} does not exist"
+    if vinfo.status == "archived":
+        return f"v{version} is archived — unarchive it to serve"
+    if at == "tip":
+        if vinfo.tip_sha is None:
+            return f"v{version} has no validated tip"
+    elif at == "sha":
+        if not sha or not snap.servable(pid, version, sha):
+            return f"pinned SHA for v{version} is not servable"
+    elif vinfo.live_sha is None or not snap.servable(pid, version, vinfo.live_sha):
+        if not any(snap.servable(pid, version, s) for s in vinfo.previous_live):
+            return f"v{version} has no servable live content"
     return None
 
 
@@ -184,15 +152,11 @@ def upsert_rule(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    # Requested-scope authority: prompt-scoped rules need operator on that project+env;
-    # a *global* rule governs every project, so it requires env-wide (or instance) operator.
-    if req.prompt_id:
-        _require(ident, "operator", project=_project_of(req.prompt_id), environment=env)
-    else:
-        _require(ident, "operator", environment=env)
-    # Stored-scope authority (rehoming defense — see _require_stored_scope). Editing an
-    # existing rule also requires authority over where it lives NOW, so its scope/prompt_id
-    # can't be overwritten by a caller who only holds authority over the requested target.
+    # Requested authority: operator on the prompt's project + env.
+    _require(ident, "operator", project=_project_of(req.prompt_id), environment=env)
+    # Stored authority (rehoming defense — see _require_stored_scope). Editing an existing
+    # rule also requires authority over where it lives NOW, so its prompt_id can't be
+    # overwritten by a caller who only holds authority over the requested target.
     existing = session.get(models.Rule, req.id)
     if existing is not None and existing.environment_id == env:
         _require_stored_scope(ident, existing, env)
@@ -203,7 +167,7 @@ def upsert_rule(
         raise HTTPException(400, str(exc))
     app.invalidate_after_commit(session, env)
     out = {"id": r.id, "rules_version": session.get(models.Environment, env).rules_version}
-    # Save-time honesty: a rule whose serve target can't resolve (e.g. a rollout to a
+    # Save-time honesty: a rule whose serve target can't resolve (e.g. it names a
     # version that's never been published here) is accepted — publishing later makes it
     # real — but the author hears about it NOW, not after baffling default-only traffic.
     warning = _unservable_reason(app.get_snapshot(session, env), r)
@@ -230,8 +194,7 @@ def upsert_rules_batch(
     NOTHING persists.
 
     RBAC and TargetingError→400 mapping mirror the single upsert endpoint exactly, applied
-    per rule: a prompt-scoped rule needs `operator` on that project+env; a *global* rule
-    governs every project, so it needs env-wide `operator`. We check every rule's authz up
+    per rule: `operator` on the prompt's project+env. We check every rule's authz up
     front so a 403 anywhere in the batch persists nothing. There is deliberately NO
     type-to-confirm even on a locked env: rule edits are low-friction (DESIGN.md §7 —
     pointer-class changes are the governed acts; rule create/ramp/archive need only
@@ -239,12 +202,8 @@ def upsert_rules_batch(
     composer-save/reorder on a protected env.
     """
     for r in req.rules:
-        # Requested-scope authority.
-        if r.prompt_id:
-            _require(ident, "operator", project=_project_of(r.prompt_id), environment=env)
-        else:
-            _require(ident, "operator", environment=env)
-        # Stored-scope authority (rehoming defense) — same dual-authz invariant as the single
+        _require(ident, "operator", project=_project_of(r.prompt_id), environment=env)
+        # Stored authority (rehoming defense) — same dual-authz invariant as the single
         # upsert. Checked here in the up-front pass so a hijack attempt ANYWHERE in the batch
         # 403s before any write lands, preserving atomicity (a 403 persists nothing).
         existing = session.get(models.Rule, r.id)
@@ -286,10 +245,7 @@ def patch_rule(
     r = session.get(models.Rule, rule_id)
     if r is None or r.environment_id != env:
         raise HTTPException(404, f"unknown rule {rule_id!r} in {env!r}")
-    if r.prompt_id:
-        _require(ident, "operator", project=_project_of(r.prompt_id), environment=env)
-    else:
-        _require(ident, "operator", environment=env)
+    _require(ident, "operator", project=_project_of(r.prompt_id), environment=env)
     tgt = app.targeting(session, ident.name)
     try:
         tgt.set_rule_status(env, rule_id, req.status)
@@ -313,14 +269,10 @@ def get_revisions(
     #
     # A revision is kept when its snapshot names a prompt in `project`. Every prompt-scoped
     # revision carries a `prompt_id` in its snapshot: rule edits (_rule_snapshot), pointer
-    # moves, defaults, and kills all do. Revisions with NO prompt are env-wide facts —
-    # GLOBAL-rule edits (prompt_id is None), segment edits, and rollbacks — so they are
-    # EXCLUDED in project mode. This is narrower than get_rules on purpose: get_rules keeps
-    # global RULES because they still govern the project's prompts, but a global-rule
-    # *revision* is env-wide history a single project viewer has no scoped claim to. Best
-    # effort: the DB `limit` is applied before this filter, so project mode may return fewer
-    # than `limit` rows (same shape as get_rules' post-fetch filtering). Without the param,
-    # behaviour is unchanged: env-wide viewer, the full log.
+    # moves, defaults, and kills all do. Revisions with NO prompt are env-wide facts
+    # (rollbacks, baselines) and are EXCLUDED in project mode. Best effort: the DB `limit`
+    # is applied before this filter, so project mode may return fewer than `limit` rows.
+    # Without the param, behaviour is unchanged: env-wide viewer, the full log.
     if project is not None:
         _require(ident, "viewer", project=project, environment=env)
     else:
@@ -347,7 +299,7 @@ def rollback_targeting(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
-    # Rollback can touch global rules, so it needs env-wide operator.
+    # Rollback touches every prompt's targeting at once, so it needs env-wide operator.
     _require(ident, "operator", environment=env)
     _confirm_lock(session, env, env, req.confirm)
     tgt = app.targeting(session, ident.name)
@@ -357,44 +309,6 @@ def rollback_targeting(
         raise HTTPException(400, str(exc))
     app.invalidate_after_commit(session, env)
     return result
-
-
-@router.get("/envs/{env}/segments")
-def get_segments(
-    env: str,
-    app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
-):
-    _require(ident, "viewer", environment=env)
-    tgt = app.targeting(session, ident.name)
-    # count references from rules
-    rules = tgt.list_rules(env)
-
-    def refs(name: str) -> int:
-        return sum(1 for r in rules if _references_segment(r.clauses, name))
-
-    return {"environment": env, "segments": [
-        {"name": s.name, "when": s.clauses, "version": s.version, "referenced_by": refs(s.name)}
-        for s in tgt.list_segments(env)
-    ]}
-
-
-@router.post("/envs/{env}/segments")
-def upsert_segment(
-    env: str, req: SegmentRequest,
-    app: AppContext = Depends(app_context),
-    session: Session = Depends(get_session),
-    ident: Identity = Depends(identity),
-):
-    _require(ident, "operator", environment=env)
-    tgt = app.targeting(session, ident.name)
-    try:
-        tgt.upsert_segment(env, req.name, req.when)
-    except TargetingError as exc:
-        raise HTTPException(400, str(exc))
-    app.invalidate_after_commit(session, env)
-    return {"ok": True}
 
 
 @router.get("/envs/{env}/pointers")
@@ -461,12 +375,11 @@ def publish(
     RBAC mirrors the pieces exactly. The pointer move is releaser-gated on (project, env),
     identical to the `/pointers` endpoint, plus the same locked-env type-to-confirm. Each
     archive then rides the SAME requirement the single PATCH endpoint applies: look the rule
-    up (404 if unknown in this env), then require `operator` (prompt-scoped → project+env;
-    global → env). `releaser` implies `operator` (auth._IMPLIES), so a releaser on the
-    rule's project+env already satisfies it — but we still check per rule so an archive of a
-    rule in another project (or a global rule) isn't waved through. The pointer move runs
-    first; a bad archive id then 404s and the whole transaction — pointer move included —
-    rolls back.
+    up (404 if unknown in this env), then require `operator` on its project+env. `releaser`
+    implies `operator` (auth._IMPLIES), so a releaser on the rule's project+env already
+    satisfies it — but we still check per rule so an archive of a rule in another project
+    isn't waved through. The pointer move runs first; a bad archive id then 404s and the
+    whole transaction — pointer move included — rolls back.
     """
     _require(ident, "releaser", project=_project_of(req.prompt_id), environment=env)
     _confirm_lock(session, env, req.prompt_id, req.confirm)
@@ -486,10 +399,7 @@ def publish(
                 # Same 404 the single PATCH raises — but here it aborts the whole tx, so
                 # the pointer move above never commits.
                 raise HTTPException(404, f"unknown rule {rid!r} in {env!r}")
-            if r.prompt_id:
-                _require(ident, "operator", project=_project_of(r.prompt_id), environment=env)
-            else:
-                _require(ident, "operator", environment=env)
+            _require(ident, "operator", project=_project_of(r.prompt_id), environment=env)
             tgt.set_rule_status(env, rid, "archived")
             archived += 1
     except TargetingError as exc:

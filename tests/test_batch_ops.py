@@ -73,17 +73,16 @@ def test_rules_batch_rbac_scopes(client):
             "priority": 12, "serve": {"version": 2}, "comment": "own project"}]
     assert client.post("/mgmt/envs/staging/rules/batch", json={"rules": own},
                        headers=auth(op)).status_code == 200
-    # A GLOBAL rule ANYWHERE in the batch needs env-wide operator -> 403 for the
-    # project-scoped key; and because authz is checked before any upsert, the
-    # sibling prompt-scoped rule persists nothing. (One project per deployment:
-    # global rules are the surviving higher-authority surface.)
+    # A principal without operator on this env fails authz for EVERY rule in the batch;
+    # because authz is checked before any upsert, nothing persists.
+    prod_only = make_key(client, "operator", project="support", env="prod")
     mixed = [
-        {"id": "own-2", "scope": "prompt", "prompt_id": "support/system",
+        {"id": "own-2", "prompt_id": "support/system",
          "priority": 13, "serve": {"version": 2}, "comment": "own project"},
-        {"id": "other-1", "scope": "global",
-         "priority": 14, "serve": {"version": 1}, "comment": "needs env-wide"},
+        {"id": "other-1", "prompt_id": "support/greeting",
+         "priority": 14, "serve": {"version": 1}, "comment": "other prompt"},
     ]
-    r = client.post("/mgmt/envs/staging/rules/batch", json={"rules": mixed}, headers=auth(op))
+    r = client.post("/mgmt/envs/staging/rules/batch", json={"rules": mixed}, headers=auth(prod_only))
     assert r.status_code == 403, r.text
     got = _rules(client, "staging")
     assert "own-2" not in got and "other-1" not in got

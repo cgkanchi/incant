@@ -1,18 +1,18 @@
 ---
 name: incant-release
-description: "Release and target prompts in an Incant deployment: publish committed edits (move the live pointer), set environment defaults, run cohort tests and percentage rollouts with targeting rules and segments, stop tests by promoting the winner, roll back pointers or whole targeting states, and use kill switches. Operates on committed content only — authoring is incant-authoring's job. Keywords: publish, release, live pointer, make live, default version, targeting rule, segment, cohort, percentage rollout, stop test, promote, rollback, kill switch, protected environment."
+description: "Release and target prompts in an Incant deployment: publish committed edits (move the live pointer), set environment defaults, run cohort tests with flag-based targeting rules, stop tests by promoting the winner, roll back pointers or whole targeting states, and use kill switches. Operates on committed content only — authoring is incant-authoring's job. Keywords: publish, release, live pointer, make live, default version, targeting rule, flag, cohort, stop test, promote, rollback, kill switch, protected environment."
 license: MIT
 compatibility: Requires the Incant MCP server (incant-mcp) with an API key holding operator/releaser on the target environment. Operates on committed content; does not edit templates.
 metadata:
   author: incant
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Release, Target, and Roll Back
 
 You're changing **what users actually see**. In Incant nothing reaches users
 until the **live pointer** moves — and each **environment** has its own
-pointers, default versions, rules, segments, and kill switches. Every action
+pointers, default versions, rules, and kill switches. Every action
 here is live-traffic-affecting; the workflow is therefore plan → confirm →
 act → verify, with hard confirmation gates.
 
@@ -27,7 +27,7 @@ act → verify, with hard confirmation gates.
 - `evaluate_targeting`, `render_prompt`, `diff_versions` — prove who gets what,
   before and after
 - `publish_prompt` — pointer move (+ `make_default`, + `archive_rule_ids`), atomic
-- `set_default`, `upsert_rule`, `set_rule_status`, `upsert_segment` — targeting
+- `set_default`, `upsert_rule`, `set_rule_status` — targeting
 - `rollback_pointer`, `rollback_targeting`, `kill_switch` — recovery
 
 ## Plan Phase
@@ -40,8 +40,8 @@ act → verify, with hard confirmation gates.
 2. **Establish what's true now.** `get_prompt` for the version's live sha vs
    tip (`tip_ahead` = unpublished edits); `list_rules` for the rules, defaults,
    and kills in play; `get_publish_history` for what was live before (your
-   rollback target). For a cohort/rollout, `evaluate_targeting` with
-   representative flags to show current resolution.
+   rollback target). For a cohort, `evaluate_targeting` with representative
+   flags to show current resolution.
 3. **Show the change as its rendered diff.** `diff_versions` in rendered mode
    against a real test context — "what people get now" vs "after". Source
    diffs justify a commit; rendered diffs justify a release.
@@ -58,7 +58,7 @@ act → verify, with hard confirmation gates.
 Pick the pattern that matches the confirmed intent:
 
 - **Ship committed edits to everyone (same version):** `publish_prompt` with
-  the tip sha from `get_prompt`. If prompt-scoped `@tip` test rules exist for
+  the tip sha from `get_prompt`. If `@tip` test rules exist for
   this prompt, pass their ids in `archive_rule_ids` — published content makes
   them redundant, and the atomic form can't strand a moved pointer with live
   test rules.
@@ -66,14 +66,15 @@ Pick the pattern that matches the confirmed intent:
   — a pointer alone serves nobody when the prompt has no default version.
 - **Test with a cohort first:** `upsert_rule` serving the candidate
   (`{version: N, at: "tip"}` while iterating, or `@live` after a pointer
-  exists) to a segment or flag condition. **Read the response's warning field:**
+  exists) to a flag condition. Rules are prompt-scoped and read the flags the
+  caller sends: WHO is in the cohort — a beta list, a percentage — is decided
+  by the caller's flag system and arrives as a flag (e.g. `beta_voice: true`);
+  Incant does not bucket users itself. **Read the response's warning field:**
   "can't serve yet" means the target has no publishable content here and the
   cohort will silently get the default — fix the pointer first. Then
   `evaluate_targeting` both ways: cohort flags resolve to the candidate,
   non-cohort flags to the default. Don't declare the test running until both
   are proven.
-- **Percentage rollout:** a rule with `serve: {rollout: {bucket_by, weights}}`.
-  Same warning discipline; verify with several distinct `bucket_by` values.
 - **Stop a test and ship the winner:** one `publish_prompt` call with the
   winning version's sha, `make_default=true`, and the test rule's id in
   `archive_rule_ids`. **`make_default` is the promotion** — archiving the rule

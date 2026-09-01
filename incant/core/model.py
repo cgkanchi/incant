@@ -4,6 +4,10 @@ Everything here is plain data (dataclasses) so the core stays I/O-free and
 exhaustively unit-testable. The server layer maps its DB rows / pydantic models
 onto these structures to build an :class:`EnvSnapshot`, then hands it to the
 evaluator and renderer.
+
+Targeting is deliberately small (v1): a rule is a flag condition on ONE prompt that
+serves ONE of that prompt's versions. Audience reuse and cohort assignment (segments,
+percentage rollouts) belong to the caller's flag system — Incant consumes flags.
 """
 
 from __future__ import annotations
@@ -34,7 +38,6 @@ class Clause:
 #   {"all": [node, ...]}   -> All
 #   {"any": [node, ...]}   -> Any
 #   {"not": node}          -> Not
-#   {"segment": "name"}    -> SegmentRef
 # None / empty => always matches.
 
 @dataclass(frozen=True)
@@ -52,19 +55,7 @@ class Not:
     of: "Condition"
 
 
-@dataclass(frozen=True)
-class SegmentRef:
-    name: str
-
-
-Condition = Clause | All | Any_ | Not | SegmentRef | None
-
-
-@dataclass(frozen=True)
-class Segment:
-    name: str
-    condition: Condition
-    version: int = 1
+Condition = Clause | All | Any_ | Not | None
 
 
 # ─────────────────────────── serve targets ───────────────────────────
@@ -81,48 +72,22 @@ class ServeVersion:
     sha: str | None = None
 
 
-@dataclass(frozen=True)
-class ServeLabel:
-    """Serve whatever version carries this label on the prompt, at its live pointer.
-
-    Used by global rules: prompts without the label skip the rule and continue.
-    """
-
-    label: str
-
-
-@dataclass(frozen=True)
-class RolloutBand:
-    weight: float
-    label: str | None = None
-    version: int | None = None
-    is_default: bool = False
-
-
-@dataclass(frozen=True)
-class ServeRollout:
-    bucket_by: str
-    weights: tuple[RolloutBand, ...]
-
-
-Serve = ServeVersion | ServeLabel | ServeRollout
+Serve = ServeVersion
 
 
 # ─────────────────────────── rules ───────────────────────────
 
-Scope = Literal["global", "prompt"]
 RuleStatus = Literal["active", "paused", "archived"]
 
 
 @dataclass(frozen=True)
 class Rule:
     id: str
-    scope: Scope
+    prompt_id: str
     priority: int
     when: Condition
     serve: Serve
     status: RuleStatus = "active"
-    prompt_id: str | None = None  # required when scope == "prompt"
     comment: str = ""
 
 
@@ -135,7 +100,6 @@ class VersionInfo:
     version: int
     live_sha: str | None                       # current live pointer (newest pointer_move)
     tip_sha: str | None                        # newest validated commit on the file
-    label: str | None = None
     status: Literal["active", "archived"] = "active"
     # Newest-first list of previously-live SHAs, for the §10 within-version fallback.
     previous_live: tuple[str, ...] = ()
@@ -152,7 +116,6 @@ class EnvSnapshot:
     environment: str
     rules_version: int
     rules: list[Rule] = field(default_factory=list)
-    segments: dict[str, Segment] = field(default_factory=dict)
     defaults: dict[str, int] = field(default_factory=dict)  # prompt_id -> version number
     # (prompt_id, version_number) -> {var_name -> default value} for optional vars.
     # Folded into the snapshot so the render hot path needs no per-request DB read.
@@ -168,33 +131,14 @@ class EnvSnapshot:
 
     # -- convenience accessors --------------------------------------------
 
-    def global_rules(self) -> list[Rule]:
-        return sorted(
-            (r for r in self.rules if r.scope == "global" and r.status == "active"),
-            key=lambda r: r.priority,
-        )
-
     def prompt_rules(self, prompt_id: str) -> list[Rule]:
         return sorted(
-            (
-                r for r in self.rules
-                if r.scope == "prompt" and r.prompt_id == prompt_id and r.status == "active"
-            ),
+            (r for r in self.rules if r.prompt_id == prompt_id and r.status == "active"),
             key=lambda r: r.priority,
         )
 
     def version_info(self, prompt_id: str, version: int) -> VersionInfo | None:
         return self.versions.get(prompt_id, {}).get(version)
-
-    def version_for_label(self, prompt_id: str, label: str) -> int | None:
-        """The ACTIVE version carrying ``label``. Labels are unique per prompt at write
-        time; for pre-existing duplicates the highest version wins, deterministically.
-        Archived versions never resolve — they do not serve."""
-        best = None
-        for v in self.versions.get(prompt_id, {}).values():
-            if v.label == label and v.status != "archived" and (best is None or v.version > best):
-                best = v.version
-        return best
 
     def all_prompt_ids(self) -> list[str]:
         ids = set(self.versions) | set(self.defaults)
@@ -203,7 +147,7 @@ class EnvSnapshot:
 
 # ─────────────────────────── resolution result ───────────────────────────
 
-MatchScope = Literal["global", "prompt", "default"]
+MatchScope = Literal["prompt", "default", "pin"]
 
 
 @dataclass(frozen=True)
@@ -214,7 +158,6 @@ class Resolution:
     at: At                         # how it was chosen (live / tip / sha)
     match_scope: MatchScope
     rule_id: str | None = None
-    label: str | None = None
     content_fallback: bool = False  # true iff a previous-live SHA served (§10)
 
 

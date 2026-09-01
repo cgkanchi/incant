@@ -3,7 +3,7 @@
 One project (one per deployment — the existing project if the deployment is
 already bound, else "support"), two environments (prod protected, staging
 track-tip), the <project>/system v1–v3 lineage with v2 live and tip ahead +2,
-the shared style fragment (a prompt like any other), rules, segments,
+the shared style fragment (a prompt like any other), rules,
 refinements, and test contexts.
 """
 
@@ -100,7 +100,7 @@ def seed(ctx: AppContext | None = None) -> str:
         ctx.targeting(s, "Rae").set_default("staging", f"{project}/style/language-rules", 1)
 
     with session_scope() as s:
-        # support/system v1 (archived), v2 (live + tip ahead +2), v3 (voice-v2 label).
+        # support/system v1 (archived), v2 (live + tip ahead +2), v3 (the beta voice).
         _author(ctx, s, f"{project}/system", 1,
                 "You are a support agent for {{ customer_name }}.", "Jamie", "v1 initial")
         v = s.execute(select(models.Version).where(
@@ -123,12 +123,9 @@ def seed(ctx: AppContext | None = None) -> str:
         ctx.targeting(s, "Sam").set_default("staging", f"{project}/system", 2)
 
     with session_scope() as s:
-        # v3 voice-v2
+        # v3: the new voice, tested with a beta cohort before it becomes the default
         out3 = _author(ctx, s, f"{project}/system", 3, v3_voice, "Maya",
                        "v3 voice rewrite", make_live=True)
-        v3 = s.execute(select(models.Version).where(
-            models.Version.prompt_id == f"{project}/system", models.Version.number == 3)).scalar_one()
-        v3.label = "voice-v2"
         # v3 lives in staging as default via track_tip; make it live there.
         ctx.targeting(s, "Maya").make_live("staging", f"{project}/system", 3, out3.sha,
                                            comment="v3 to staging")
@@ -148,10 +145,6 @@ def seed(ctx: AppContext | None = None) -> str:
 
     with session_scope() as s:
         tgt = ctx.targeting(s, "Dana")
-        tgt.upsert_segment("prod", "beta-us", {"all": [
-            {"flag": "beta_opt_in", "op": "eq", "value": True},
-            {"flag": "region", "op": "in", "values": ["us", "us-gov"]},
-        ]})
         # v3 needs a prod live pointer for "v3 @ live" rule targets to resolve.
         v3 = s.execute(select(models.CommitValidation).where(
             models.CommitValidation.prompt_id == f"{project}/system",
@@ -159,16 +152,19 @@ def seed(ctx: AppContext | None = None) -> str:
             models.CommitValidation.status == "valid",
         ).order_by(models.CommitValidation.validated_at.desc())).scalars().first()
         tgt.make_live("prod", f"{project}/system", 3, v3.sha, comment="v3 pointer for beta rule")
+        # The beta cohort is described entirely by flags the caller sends (the flag
+        # system owns who is in the beta; Incant just reads the flags).
         tgt.upsert_rule("prod", {
-            "id": "beta-gets-v3", "scope": "prompt", "prompt_id": f"{project}/system",
+            "id": "beta-gets-v3", "prompt_id": f"{project}/system",
             "priority": 10, "comment": "Voice v2 beta — EXP-142",
-            "when": {"all": [{"segment": "beta-us"},
+            "when": {"all": [{"flag": "beta_opt_in", "op": "eq", "value": True},
+                             {"flag": "region", "op": "in", "values": ["us", "us-gov"]},
                              {"flag": "tier", "op": "in", "values": ["enterprise", "pro"]}]},
             "serve": {"version": 3, "at": "live"},
         })
         # team-x-tip: testing the v2 tweak before make-live
         tgt.upsert_rule("prod", {
-            "id": "team-x-tip", "scope": "prompt", "prompt_id": f"{project}/system",
+            "id": "team-x-tip", "prompt_id": f"{project}/system",
             "priority": 20, "comment": "Testing the v2 tweak before make-live",
             "when": {"flag": "user_id", "op": "in", "values": ["u_12", "u_88", "u_301"]},
             "serve": {"version": 2, "at": "tip"},

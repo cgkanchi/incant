@@ -25,7 +25,7 @@ log = logging.getLogger("incant.registry")
 
 class RegistryConflict(Exception):
     """A registry change that would break something currently relied on (HTTP 409):
-    a duplicate label, archiving an environment's default version."""
+    archiving an environment's default version."""
 
 
 class RegistryError(Exception):
@@ -143,7 +143,7 @@ class RegistryService:
         return v
 
     def update_version(
-        self, prompt_id: str, number: int, *, label: str | None = None,
+        self, prompt_id: str, number: int, *,
         notes: str | None = None, status: str | None = None,
     ) -> models.Version:
         v = self.s.execute(select(models.Version).where(
@@ -152,21 +152,6 @@ class RegistryService:
         ).with_for_update()).scalar_one_or_none()
         if v is None:
             raise RegistryError(f"unknown version {number} for prompt {prompt_id!r}")
-        if label is not None:
-            new_label = label.strip() or None
-            if new_label:
-                # A label names exactly one version of a prompt — otherwise which
-                # version a label rule serves would be arbitrary.
-                dup = self.s.execute(select(models.Version.number).where(
-                    models.Version.prompt_id == prompt_id,
-                    models.Version.label == new_label,
-                    models.Version.number != number,
-                )).first()
-                if dup is not None:
-                    raise RegistryConflict(
-                        f"label {new_label!r} already names v{dup[0]} of {prompt_id!r} — "
-                        "a label names exactly one version of a prompt; move it explicitly")
-            v.label = new_label
         if notes is not None:
             v.notes = notes
         if status is not None:
@@ -186,17 +171,16 @@ class RegistryService:
                         "archiving")
             v.status = status
         self.s.flush()
-        if label is not None or status is not None:
-            # Label and status live in every environment's snapshot (VersionInfo), so a
-            # change must propagate like any targeting change: bump each environment's
+        if status is not None:
+            # Status lives in every environment's snapshot (VersionInfo), so a change
+            # must propagate like any targeting change: bump each environment's
             # rules_version with a "version" revision so replicas rebuild within the
             # poll interval and pin.rules_version replay reconstructs the change.
             from ..targeting.service import TargetingService
             ts = TargetingService(self.s, self.actor)
             for env_id in self.s.execute(select(models.Environment.id)).scalars().all():
                 ts._bump(ts._env(env_id), "version",
-                         {"prompt_id": prompt_id, "version": number,
-                          "label": v.label, "status": v.status})
+                         {"prompt_id": prompt_id, "version": number, "status": v.status})
         return v
 
     @staticmethod

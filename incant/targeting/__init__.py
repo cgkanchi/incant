@@ -1,4 +1,4 @@
-"""targeting — rules, segments, live pointers, defaults, kill switches, snapshots."""
+"""targeting — rules, live pointers, defaults, kill switches, snapshots."""
 
 from __future__ import annotations
 

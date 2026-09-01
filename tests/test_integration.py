@@ -299,7 +299,7 @@ def test_archived_version_stops_serving_until_unarchived(app):
 
 def test_total_rollback_restores_pointers_defaults_and_kills(app):
     # §7 "one-click rollback of … the whole environment's targeting state": rules,
-    # segments, defaults, kill switches AND live pointers — not just rules.
+    # defaults, kill switches AND live pointers — not just rules.
     out1 = _author_version(app, "support/system", 1, "v1 {{ x }}")
     _author_version(app, "support/system", 2, "v2 {{ x }}", make_live=True)
     with session_scope() as s:
@@ -308,7 +308,7 @@ def test_total_rollback_restores_pointers_defaults_and_kills(app):
         target_rv = s.get(models.Environment, "prod").rules_version
 
     # Everything changes after the checkpoint: pointer (a v1 tweak made live),
-    # default, kill switch, a new rule, a new segment.
+    # default, kill switch, a new rule.
     _author_version(app, "support/system", 1, "v1 edited {{ x }}", make_live=True)
     with session_scope() as s:
         tgt = app.targeting(s, "op")
@@ -317,7 +317,6 @@ def test_total_rollback_restores_pointers_defaults_and_kills(app):
         tgt.upsert_rule("prod", {"id": "late-rule", "scope": "prompt",
                                  "prompt_id": "support/system", "priority": 1,
                                  "when": None, "serve": {"version": 2}})
-        tgt.upsert_segment("prod", "late-segment", {"flag": "x", "op": "eq", "value": 1})
 
     with session_scope() as s:
         result = app.targeting(s, "op").rollback("prod", target_rv)
@@ -337,16 +336,12 @@ def test_total_rollback_restores_pointers_defaults_and_kills(app):
         assert tgt.current_live("prod", "support/system", 1) == out1.sha
         moves = tgt.pointer_history("prod", "support/system", 1)
         assert len(moves) == 3 and moves[0].comment.startswith("rollback")
-        # Kill disengaged; late rule and segment removed exactly.
+        # Kill disengaged; late rule removed exactly.
         kill = s.execute(select(models.KillSwitch).where(
             models.KillSwitch.environment_id == "prod",
             models.KillSwitch.prompt_id == "support/system")).scalar_one()
         assert kill.engaged is False
         assert s.get(models.Rule, "late-rule") is None
-        assert s.execute(select(models.Segment).where(
-            models.Segment.environment_id == "prod",
-            models.Segment.name == "late-segment",
-        )).scalar_one_or_none() is None
 
 
 def test_rollback_rejects_legacy_or_nonexistent_revisions(app):
@@ -373,28 +368,6 @@ def test_rollback_rejects_legacy_or_nonexistent_revisions(app):
             app.targeting(s, "op").rollback("prod", 999999)
     with session_scope() as s:
         assert s.get(models.Rule, "r2") is not None
-
-
-def test_rescoping_a_rule_to_global_drops_its_prompt_id(app):
-    # A service-level caller (plain dict, no pydantic defaults) rescoping a prompt
-    # rule to global while OMITTING prompt_id must not leave the stale prompt_id on
-    # the merged row — the DB check would reject it, and a row that slipped through
-    # would crash every later snapshot build for the environment.
-    _author_version(app, "support/system", 1, "v1 {{ x }}")
-    with session_scope() as s:
-        tgt = app.targeting(s, "op")
-        tgt.upsert_rule("prod", {"id": "r-scope", "scope": "prompt",
-                                 "prompt_id": "support/system", "priority": 5,
-                                 "when": None, "serve": {"version": 1}})
-    with session_scope() as s:
-        app.targeting(s, "op").upsert_rule("prod", {
-            "id": "r-scope", "scope": "global", "priority": 5,
-            "when": None, "serve": {"label": "voice-v2"}})
-    with session_scope() as s:
-        r = s.get(models.Rule, "r-scope")
-        assert r.scope == "global" and r.prompt_id is None
-        from incant.targeting import build_snapshot
-        build_snapshot(s, "prod")  # must not raise
 
 
 def test_old_validated_pin_serves_from_snapshot_validation_index(app, monkeypatch):

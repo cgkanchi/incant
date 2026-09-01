@@ -103,14 +103,15 @@ def reset_schema() -> None:
             "server and tests will use the isolated '<db>_test' sibling automatically."
         )
 
-    Base.metadata.drop_all(engine())
-    # `alembic_version` is created by Alembic, not Base.metadata, so drop_all leaves it
-    # behind. A stale stamp (< head) would make ctx.initialize()'s ensure_schema try to
-    # re-run migrations against the tables create_all just built (DuplicateTable). Drop it
-    # so ensure_schema instead stamps head over the create_all'd schema, as intended for
-    # test DBs (which are built by create_all, never by migrations).
+    # Wipe the WHOLE schema, not just the tables the current models know: a table that a
+    # release removed (segments, in 1.1.0) would otherwise linger in a long-lived test
+    # database and block drop_all through its FK to environments. This also takes
+    # `alembic_version` with it — a stale stamp (< head) would make ctx.initialize()'s
+    # ensure_schema re-run migrations against tables create_all just built; with no stamp
+    # it adopts the create_all'd schema at head, as intended for test DBs.
     with engine().begin() as conn:
-        conn.exec_driver_sql("DROP TABLE IF EXISTS alembic_version")
+        conn.exec_driver_sql("DROP SCHEMA public CASCADE")
+        conn.exec_driver_sql("CREATE SCHEMA public")
     Base.metadata.create_all(engine())
 
 
@@ -129,9 +130,9 @@ class DictContent:
         return ContentBlob(blob_sha=blob_sha(source), source=source)
 
 
-def vinfo(version, live=None, tip=None, label=None, previous=(), status="active"):
+def vinfo(version, live=None, tip=None, previous=(), status="active"):
     return VersionInfo(
-        version=version, live_sha=live, tip_sha=tip, label=label,
+        version=version, live_sha=live, tip_sha=tip,
         status=status, previous_live=tuple(previous),
     )
 

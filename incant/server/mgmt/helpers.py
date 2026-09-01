@@ -309,16 +309,6 @@ def _comment_payload(c) -> dict:
             "created_at": c.created_at.isoformat()}
 
 
-def _references_segment(clauses, name) -> bool:
-    if isinstance(clauses, dict):
-        if clauses.get("segment") == name:
-            return True
-        return any(_references_segment(v, name) for v in clauses.values())
-    if isinstance(clauses, list):
-        return any(_references_segment(v, name) for v in clauses)
-    return False
-
-
 def _principal_payload(session: Session, p: models.Principal) -> dict:
     bindings = session.execute(
         select(models.RoleBinding).where(models.RoleBinding.principal_id == p.id)

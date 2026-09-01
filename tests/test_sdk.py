@@ -62,7 +62,6 @@ def test_prompts_lists_the_library(client):
             "support/style/language-rules"} <= ids
     system = next(p for p in client.prompts() if p.id == "support/system")
     assert system.default_version == 2 and set(system.versions) >= {1, 2, 3}
-    assert system.labels.get(3) == "voice-v2"
 
 
 def test_renderer_key_can_discover(renderer_client):
@@ -82,7 +81,7 @@ def test_spec_names_variables_and_flags(client):
     assert not v["history"].required
     flags = {f.name: set(f.values) for f in spec.flags}
     assert {"enterprise", "pro"} <= flags["tier"]          # from the beta rule
-    assert {"us", "us-gov"} <= flags["region"]             # via the beta-us segment
+    assert {"us", "us-gov"} <= flags["region"]             # from the beta rule
     assert True in flags["beta_opt_in"]
     assert "u_12" in flags["user_id"]                      # from team-x-tip
     assert "support/style/language-rules" in spec.includes

@@ -9,7 +9,6 @@ function parseRoute() {
   if (queryPart) queryPart.split("&").forEach((kv) => { const [k, v] = kv.split("="); q[k] = decodeURIComponent(v || ""); });
   const parts = pathPart.split("/").filter(Boolean);
   if (parts.length === 0 || parts[0] === "prompts") return { name: "prompts", pid: null, q };
-  if (parts[0] === "segments") return { name: "segments", pid: null, q };
   if (parts[0] === "play") return { name: "play", pid: null, q };
   if (parts[0] === "audit") return { name: "audit", pid: null, q };
   if (parts[0] === "access") return { name: "access", pid: null, q };
@@ -30,7 +29,7 @@ function parseRoute() {
 
 const SCREENS = {
   prompts: screenPrompts, overview: screenOverview, draft: screenDraft, compare: screenCompare,
-  rules: screenRules, pointers: screenPointers, segments: screenSegments,
+  rules: screenRules, pointers: screenPointers,
   play: screenPlay, audit: screenAudit, access: screenAccess, envs: screenEnvironments,
   welcome: screenWelcome,
 };
@@ -996,7 +995,7 @@ const Actions = {
       : `a small example <span class="mono">support</span> project`;
     openModal(`
       <h3>Load the example dataset?</h3>
-      <p class="hint">Fills the empty library with ${where} — prompts with real version history, targeting rules, segments and test contexts — so every screen has something to show. It also issues a renderer service key (shown once) so you can try the render API. Only works while the library is empty.</p>
+      <p class="hint">Fills the empty library with ${where} — prompts with real version history, targeting rules and test contexts — so every screen has something to show. It also issues a renderer service key (shown once) so you can try the render API. Only works while the library is empty.</p>
       <div class="modal-actions">
         <button class="btn" data-act="closeModal">Cancel</button>
         <button id="seedBtn" class="btn primary" data-act="seedExampleConfirm">Load example data</button></div>`);
@@ -1258,22 +1257,10 @@ const Actions = {
     } catch (e) { toast(errText(e), true); }
   },
 
-  // ── clause builder (composer + segments editor + inline new-segment) ──
+  // ── clause builder (composer) ──
   cbAdd(ds) { const { cb, host } = cbResolve(ds.prefix); if (!cb) return; cbHostSync(host); cb.rows.push(emptyFlagRow()); cbHostRender(host); },
   cbDel(ds) { const { cb, host } = cbResolve(ds.prefix); if (!cb) return; cbHostSync(host); cb.rows.splice(+ds.ri, 1); cbHostRender(host); },
-  cbKind(ds) {
-    const { cb, host } = cbResolve(ds.prefix); if (!cb) return; cbHostSync(host);
-    const row = cb.rows[+ds.ri];
-    if (row.kind === "flag" && !row.op) row.op = "eq";
-    cbHostRender(host);
-  },
   cbOp(ds) { const { cb, host } = cbResolve(ds.prefix); if (!cb) return; cbHostSync(host); cbHostRender(host); },
-  cbSeg(ds) {
-    const { cb, host } = cbResolve(ds.prefix); if (!cb) return; cbHostSync(host);
-    const row = cb.rows[+ds.ri];
-    if (row.segment === "__new" && !row.newSeg) row.newSeg = { name: "", cb: newCb(null) };
-    cbHostRender(host);
-  },
   cbAdvanced(ds) {
     const { cb, host } = cbResolve(ds.prefix); if (!cb) return; cbHostSync(host);
     cb.advancedJson = JSON.stringify(rowsToWhen(cb.rows), null, 2);
@@ -1293,37 +1280,15 @@ const Actions = {
   ruleNew() { openComposer({ pid: State.route.pid || ((_rulesData && _rulesData.rules.find((r) => r.prompt_id)) || {}).prompt_id }); },
   ruleEdit(ds) { const r = (_rulesData && _rulesData.rules || []).find((x) => x.id === ds.id); if (r) openComposer({ rule: r }); },
   ruleDup(ds) { const r = (_rulesData && _rulesData.rules || []).find((x) => x.id === ds.id); if (r) openComposer({ rule: r, duplicate: true }); },
-  cbServeMode(ds) {
-    composerSync(); const co = window._composer; co.serveMode = ds.mode;
-    if (ds.mode === "rollout" && !co.rollout.weights.length)
-      co.rollout.weights.push({ version: co.version != null ? co.version : "", weight: 50, label: "" });
-    renderComposer();
-  },
   cbTip() { composerSync(); renderComposer(); },
   cbVersion() { composerSync(); },
   cbPos() { composerSync(); renderComposer(); },
-  cbScope() {
-    composerSync(); const co = window._composer;
-    co.prompt_id = co.scope === "global" ? null : co.routePid;
-    renderComposer();
-  },
-  cbRoAdd() { composerSync(); window._composer.rollout.weights.push({ version: "", weight: 0, label: "" }); renderComposer(); },
-  cbRoDel(ds) { composerSync(); window._composer.rollout.weights.splice(+ds.ri, 1); renderComposer(); },
-  cbRoWeight() { composerSync(); },
-  rolloutWeightInput() {
-    const co = window._composer; if (!co) return;
-    let sum = 0;
-    co.rollout.weights.forEach((w, i) => { const rw = el(`co-rw${i}`); if (rw) sum += Number(rw.value) || 0; });
-    const rdef = el("co-rdef"); if (rdef) sum += Number(rdef.value) || 0;
-    const s = el("rolloutSum"); if (s) { s.textContent = `sum: ${sum}%`; s.className = "ro-sum " + (sum === 100 ? "ok" : "bad"); }
-  },
   async composerSave() {
     composerSync();
     const co = window._composer; co.err = "";
     let when;
     try {
-      if (co.cb.advanced) when = co.cb.advancedJson.trim() ? JSON.parse(co.cb.advancedJson) : null;
-      else { await composerCreateNewSegments(co); when = rowsToWhen(co.cb.rows); }
+      when = co.cb.advanced ? (co.cb.advancedJson.trim() ? JSON.parse(co.cb.advancedJson) : null) : rowsToWhen(co.cb.rows);
     } catch (e) { co.err = typeof e === "string" ? e : "Condition JSON is invalid."; return renderComposer(); }
     let serve;
     try { serve = composerServe(co); } catch (e) { co.err = typeof e === "string" ? e : String(e); return renderComposer(); }
@@ -1331,16 +1296,15 @@ const Actions = {
     const id = co.editing ? co.origId : slugId(comment);
     const active = activeOrderedRules(co.rules, co.editing ? co.origId : null);
     const { priority, plan } = placePriority(active, Math.min(co.slot, active.length));
-    const base = { id, scope: co.scope, priority, when, serve, status: co.status || "active", comment };
-    if (co.scope === "prompt") base.prompt_id = co.prompt_id || co.routePid;
+    const base = { id, prompt_id: co.prompt_id || co.routePid, priority, when, serve, status: co.status || "active", comment };
     // One atomic batch: the priority-shift plan first, then the new/edited rule. A failure
     // no longer half-applies the renumber (server rolls the whole request back).
     const rules = plan.map((p) => ruleUpsertBody(p.rule, p.priority)).concat([base]);
     try {
       const res = await POST(`/mgmt/envs/${enc(State.env)}/rules/batch`, { rules });
       closeModal();
-      // A rule whose serve target can't resolve yet (e.g. a rollout to a version never
-      // published here) saves fine but would silently serve the default to everyone —
+      // A rule whose serve target can't resolve yet (e.g. a version never published
+      // here) saves fine but would silently serve the default to everyone —
       // say so NOW, not after 30 baffling requests.
       const warn = (res.warnings || []).length ? ` — ⚠ ${res.warnings.join("; ")}` : "";
       toast((co.editing ? "Rule saved" : "Rule created") + warn, !!warn);
@@ -1431,31 +1395,6 @@ const Actions = {
     }
   },
 
-  // ── segments editor ──────────────────────────────────────────────
-  segSelect(ds) {
-    const se = window._segEdit; const s = se.raw.find((x) => x.name === ds.name); if (!s) return;
-    se.creating = false; se.selected = s.name; se.name = s.name; se.cb = newCb(s.when); se.err = "";
-    renderSegEditor();
-  },
-  segNew() {
-    const se = window._segEdit;
-    se.creating = true; se.selected = null; se.name = ""; se.cb = newCb(null); se.err = "";
-    renderSegEditor();
-  },
-  async segSave() {
-    const se = window._segEdit; segEditSync(); se.err = "";
-    const name = (se.creating ? se.name : se.selected || "").trim();
-    if (!name) { se.err = "Name the segment."; return renderSegEditor(); }
-    let when;
-    try { when = se.cb.advanced ? (se.cb.advancedJson.trim() ? JSON.parse(se.cb.advancedJson) : null) : rowsToWhen(se.cb.rows); }
-    catch (e) { se.err = "Condition JSON is invalid."; return renderSegEditor(); }
-    try {
-      await POST(`/mgmt/envs/${enc(State.env)}/segments`, segmentPayload(name, when));
-      toast(`Saved segment “${name}”`);
-      se.selected = name; se.creating = false; se.name = name;
-      render();
-    } catch (e) { se.err = errText(e); renderSegEditor(); }
-  },
 };
 
 // ── render + wire ────────────────────────────────────────────────────
@@ -1463,7 +1402,7 @@ const Actions = {
 // reading "Incant" (history, tab switching, and screen-reader page announcements).
 const SCREEN_TITLES = {
   prompts: "Prompts", overview: "Overview", draft: "Edit", compare: "Compare",
-  rules: "Who sees what", pointers: "Publish history", segments: "Segments",
+  rules: "Who sees what", pointers: "Publish history",
   play: "Playground", audit: "Audit", access: "Access", envs: "Environments",
   welcome: "Welcome",
 };
@@ -1523,7 +1462,7 @@ document.addEventListener("input", (ev) => {
   const t = ev.target.closest("[data-act]");
   if (!t) return;
   const act = t.dataset.act;
-  if (act === "search" || act === "draftInput" || act === "tcVarsInput" || act === "tcFlagsInput" || act === "rolloutWeightInput" || act === "ctxInput" || act === "confirmInput" || act === "commentInput") Actions[act](t.dataset, ev);
+  if (act === "search" || act === "draftInput" || act === "tcVarsInput" || act === "tcFlagsInput" || act === "ctxInput" || act === "confirmInput" || act === "commentInput") Actions[act](t.dataset, ev);
 });
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") { closeModal(); Actions.navClose(); }

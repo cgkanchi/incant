@@ -12,7 +12,7 @@ Three planes:
   per-file history, immutable SHAs, diffs, durability, portability. External providers
   (GitHub, Bitbucket, GitLab, a bare server) receive backup pushes and are otherwise
   ignored: no webhooks, no PR review, no provider APIs.
-- **Postgres is the control plane.** Targeting rules, segments, environments, **live
+- **Postgres is the control plane.** Targeting rules, environments, **live
   pointers**, review state, variable metadata, RBAC, audit. Operational state at ops
   tempo — and no content, ever: the DB stores SHAs, never template text.
 - **Memory is the serving plane.** Compiled templates and rule snapshots; the render
@@ -83,15 +83,14 @@ serving; pointer moves do.
 |---|---|
 | **Project** | The deployment's namespace — exactly ONE per database (named at first-run setup or by the first prompt's prefix). Multi-project = multiple deployments; a future schema-sharding direction keeps auth shared and gives each project a private schema. |
 | **Prompt** | A folder of version files. Its id is a path: `support/system`. Fragments are not a separate type — any prompt can include any other (§4). |
-| **Version** | A file: `support/system/v2.j2`. A stable, targetable identity whose content iterates via commits — not a frozen point. Optional label, notes, status in the DB. |
+| **Version** | A file: `support/system/v2.j2`. A stable, targetable identity whose content iterates via commits — not a frozen point. Notes and status in the DB. |
 | **Tip** | The newest validated commit touching a version file. Content that *exists* but serves only where explicitly targeted. |
 | **Live pointer** | Per `(environment, prompt, version)`: the commit SHA that version serves in that environment. "Make live" = advance the pointer. Append-only history retained (rollback, audit, blame). |
-| **Label** | A name attached to versions across prompts (`voice-v2`) — the handle for multi-prompt experiments. |
 | **Draft** | Work-in-progress edit of a version file (or a proposed new file), held on an Incant-managed ref; becomes a commit through review. |
 | **Flags** | Evaluation context sent with a render request (`{"tier": "pro", "user_id": "u_42"}`). Rules match these. |
 | **Variables** | Values interpolated into the chosen template by Jinja. |
-| **Environment** | A named targeting scope (`prod`, `staging`): rules, segments, kill switches, defaults, live pointers. Pure DB state. |
-| **Rule / segment** | Per-environment. Rules map flag conditions to versions (at live, tip, or a pinned SHA) or labels; segments are named, reusable conditions. |
+| **Environment** | A named targeting scope (`prod`, `staging`): rules, kill switches, defaults, live pointers. Pure DB state. |
+| **Rule** | Per-environment, per-prompt. A flag condition that serves one of the prompt's versions (at live, tip, or a pinned SHA). Who is in a cohort is the caller's flag system's business — Incant reads flags. |
 | **Remote** | A git URL receiving backup pushes from the full node. Plural, optional; read only by serve replicas (hydrate + follow, §6) and by first-boot bootstrap. |
 
 Flags choose *which version at which commit*; variables fill in *the blanks within it*.
@@ -126,8 +125,8 @@ into the DB, where operational state belongs.
 | Concern | Home |
 |---|---|
 | Template content + all content history | **Git** (canonical repo, Incant-owned) |
-| Version registry: status, labels, notes | **DB** (references files; no content) |
-| Live pointers, defaults, rules, segments, kill switches | **DB** |
+| Version registry: status, notes | **DB** (references files; no content) |
+| Live pointers, defaults, rules, kill switches | **DB** |
 | Validation results per commit, extracted variables, refinements | **DB** (keyed by SHA/blob — derived, rebuildable) |
 | Drafts/review state, comments, test contexts | **DB** (draft content on git refs) |
 | Principals, users, roles, keys, sessions, audit | **DB** |
@@ -228,8 +227,8 @@ exist in history but can never serve.
 ### The flows
 
 **New version** (req 1): draft `v3.j2` seeded from v2 → in-product review → commit.
-v3 now *exists* — and serves nowhere. Target it (a rule for the beta segment, a
-rollout), or promote it to an environment's default. Making it prod's default is a
+v3 now *exists* — and serves nowhere. Target it (a rule for the beta cohort's flag),
+or promote it to an environment's default. Making it prod's default is a
 pointer-class change: audited, optionally approval-gated (§7).
 
 **Tweak a live version** (req 3+4, the canonical scenario): edit `v2.j2` → review →
@@ -268,15 +267,14 @@ same validation, review policy, audit. No side door.
 
 ### Version registry
 
-Versions carry DB metadata: notes, optional **label**, status `active ⇄ archived`.
-**Archived versions do not serve**: a rule targeting one is skipped (counted in
-`skipped_rules`, flagged in the console), labels ignore it, and a version that is an
-environment's default cannot be archived at all — point the default elsewhere first.
-Archiving refuses new drafts, commits, rules and defaults; unarchiving resumes serving.
-A **label names exactly one version of a prompt** (duplicates are refused). Label and
-status changes propagate like targeting changes (a `version` revision on every
-environment) so replicas see them within the poll interval. `incant_versions` mirrors
-the tree; the tree is authoritative for existence, the DB for status.
+Versions carry DB metadata: notes and status `active ⇄ archived`. **Archived versions
+do not serve**: a rule targeting one is skipped (counted in `skipped_rules`, flagged in
+the console), and a version that is an environment's default cannot be archived at all
+— point the default elsewhere first. Archiving refuses new drafts, commits, rules and
+defaults; unarchiving resumes serving. Status changes propagate like targeting changes
+(a `version` revision on every environment) so replicas see them within the poll
+interval. `incant_versions` mirrors the tree; the tree is authoritative for existence,
+the DB for status.
 
 ---
 
@@ -326,56 +324,54 @@ nodes in seconds.
 
 ### Rules serve versions
 
+Targeting is deliberately small in v1: **flags in, one version out.** A rule belongs to
+one prompt, matches a condition over the flags the caller sends, and serves one of that
+prompt's versions. Audience *reuse* and cohort *assignment* — "the enterprise-US beta",
+"10% of users" — are the caller's feature-flag system's job: it decides who is in and
+sends the answer as a flag (`beta_voice: true`); Incant never buckets users itself. That
+keeps multi-prompt experiments coherent by construction (the same user carries the same
+flag to every prompt) and keeps Incant out of the business of re-implementing a flag
+system. A unified audience/content abstraction is planned for a later release.
+
 ```jsonc
 {
   "id": "voice-v2-beta",
   "environment": "prod",
-  "scope": "global",                 // or {"scope": "prompt", "prompt_id": "support/system"}
+  "prompt_id": "support/system",
   "priority": 10,
   "when": {"all": [
-    {"segment": "beta-us"},
+    {"flag": "beta_voice", "op": "eq", "value": true},
     {"flag": "tier", "op": "in", "values": ["enterprise", "pro"]}
   ]},
-  "serve": {"rollout": {"bucket_by": "user_id",
-                        "weights": [{"label": "voice-v2", "weight": 20},
-                                    {"default": true,     "weight": 80}]}},
+  "serve": {"version": 3},           // at its live pointer; {"version": 3, "at": "tip"}
+                                     //   for the testing flow; {"at": "sha", "sha": …} to pin
   "status": "active",                // active | paused | archived
-  "comment": "Voice v2 ramp — EXP-142",
-  "version": 7
+  "comment": "Voice v2 beta — EXP-142"
 }
 ```
 
-- **Prompt-scoped rules** serve a version at its live pointer (`{"version": 2}`), at
-  its tip (`{"version": 2, "at": "tip"}` — the testing flow), or at an explicit SHA.
-- **Global rules** serve a **label**: prompts with a labeled version participate at
-  that version's live pointer; others skip the rule and continue. One experiment = one
-  rule; killing it = archiving one rule.
-- Evaluation order per prompt: global rules → prompt rules → **environment default**
+- A rule serves a version at its live pointer (`{"version": 2}`), at its tip
+  (`{"version": 2, "at": "tip"}` — the testing flow), or at an explicit SHA.
+- Evaluation order per prompt: the prompt's rules by priority → **environment default**
   (a version, at its live pointer). First match wins.
 - Environments have `track_tip: true|false` — dev/staging convenience where live
   pointers auto-follow validated tips; off for prod, where making content live is
   always explicit.
 
-### Clause & rollout semantics
+### Clause semantics
 
 - Operators: `eq`, `neq`, `in`, `not_in`, `contains`, `starts_with`, `ends_with`,
-  `gt/gte/lt/lte`, `semver_gt/semver_lt`, `exists`; `all`/`any` composition
+  `gt/gte/lt/lte`, `semver_gt/semver_lt`, `exists`; `all`/`any`/`not` composition
   (no user-authored regex — see Divergences).
-  A clause referencing an absent flag does not match (no error).
-- **Segments**: named clause groups per environment, referencable from any rule.
-- **Rollout bucketing is coherent across prompts for global rules**:
-  `sha256(f"{rule.id}:{bucket_value}")` — no prompt id — so an experiment user sees it
-  in every participating prompt. Prompt-scoped rollouts hash
-  `sha256(f"{prompt_id}:{rule.id}:{bucket_value}")`. Rule ids are immutable → ramps are
-  monotonic and reordering never reshuffles cohorts. Missing `bucket_by` flag → rule
-  falls through.
+  A clause referencing an absent flag does not match (no error); incomparable types
+  never raise; semver drops pre-release and build metadata.
 
 ### Governance
 
 - **Pointer-class changes** — advancing/reverting a live pointer, changing an
   environment default — are the governed acts: `operator` role, audited, and in
   `protected` environments optionally behind propose → approve (approver ≠ proposer).
-- **Rule edits** (create, ramp, archive) need `operator` on the environment but no
+- **Rule edits** (create, edit, archive) need `operator` on the environment but no
   approval ceremony — requirement 4's test-target-expand loop must be low-friction, and
   a rule pointing at a validated SHA can only expose reviewed content.
 - **Kill switches**: per environment, per prompt — one click forces the environment
@@ -383,11 +379,8 @@ nodes in seconds.
 
 ### Integrity
 
-- Rules and pointers may only reference validated SHAs and existing, active versions;
-  a condition may only name segments the environment has, and segment references may
-  not form a cycle; a global rule serving an explicit version must name one some prompt
-  actively has. Violations are rejected at write time (global label rules: warned when
-  no prompt participates).
+- Rules and pointers may only reference validated SHAs and existing, active versions
+  of their prompt. Violations are rejected at write time.
 - Archiving a version that is an environment default is refused; archiving one that
   active rules target is allowed — those rules skip (counted) and are flagged in the
   console until retargeted or the version is unarchived.
@@ -407,12 +400,12 @@ work even during a DB outage.
 
 ### Lifecycle, audit, propagation
 
-Every targeting mutation (rules, segments, pointers, defaults, kills) runs under
+Every targeting mutation (rules, pointers, defaults, kills) runs under
 its environment's row lock and writes a `rule_revisions` row (actor, at, comment)
 carrying the changed object — and, on CHECKPOINT revisions (baseline, rollback,
 and every Kth per `INCANT_REVISION_CHECKPOINT_INTERVAL`), the environment's
-**complete post-change targeting state** (rules, segments, defaults, kills, live
-pointers, tips, labels — SHAs only, never content). Non-checkpoint states
+**complete post-change targeting state** (rules, defaults, kills, live pointers,
+tips, statuses — SHAs only, never content). Non-checkpoint states
 reconstruct exactly by forward-applying at most K−1 per-object changes from the
 nearest older checkpoint: O(1) recent, bounded slow path old, O(N/K) state
 storage. Each mutation bumps the environment's monotonic
@@ -421,7 +414,7 @@ serial history point, so no captured state can miss a concurrent change).
 Environments get an exact **baseline revision** before their first mutation. That
 full-state capture is what makes rollback **exact**: it requires an exact recorded
 revision and restores rules (extras deleted; their revision history remains),
-segments, defaults, kills, and pointers — pointer restoration appends new moves,
+defaults, kills, and pointers — pointer restoration appends new moves,
 including `to_sha = NULL` **tombstones** for pointers that did not exist at the
 target, so the history stays append-only and the §10 fallback never reaches past
 an un-make-live. The same capture is what makes §9's `pin.rules_version` replay
@@ -507,9 +500,9 @@ POST /prompt/{prompt_id}
 {
   "prompt": "You are a friendly support agent for Acme...",
   "prompt_id": "support/system",
-  "matched_rule": {"scope": "global", "id": "voice-v2-beta"},   // or {"scope":"prompt",...} or "default"
+  "matched_rule": {"scope": "prompt", "id": "voice-v2-beta"},   // or "default"
   "versions": {                      // every prompt that contributed content, resolved
-    "support/system": {"version": 2, "commit": "8c1f2ab", "label": "voice-v2"},
+    "support/system": {"version": 2, "commit": "8c1f2ab"},
     "support/style/language-rules": {"version": 1, "commit": "2fe9c1a"}
   },
   "environment": "prod",
@@ -562,7 +555,7 @@ POST /prompt/{prompt_id}/evaluate   # flags only → resolved version+SHA (no re
 POST /evaluate                      # flags → resolution for EVERY prompt in the env;
                                     #   "what does this experiment change?" in one call
 GET  /prompts?environment=…         # what this credential can render: ids, descriptions,
-                                    #   versions, defaults, labels (renderer-scoped)
+                                    #   versions, defaults (renderer-scoped)
 GET  /prompt/{prompt_id}/spec       # what to pass: variables merged across the versions
                                     #   targeting can currently serve, the flags active
                                     #   rules consult (+ known values), includes
@@ -626,7 +619,7 @@ Bindings are `(principal, role, scope)`; scope = instance, project, or
 | `renderer` | Render/evaluate via the serving API (what service keys hold) |
 | `viewer` | Read prompts, versions, rules, history; run previews and test contexts |
 | `editor` | `viewer` + drafts, test contexts, commits (subject to project review policy) — content, never targeting (§17) |
-| `operator` | `viewer` + targeting in granted environments: rules, segments, ramps, kill switches, pointer moves, defaults |
+| `operator` | `viewer` + targeting in granted environments: rules, kill switches, pointer moves, defaults |
 | `releaser` | `operator` + approvals for pointer-class changes in protected environments |
 | `admin` | Everything: projects, environments, principals, keys, bindings, remotes |
 
@@ -638,7 +631,7 @@ Bindings are `(principal, role, scope)`; scope = instance, project, or
 - **Targeting:** `operator`; protected environments add two-person approval for
   pointer-class changes only (§7). Kill switches: any `operator`, instantly.
 
-Append-only **`audit_log`** for every mutation — commits, rule changes, ramps, kills,
+Append-only **`audit_log`** for every mutation — commits, rule changes, kills,
 pointer moves, key issuance, role grants: actor, action, object, before/after, at.
 Render traffic goes to structured logs/metrics (with the version tuple), not the DB.
 Sandboxed rendering, loader confined to registered content; Incant stores no variable
@@ -651,21 +644,21 @@ values.
 One app, three centers of gravity:
 
 **Author & review.** Project browser → prompt page: version files with tip-vs-live
-badges per environment, labels, effective variable schema (auto-extracted, refinable
+badges per environment, effective variable schema (auto-extracted, refinable
 inline), include graph. Draft editor (lint-as-you-type) with the test panel:
 saved contexts rendering live, rendered diffs against any version at any SHA. Review
 queue with comments on source or rendered output. A "tweak flow" affordance walks the
 canonical loop: edit → commit → target to cohort → expand → make live.
 
-**Target & operate.** Per environment: rule list (global + per-prompt,
-reorderable), segment editor — flag names and observed values suggested as you type
-(§7) — rollout weights writing live, kill switches, live
+**Target & operate.** Per environment: rule list (per prompt, reorderable) with a
+composer whose flag names and values are suggested as you type (§7 observed flags),
+kill switches, live
 pointers per prompt/version with advance/revert controls, the per-version pointer
 timeline (who made what live, when, why — the blame view), rendered old→new diffs,
 approval queue (protected envs), targeting history with one-click rollback. Controls
 reflect RBAC.
 
-**Understand.** Experiment view: pick a rule or label → every affected prompt with
+**Understand.** Experiment view: pick a rule → the affected prompt with
 rendered before/after (`POST /evaluate` underneath). Per-prompt timeline: versions,
 commits, who/when/notes, where each is live. Audit explorer. Backup health (queue
 depth, last push per remote).
@@ -676,7 +669,7 @@ depth, last push per remote).
 # authoring
 GET  /mgmt/overview                            GET  /mgmt/whoami
 POST /mgmt/prompts                             # register a prompt; its v1 arrives via a draft
-GET  /mgmt/prompts/{id}/versions               PATCH /mgmt/prompts/{id}/versions/{n}  # label, notes, archive
+GET  /mgmt/prompts/{id}/versions               PATCH /mgmt/prompts/{id}/versions/{n}  # notes, archive/unarchive
 GET  /mgmt/prompts/{id}/diff                   GET  /mgmt/prompts/{id}/drafts
 POST /mgmt/prompts/{id}/drafts                 # draft on a version, or a new vN+1 (seeded from a version/SHA)
 GET  /mgmt/drafts/{id}                         PUT  /mgmt/drafts/{id}/content
@@ -693,7 +686,7 @@ GET/PUT /mgmt/prompts/{id}/test-contexts
 # targeting & pointers
 GET  /mgmt/envs                                GET/POST /mgmt/envs/{env}/rules
 POST /mgmt/envs/{env}/rules/batch              PATCH /mgmt/envs/{env}/rules/{id}
-GET/POST /mgmt/envs/{env}/segments             POST /mgmt/envs/{env}/kill?prompt_id=…
+POST /mgmt/envs/{env}/kill?prompt_id=…
 GET/POST /mgmt/envs/{env}/pointers             # make-live / revert (bulk-capable)
 POST /mgmt/envs/{env}/publish                  # pointer advance + default + rule archive, atomically
 POST /mgmt/envs/{env}/defaults                 # set default versions
@@ -764,7 +757,7 @@ incant/
 ├── core/          # pure: evaluation, rendering, variable extraction — no I/O
 ├── gitstore/      # canonical repo, commits, validation pipeline, backup pusher
 ├── registry/      # version registry, drafts, reviews, variable refinements
-├── targeting/     # rules, segments, pointers, snapshots, propagation
+├── targeting/     # rules, pointers, snapshots, propagation, observed flags
 ├── server/        # FastAPI: serving API, mgmt API, browser sessions, RBAC, metrics
 ├── ui/            # vanilla-JS single-page UI (no build step), served as static assets
 ├── service.py     # AppContext: wiring + snapshot cache + serve/evaluate hot path
@@ -783,7 +776,7 @@ Alongside the server package: `sdk/python` (incant-sdk), `mcp/python` (incant-mc
 ```
 projects(id, name, review_policy, allow_self_review)     -- exactly one row (§17)
 prompts(id, project_id, description)                     -- registry of the tree
-versions(id, prompt_id, number, label?, status: active|archived, notes, created_by, created_at)
+versions(id, prompt_id, number, status: active|archived, notes, created_by, created_at)
 commit_validations(sha, blob_sha, path, prompt_id, version_number, status, error?, extracted_variables, validated_at)
 variable_refinements(prompt_id, version_number, name, type?, required?, default?, description?)
 test_contexts(id, prompt_id, name, flags, variables)
@@ -795,8 +788,7 @@ pointer_moves(environment_id, prompt_id, version_number, from_sha?, to_sha?,
                                                 --   (NULL to_sha = rollback tombstone)
 env_defaults(environment_id, prompt_id, version_number)
 kill_switches(environment_id, prompt_id, engaged, by, at)
-segments(id, environment_id, name, clauses, version)
-rules(id, environment_id, scope, prompt_id?, priority, clauses, serve, status, comment)
+rules(id, environment_id, prompt_id, priority, clauses, serve, status, comment)
 rule_revisions(environment_id, rule_id?, kind, rules_version, snapshot, state?, actor, at, comment)
                                                 -- state = full checkpoint every Kth revision (§7)
 observed_flags(environment_id, flag, value, value_type, first_seen, last_seen)   -- §7; gin_trgm on value
@@ -878,23 +870,25 @@ not duplicated here. The properties this design relies on:
 
 1. **`incant.core`** — evaluator (rules as data), sandboxed renderer, variable
    extraction/inference, include resolution; exhaustive unit tests (rule semantics,
-   rollout bucketing, AST inference are the fiddly parts).
+   AST inference are the fiddly parts).
 2. **GitStore + registry** — canonical repo, commit pipeline with validation,
    version-file conventions, drafts/review, version registry.
 3. **Serving + targeting** — render/evaluate APIs over eager-warm caches, rules,
-   segments, live pointers, propagation, API keys + RBAC + audit. Hit the latency SLO
+   live pointers, propagation, API keys + RBAC + audit. Hit the latency SLO
    here, benchmarks in CI. With 1–3, shippable for API-driven teams.
 4. **UI** — author/draft/test/review flow, the tweak-flow loop, rules console, pointer
    controls, admin screens.
 5. **Hardening** — approvals for protected environments, backup pusher + restore
-   tooling, promote-rules-between-envs, label UX, dashboards.
+   tooling, promote-rules-between-envs, dashboards.
 6. **Clients** — Python SDK (`sdk/python`: sync + async, typed errors, retries,
    discovery via `GET /prompts` + `GET /prompt/{id}/spec`) and MCP server
-   (`mcp/python`: 23 task-shaped tools under the key's roles, `--read-only`) with
+   (`mcp/python`: 22 task-shaped tools under the key's roles, `--read-only`) with
    paired agent skills (`skills/`). Built.
-7. **Later** — TS SDK, client-side caching and stale-on-fail, releases (named bundles
-   of prompt versions promoted together), experiment analytics, scheduled ramps, eval
-   hooks.
+7. **Later** — a unified audience/content abstraction for targeting (v1.5/v2 — the
+   place where reusable audiences, cross-prompt experiments and Incant-side cohort
+   assignment return, if they return at all), TS SDK, client-side caching and
+   stale-on-fail, releases (named bundles of prompt versions promoted together),
+   experiment analytics, eval hooks.
 
 ---
 
@@ -918,10 +912,10 @@ scattered through code comments — so a reader knows which promises are live.
 - **One project per deployment (§2, §4, §11).** The database hosts exactly one
   project; creating a second is refused. Cross-project includes and cross-project
   RBAC collapsed into non-features — the surviving authority boundary is the
-  environment (plus env-wide-only global rules). Multi-project returns, if ever,
+  environment. Multi-project returns, if ever,
   as schema sharding: shared `public` auth, one private schema per project.
 - **No user-authored regex (§7).** The `matches` operator was removed: every real
-  targeting predicate is expressible with the structured operators and segments,
+  targeting predicate is expressible with the structured operators and composition,
   and operator-authored patterns were a ReDoS surface on the serving thread. If
   demand appears it returns RE2-backed with a length cap.
 - **No OIDC/SSO (§11).** Humans use local email+password accounts (first-run setup +
@@ -939,7 +933,7 @@ scattered through code comments — so a reader knows which promises are live.
   environments' include resolution can differ. The §7 write-time integrity checks
   and eval-time skip backstop cover the gap.
 - **Targeting is `operator`-only (§11).** Editors never write targeting, protected
-  environment or not: rules, segments, defaults, kills, and pointers all require
+  environment or not: rules, defaults, kills, and pointers all require
   `operator` on the environment (`releaser` for pointer-class changes in protected
   environments). The role split is content (`editor`) vs. audience (`operator`,
   `releaser`); protection raises the gate, it never lowers it.
@@ -947,3 +941,13 @@ scattered through code comments — so a reader knows which promises are live.
   caches are memory-only, rebuilt from the canonical repo and the DB at boot
   (readiness waits for the warm). No cache volume exists; the repo volume is the only
   durable mount.
+- **Flags-only targeting (§2, §7, §12) — 1.1.0.** Segments, version labels, percentage
+  rollouts and global-scope rules were removed. A rule is a flag condition on one
+  prompt serving one of its versions; cohort membership (betas, percentages) is
+  decided by the caller's flag system and arrives as a flag. Rationale: the three
+  removed constructs were three half-abstractions (a reusable audience, a cross-prompt
+  content coordinate, an in-house bucketing engine) whose lifecycle interactions
+  produced most of the system's edge cases, and every one of them duplicates
+  something a feature-flag system already does better. Replays and rollbacks of
+  pre-1.1.0 revisions that used them are refused honestly. A unified abstraction
+  returns in v1.5/v2 once the flags-only surface has been lived with.

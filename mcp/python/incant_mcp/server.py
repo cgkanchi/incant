@@ -36,7 +36,7 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
             "targeting, memory-first serving. Core model: a PROMPT has numbered "
             "VERSIONS; edits accumulate on a version's TIP but users only see what "
             "the LIVE POINTER serves — publishing is the explicit act that moves it. "
-            "Each ENVIRONMENT has its own targeting (rules/segments/defaults/kills) "
+            "Each ENVIRONMENT has its own targeting (rules/defaults/kills) "
             "and default versions; protected environments demand a `confirm` echo on "
             "mutations — never supply it without the human's explicit go-ahead. "
             "All calls run under the configured API key's roles; a 403 names the "
@@ -74,9 +74,9 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     def get_prompt(prompt_id: str, environment: str | None = None) -> dict:
-        """One prompt in full: every version (live sha, tip sha, tip_ahead, labels,
-        status, commit history), effective variables, includes, open drafts, and
-        saved test contexts."""
+        """One prompt in full: every version (live sha, tip sha, tip_ahead, status,
+        commit history), effective variables, includes, open drafts, and saved test
+        contexts."""
         env = api.env(environment)
         try:
             out = api.get(f"/mgmt/prompts/{prompt_id}/versions", environment=env)
@@ -90,13 +90,10 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
     @mcp.tool(annotations=READ)
     def list_rules(environment: str | None = None) -> dict:
         """The environment's whole targeting state: rules (with priority order and
-        any unservable warnings), segments, per-prompt default versions, and kill
-        switches. Rules are checked top to bottom; first match wins."""
-        env = api.env(environment)
+        any unservable warnings), per-prompt default versions, and kill switches.
+        Rules are checked top to bottom; first match wins."""
         try:
-            out = api.get(f"/mgmt/envs/{env}/rules")
-            out["segments"] = api.get(f"/mgmt/envs/{env}/segments").get("segments", [])
-            return out
+            return api.get(f"/mgmt/envs/{api.env(environment)}/rules")
         except Exception as exc:
             raise _err(exc)
 
@@ -115,7 +112,7 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
     @mcp.tool(annotations=READ)
     def get_targeting_history(environment: str | None = None, limit: int = 50) -> dict:
         """The environment's targeting change log (rules_version timeline): every
-        rule/segment/default/kill/pointer change with author and comment. Feed a
+        rule/default/kill/pointer change with author and comment. Feed a
         listed rules_version to rollback_targeting to restore that exact state."""
         try:
             return api.get(f"/mgmt/envs/{api.env(environment)}/revisions", limit=limit)
@@ -300,15 +297,16 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
 
     @mcp.tool(annotations=WRITE)
     def set_prompt_metadata(action: str, prompt_id: str, version: int | None = None,
-                            label: str | None = None, notes: str | None = None,
+                            notes: str | None = None,
                             status: str | None = None, name: str | None = None,
                             type: str | None = None, required: bool | None = None,
                             default: Any = None, description: str = "",
                             flags: dict | None = None,
                             variables: dict | None = None) -> dict:
         """Prompt/version metadata. action=
-        'version' (version + label/notes/status — status 'archived' retires a
-          version from new drafts),
+        'version' (version + notes/status — status 'archived' retires a version:
+          it stops serving, and new drafts/rules for it are refused; 'active'
+          brings it back),
         'refine' (version + name [+ type/required/default/description] — record
           what a template variable means),
         'test_context' (name + flags/variables — save a named who-and-what for
@@ -319,7 +317,7 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
                     raise ValueError("version action needs version")
                 return api.request(
                     "PATCH", f"/mgmt/prompts/{prompt_id}/versions/{version}",
-                    json={"label": label, "notes": notes, "status": status})
+                    json={"notes": notes, "status": status})
             if action == "refine":
                 if version is None or not name:
                     raise ValueError("refine needs version and name")
@@ -381,13 +379,14 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
 
     @mcp.tool(annotations=WRITE)
     def upsert_rule(rule: dict, environment: str | None = None) -> dict:
-        """Create or update a targeting rule. Shape: {id, scope: 'prompt'|'global',
-        prompt_id (for prompt scope), priority, when: <condition>, serve, comment}.
-        Conditions: {flag, op, value|values} or {all|any: [...]} / {not: ...} /
-        {segment: name}. Serve: {version, at: 'live'|'tip'} | {label} |
-        {rollout: {bucket_by, weights: [...]}}. The response may carry a warning
-        that the rule CAN'T SERVE YET (e.g. the version was never published here)
-        — surface it and fix the pointer before relying on the rule."""
+        """Create or update a targeting rule. Shape: {id, prompt_id, priority,
+        when: <condition>, serve: {version, at: 'live'|'tip'}, comment}. Conditions:
+        {flag, op, value|values} or {all|any: [...]} / {not: ...}. Rules are
+        prompt-scoped and serve one version of that prompt; who is in a cohort (a
+        beta, a percentage) is a flag the caller's system sets and sends. The
+        response may carry a warning that the rule CAN'T SERVE YET (e.g. the
+        version was never published here) — surface it and fix the pointer before
+        relying on the rule."""
         try:
             return api.post(f"/mgmt/envs/{api.env(environment)}/rules", rule)
         except Exception as exc:
@@ -403,18 +402,6 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
             return api.request(
                 "PATCH", f"/mgmt/envs/{api.env(environment)}/rules/{rule_id}",
                 json={"status": status})
-        except Exception as exc:
-            raise _err(exc)
-
-    @mcp.tool(annotations=WRITE)
-    def upsert_segment(name: str, when: dict,
-                       environment: str | None = None) -> dict:
-        """Create or update a named segment (a reusable audience) — rules
-        reference it as {segment: name}. `when` is a condition tree, same shape
-        as rule conditions."""
-        try:
-            return api.post(f"/mgmt/envs/{api.env(environment)}/segments",
-                            {"name": name, "when": when})
         except Exception as exc:
             raise _err(exc)
 
@@ -449,8 +436,8 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
     def rollback_targeting(to_rules_version: int,
                            environment: str | None = None,
                            confirm: str | None = None) -> dict:
-        """Restore the ENTIRE environment's targeting — rules, segments,
-        defaults, kills, and live pointers — to an earlier rules_version from
+        """Restore the ENTIRE environment's targeting — rules, defaults, kills,
+        and live pointers — to an earlier rules_version from
         get_targeting_history. This is environment-wide, not per-prompt: every
         targeting change made after that point stops applying. It is itself a
         new revision (history is never rewritten). Protected environments

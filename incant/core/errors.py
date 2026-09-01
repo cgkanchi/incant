@@ -32,24 +32,6 @@ class Unservable(CoreError):
         super().__init__(msg)
 
 
-class MissingSegment(CoreError):
-    """A condition references a segment the environment does not have. Raised (not
-    treated as False) so `not: {segment: gone}` can never invert into "match everyone";
-    the evaluator turns it into a counted rule skip."""
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-        super().__init__(f"segment {name!r} does not exist")
-
-
-class SegmentCycle(CoreError):
-    """Segment references form a cycle. Same handling as :class:`MissingSegment`."""
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-        super().__init__(f"segment {name!r} references itself (cycle)")
-
-
 class IncludeCycle(CoreError):
     """A render-time include cycle was detected (static validation is the primary guard)."""
 

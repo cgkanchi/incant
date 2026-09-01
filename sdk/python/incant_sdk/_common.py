@@ -29,7 +29,7 @@ from ._models import (
     VersionPin,
 )
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 USER_AGENT = f"incant-sdk-python/{VERSION}"
 
 # Renders are pure reads of an in-memory snapshot — safe to retry on the gateway
@@ -110,7 +110,6 @@ def parse_resolution(data: dict, prompt_id: str | None = None) -> Resolution:
         version=data["version"],
         commit=data["commit"],
         matched_rule=_match(data["matched_rule"]),
-        label=data.get("label"),
         raw=data,
     )
 
@@ -122,7 +121,6 @@ def parse_prompts(data: dict) -> list[PromptInfo]:
             description=p.get("description", ""),
             versions=tuple(p.get("versions", [])),
             default_version=p.get("default"),
-            labels={int(k): v for k, v in (p.get("labels") or {}).items()},
             raw=p,
         )
         for p in data.get("prompts", [])

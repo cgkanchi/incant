@@ -1,29 +1,5 @@
-/* screens: segments, playground, audit, and access (+ their modals) */
+/* screens: playground, audit, and access (+ their modals) */
 "use strict";
-
-async function screenSegments() {
-  const main = el("main");   // capture before any await (Issue B: stale screens write a detached node)
-  const d = await GET(`/mgmt/envs/${enc(State.env)}/segments`);
-  const segs = d.segments || [];
-  const names = segs.map((s) => s.name);
-  let se = window._segEdit;
-  // Repair stale state: a selection that no longer exists (env switch, deletion) resets.
-  if (se && !se.creating && se.selected && !names.includes(se.selected)) se = null;
-  if (!se) {
-    se = segs.length
-      ? { creating: false, selected: segs[0].name, name: segs[0].name, cb: newCb(segs[0].when), err: "" }
-      : { creating: true, selected: null, name: "", cb: newCb(null), err: "" };
-  }
-  se.raw = segs; se.allSegments = names;
-  window._segEdit = se;
-  main.innerHTML = `<div class="screen">
-    <div class="h1row"><span class="h1 sm serif">Segments — <i>${esc(State.env)}</i></span>
-      <span class="sub">named groups of users that rules can target</span></div>
-    <div class="panelrow">
-      <div id="segList" style="flex:1 1 220px;display:flex;flex-direction:column;gap:10px">${segListHtml(se)}</div>
-      <div id="segEditor" style="flex:10 1 420px;min-width:0">${segEditorHtml(se)}</div>
-    </div></div>`;
-}
 
 // Explorable audit — actor/action selects + object substring, applied via query
 // re-fetch (module state). Rows open a before/after detail modal.
@@ -414,39 +390,4 @@ async function screenPlay() {
         last ? renderPlayResult(last, pinned)
              : '<div class="empty">Render a prompt to see the resolved output and its reproducible pin.</div>'}</div>
     </div></div>`;
-}
-
-// ── segments editor (reuses the clause builder) ──────────────────────
-function segListHtml(se) {
-  const items = se.raw.map((s) =>
-    `<button type="button" class="card pad seg-item btn-bare${!se.creating && se.selected === s.name ? " sel" : ""}" data-act="segSelect" data-name="${esc(s.name)}">
-      <div style="font-size:13px;font-weight:700">${esc(s.name)}</div>
-      <div style="font-size:11.5px;color:var(--mut);margin-top:3px">referenced by ${s.referenced_by} ${plural(s.referenced_by, "rule")}</div></button>`).join("");
-  return `${items || '<div class="empty">No segments yet.</div>'}
-    <button type="button" class="card pad seg-item btn-bare${se.creating ? " sel" : ""}" data-act="segNew" style="text-align:center;color:var(--acc-ink);font-weight:600">＋ New segment</button>`;
-}
-function segEditorHtml(se) {
-  const existing = !se.creating && !!se.selected;
-  const refCount = existing ? ((se.raw.find((s) => s.name === se.selected) || {}).referenced_by || 0) : 0;
-  return `<div class="card pad">
-    ${se.err ? `<div class="banner danger" style="margin-bottom:12px"><span style="font-size:12.5px;font-weight:600">${esc(se.err)}</span></div>` : ""}
-    <div class="field"><label>Segment name${existing ? ` <span style="text-transform:none;font-weight:400">· can't change once created</span>` : ""}</label>
-      ${existing ? `<div style="font-size:14px;font-weight:700">${esc(se.name)}</div>`
-                 : `<input id="sg-name" value="${esc(se.name)}" placeholder="e.g. enterprise-us" spellcheck="false" style="font-family:'IBM Plex Mono',monospace"></div>`}
-    ${existing ? `</div><div style="font-size:11px;color:var(--mut);margin:-4px 0 14px">referenced by ${refCount} ${plural(refCount, "rule")}</div>` : ""}
-    <div class="cmp-h" style="font-size:16px;margin-bottom:8px">Who's in it — match all of:</div>
-    ${cbHtml(se.cb, "sg", { segments: se.allSegments.filter((n) => n !== se.selected), allowNew: false })}
-    <div class="modal-actions" style="justify-content:flex-start;margin-top:16px">
-      <button class="btn primary" data-act="segSave">${existing ? "Save segment" : "Create segment"}</button></div>
-    <div style="font-size:11.5px;color:var(--faint);margin-top:12px;border-top:1px solid var(--line2);padding-top:10px">A clause referencing an absent flag doesn't match — it never errors. Edits propagate in &lt;2s.</div>
-  </div>`;
-}
-function segEditSync() {
-  const se = window._segEdit; if (!se) return;
-  if (se.creating) { const n = el("sg-name"); if (n) se.name = n.value; }
-  cbSync(se.cb, "sg");
-}
-function renderSegEditor() {
-  const e = el("segEditor"); if (e) e.innerHTML = segEditorHtml(window._segEdit);
-  const l = el("segList"); if (l) l.innerHTML = segListHtml(window._segEdit);
 }

@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires the Incant MCP server (incant-mcp) configured with an API key holding at least editor on the target project. Never publishes — pointer moves belong to incant-release.
 metadata:
   author: incant
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Author a Prompt Change
@@ -25,7 +25,7 @@ a committed, review-clean version and **stops there**:
 - `list_prompts`, `get_prompt` — discover what exists and its current state
 - `create_prompt` — new prompt (or fragment — fragments are just prompts)
 - `edit_draft` — create / update / get / **render** / diff / discard a draft
-- `set_prompt_metadata` — labels, variable refinements, saved test contexts
+- `set_prompt_metadata` — version notes/status, variable refinements, saved test contexts
 - `review_draft` — approve / request changes, with comments
 - `commit_draft` — the deliverable
 - `diff_versions`, `render_prompt` — verify the committed result

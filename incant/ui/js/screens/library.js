@@ -46,12 +46,11 @@ function promptRowHtml(p, rules) {
   const bits = [];
   // green — live for everyone
   if (p.live && p.live_version != null) bits.push(statusLine("live", `Version ${p.live_version} live`));
-  // amber — being tested with a group (dedupe by rendered label). Omitted entirely when
+  // amber — being tested with a group (dedupe by rendered text). Omitted entirely when
   // rules === null (no access to the env rule list) so we never imply "not being tested".
   const seen = new Set();
   if (rules) for (const t of testingFor(rules, p.prompt_id, p.live_version)) {
-    const lbl = t.tip ? "draft testing" : (t.version != null ? `v${t.version} testing`
-              : (t.label ? `${esc(t.label)} testing` : "testing"));
+    const lbl = t.tip ? "draft testing" : (t.version != null ? `v${t.version} testing` : "testing");
     if (seen.has(lbl)) continue; seen.add(lbl);
     bits.push(pill("warn", lbl));
   }

@@ -1,6 +1,6 @@
 [project]
 name = "incant"
-version = "1.0.0"
+version = "1.1.0"
 description = "A prompt management platform — git for content, Jinja2 for rendering, flag-based targeting."
 readme = "README.md"
 license = "MIT"

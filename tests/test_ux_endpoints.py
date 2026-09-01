@@ -4,8 +4,8 @@
     project-scoped viewer (whom the UI's best-role-in-any-scope chrome gating lets reach a
     prompt screen) reads the rules governing THEIR project instead of a swallowed-403 empty
     list. The param requires viewer on that project (in this env) and returns the project's
-    own prompt-scoped rules plus every global rule; other projects' rules stay hidden. No
-    param → unchanged (env-wide viewer, full list).
+    own prompt-scoped rules; other projects' rules stay hidden. No param → unchanged
+    (env-wide viewer, full list).
 
   * GET /mgmt/overview — a per-prompt `drafts_needing_review` count that is truthful under a
     review policy: OPEN drafts on prompts whose PROJECT requires review (review_policy > 0).
@@ -29,20 +29,13 @@ def client(tmp_path):
 # ── GET /mgmt/envs/{env}/rules?project=<p> ───────────────────────────
 
 def test_project_scoped_rules_read(client):
-    # Seed gives project `support` two prompt-scoped rules (beta-gets-v3, team-x-tip). Add a
-    # rule to project `shared` (something to EXCLUDE) and a global rule (something to INCLUDE)
-    # so the filter has both sides to prove. Rule upserts carry no type-to-confirm even on a
-    # locked env (DESIGN.md §7), so no confirm token is needed on prod.
+    # Seed gives project `support` two rules (beta-gets-v3, team-x-tip). Add a rule on the
+    # fragment prompt too. Rule upserts carry no type-to-confirm even on a locked env
+    # (DESIGN.md §7), so no confirm token is needed on prod.
     assert client.post(
         "/mgmt/envs/prod/rules",
-        json={"id": "shared-only", "scope": "prompt",
-              "prompt_id": "support/style/language-rules", "priority": 30,
-              "serve": {"version": 1}, "comment": "shared project rule"},
-        headers=auth()).status_code == 200
-    assert client.post(
-        "/mgmt/envs/prod/rules",
-        json={"id": "glob-voice", "scope": "global", "priority": 5,
-              "serve": {"label": "voice-v2"}, "comment": "global rule"},
+        json={"id": "shared-only", "prompt_id": "support/style/language-rules", "priority": 30,
+              "serve": {"version": 1}, "comment": "fragment rule"},
         headers=auth()).status_code == 200
 
     # A principal with viewer ONLY on project `support` (+ prod).
@@ -54,19 +47,17 @@ def test_project_scoped_rules_read(client):
     assert client.get("/mgmt/envs/prod/rules?project=shared",
                       headers=auth(viewer)).status_code == 403
 
-    # Scoped to their OWN project → 200 with support's prompt-scoped rules + the global rule,
-    # and NOT shared's rule.
+    # Scoped to their OWN project → 200 with support's rules.
     r = client.get("/mgmt/envs/prod/rules?project=support", headers=auth(viewer))
     assert r.status_code == 200, r.text
     body = r.json()
     ids = {rule["id"] for rule in body["rules"]}
-    assert {"beta-gets-v3", "team-x-tip"} <= ids   # support's own prompt-scoped rules
-    assert "glob-voice" in ids                      # global rules govern every prompt
-    # One project per deployment: every prompt-scoped rule belongs to it, so the
-    # project-scoped read shows the fragment's rule too — nothing foreign exists.
+    assert {"beta-gets-v3", "team-x-tip"} <= ids   # support's own rules
+    # One project per deployment: every rule belongs to it, so the project-scoped read
+    # shows the fragment's rule too — nothing foreign exists.
     assert "shared-only" in ids
     for rule in body["rules"]:
-        assert rule["scope"] == "global" or rule["prompt_id"].split("/", 1)[0] == "support"
+        assert rule["prompt_id"].split("/", 1)[0] == "support"
     assert all(k.split("/", 1)[0] == "support" for k in body["defaults"])
     assert all(k.split("/", 1)[0] == "support" for k in body["kills"])
 
@@ -133,14 +124,6 @@ def test_overview_drafts_needing_review(client):
 # history required env-WIDE viewer. These pin the fixes end to end.
 
 def test_scoped_viewer_end_to_end(client):
-    # Seed a GLOBAL rule so the revisions log has an env-wide revision to EXCLUDE from the
-    # project-scoped view (the seed's beta-gets-v3/team-x-tip give the support side to INCLUDE).
-    assert client.post(
-        "/mgmt/envs/prod/rules",
-        json={"id": "glob-test", "scope": "global", "priority": 5,
-              "serve": {"label": "voice-v2"}, "comment": "global rule"},
-        headers=auth()).status_code == 200
-
     v = make_key(client, "viewer", project="support", env="prod")
 
     # overview — passes `environment`, so the (support, prod) viewer sees support's prompts.
@@ -174,7 +157,7 @@ def test_scoped_viewer_end_to_end(client):
                       headers=auth(v)).status_code == 200
 
     # revisions — the env-wide door 403s, a project they can't see 403s, and the project door
-    # 200s filtered to support (its own rule revisions in, the global-rule revision out).
+    # 200s filtered to support (its own rule revisions in, env-wide revisions out).
     assert client.get("/mgmt/envs/prod/revisions", headers=auth(v)).status_code == 403
     assert client.get("/mgmt/envs/prod/revisions?project=shared",
                       headers=auth(v)).status_code == 403
@@ -186,8 +169,8 @@ def test_scoped_viewer_end_to_end(client):
         assert pid and pid.split("/", 1)[0] == "support", rev
     assert any(rev["kind"] == "rule" and rev["rule_id"] in ("beta-gets-v3", "team-x-tip")
                for rev in revs), "support's own rule revisions are included"
-    assert not any(rev.get("rule_id") == "glob-test" for rev in revs), \
-        "global-rule revisions are env-wide info, excluded in project mode"
+    assert not any(rev["kind"] == "baseline" for rev in revs), \
+        "env-wide revisions (baseline) are excluded in project mode"
 
     # per-prompt publish history — now authorized on (prompt's project, env), not env-wide.
     assert client.get("/mgmt/envs/prod/pointers?prompt_id=support/system&version=2",
@@ -206,17 +189,12 @@ def test_scoped_viewer_end_to_end(client):
 
 def test_env_wide_revisions_and_history_unchanged(client):
     # Regression pins for the unscoped callers. WITHOUT the project param, revisions still
-    # returns the full log — global-rule + segment revisions and cross-project defaults all
-    # present — and the per-prompt publish history stays readable by an env-wide viewer.
-    client.post("/mgmt/envs/prod/rules",
-                json={"id": "glob-test", "scope": "global", "priority": 5,
-                      "serve": {"label": "voice-v2"}, "comment": "global rule"},
-                headers=auth())
+    # returns the full log — env-wide revisions and every prompt's defaults present — and the
+    # per-prompt publish history stays readable by an env-wide viewer.
     full = client.get("/mgmt/envs/prod/revisions", headers=auth()).json()["revisions"]
-    assert any(rev.get("rule_id") == "glob-test" for rev in full)     # global-rule revision kept
-    assert any(rev["kind"] == "segment" for rev in full)              # segment revision kept
+    assert any(rev["kind"] == "baseline" for rev in full)             # env-wide revision kept
     assert any((rev["snapshot"] or {}).get("prompt_id") == "support/style/language-rules"
-               for rev in full)                                       # cross-project default kept
+               for rev in full)                                       # fragment default kept
 
     # An env-wide viewer (project=None, env=prod) reads both, unchanged.
     ew = make_key(client, "viewer", env="prod")

@@ -10,7 +10,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..core.model import ServeLabel, ServeRollout, ServeVersion
 from ..service import AppContext, ServingError
 from ..targeting.observed import collect_rule_flags, typed_value
 from . import metrics
@@ -103,7 +102,7 @@ def evaluate_prompt(
     app.observer.observe(env, req.flags)  # §7 observed flags (memory only)
     return {
         "prompt_id": prompt_id, "version": res.version, "commit": res.commit,
-        "label": res.label, "matched_rule": (
+        "matched_rule": (
             "default" if res.match_scope == "default"
             else {"scope": res.match_scope, "id": res.rule_id}
         ), "environment": env,
@@ -121,7 +120,7 @@ def prompt_spec(
     variables (names, types, required/optional, defaults, descriptions; merged
     across every version targeting can currently serve) and the flags that the
     active rules governing this prompt actually consult (with their enumerable
-    values from eq/in-style clauses, plus any rollout bucketing flag). Renderer-
+    values from eq/in-style clauses). Renderer-
     scoped, same as render: this describes only what the credential could
     already observe by rendering."""
     env = _env(app, environment)
@@ -137,28 +136,14 @@ def prompt_spec(
                                  "no versions and no default here")
 
     # Versions a render could currently resolve to: the default plus anything an
-    # active rule serves (explicit version, label, or rollout band).
-    rules = snap.prompt_rules(prompt_id) + snap.global_rules()
+    # active rule serves.
+    rules = snap.prompt_rules(prompt_id)
     candidates: set[int] = set()
     if default_v is not None:
         candidates.add(default_v)
     flags: dict[str, set] = collect_rule_flags(snap, rules)
     for r in rules:
-        serve = r.serve
-        if isinstance(serve, ServeVersion):
-            candidates.add(serve.version)
-        elif isinstance(serve, ServeLabel):
-            v = snap.version_for_label(prompt_id, serve.label)
-            if v is not None:
-                candidates.add(v)
-        elif isinstance(serve, ServeRollout):
-            for band in serve.weights:
-                if band.version is not None:
-                    candidates.add(band.version)
-                elif band.label is not None:
-                    v = snap.version_for_label(prompt_id, band.label)
-                    if v is not None:
-                        candidates.add(v)
+        candidates.add(r.serve.version)
     candidates &= set(known)  # spec only versions that actually exist here
 
     # Variables: the mgmt-side merge (refinements + template extraction, includes
@@ -271,7 +256,7 @@ def evaluate_all(
         if not ident.has("renderer", project=_project_of(pid), environment=env):
             continue
         out[pid] = {
-            "version": res.version, "commit": res.commit, "label": res.label,
+            "version": res.version, "commit": res.commit,
             "matched_rule": ("default" if res.match_scope == "default"
                              else {"scope": res.match_scope, "id": res.rule_id}),
         }
@@ -291,7 +276,7 @@ def list_prompts(
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
     # Renderer-scoped (not viewer): a production render key must be able to
-    # DISCOVER what it can render — this lists only ids/versions/labels of
+    # DISCOVER what it can render — this lists only ids/versions/defaults of
     # prompts the credential could already render one by one.
     descriptions = {p.id: p.description or "" for p in
                     session.execute(select(models.Prompt)).scalars()}
@@ -306,6 +291,5 @@ def list_prompts(
             "description": descriptions.get(pid, ""),
             "versions": sorted(vers.keys()),
             "default": default_v,
-            "labels": {v.version: v.label for v in vers.values() if v.label},
         })
     return {"environment": env, "prompts": out}

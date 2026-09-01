@@ -4,19 +4,13 @@ Semantics (from the design):
   * Operators: eq, neq, in, not_in, contains, starts_with, ends_with,
     gt/gte/lt/lte, semver_gt/semver_lt, exists; all/any/not composition.
   * A clause referencing an absent flag does not match — never errors.
-  * Segments are named conditions, referenced from any rule. A reference to a
-    segment that does not exist (or a reference cycle) is a broken condition, not
-    a false one: it raises MissingSegment / SegmentCycle so the evaluator can skip
-    and COUNT the rule — evaluating it as False would let `not: {segment: gone}`
-    match everyone.
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .errors import MissingSegment, SegmentCycle
-from .model import All, Any_, Clause, Condition, Not, Segment, SegmentRef
+from .model import All, Any_, Clause, Condition, Not
 
 _MISSING = object()
 
@@ -81,12 +75,7 @@ def eval_clause(clause: Clause, flags: Mapping[str, Any]) -> bool:
     return False
 
 
-def eval_condition(
-    cond: Condition,
-    flags: Mapping[str, Any],
-    segments: Mapping[str, Segment],
-    _seen: frozenset[str] = frozenset(),
-) -> bool:
+def eval_condition(cond: Condition, flags: Mapping[str, Any]) -> bool:
     """Evaluate a condition tree. ``None`` means "always matches"."""
 
     if cond is None:
@@ -94,16 +83,9 @@ def eval_condition(
     if isinstance(cond, Clause):
         return eval_clause(cond, flags)
     if isinstance(cond, All):
-        return all(eval_condition(c, flags, segments, _seen) for c in cond.of)
+        return all(eval_condition(c, flags) for c in cond.of)
     if isinstance(cond, Any_):
-        return any(eval_condition(c, flags, segments, _seen) for c in cond.of)
+        return any(eval_condition(c, flags) for c in cond.of)
     if isinstance(cond, Not):
-        return not eval_condition(cond.of, flags, segments, _seen)
-    if isinstance(cond, SegmentRef):
-        seg = segments.get(cond.name)
-        if seg is None:
-            raise MissingSegment(cond.name)
-        if cond.name in _seen:
-            raise SegmentCycle(cond.name)
-        return eval_condition(seg.condition, flags, segments, _seen | {cond.name})
+        return not eval_condition(cond.of, flags)
     raise TypeError(f"unknown condition node: {cond!r}")

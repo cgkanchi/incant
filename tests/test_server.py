@@ -109,13 +109,6 @@ def test_unlocked_env_needs_no_confirmation(client):
 
 
 def test_invalid_targeting_payloads_are_rejected_before_persistence(client):
-    bad_segment = client.post(
-        "/mgmt/envs/prod/segments",
-        json={"name": "poison", "when": {"unknown": []}},
-        headers=auth(),
-    )
-    assert bad_segment.status_code == 422
-
     bad_operator = client.post(
         "/mgmt/envs/prod/rules",
         json={
@@ -127,26 +120,26 @@ def test_invalid_targeting_payloads_are_rejected_before_persistence(client):
     )
     assert bad_operator.status_code == 422
 
-    bad_rollout = client.post(
+    # Removed 1.1.0 constructs are refused at the schema with a reason, never stored.
+    removed = client.post(
         "/mgmt/envs/prod/rules",
-        json={
-            "id": "bad-rollout", "scope": "prompt", "prompt_id": "support/system",
-            "when": None,
-            "serve": {"rollout": {"bucket_by": "user_id", "weights": [
-                {"version": 2, "weight": 70}, {"default": True, "weight": 20},
-            ]}},
-        },
+        json={"id": "bad-label", "prompt_id": "support/system", "when": None,
+              "serve": {"label": "voice-v2"}},
         headers=auth(),
     )
-    assert bad_rollout.status_code == 422
+    assert removed.status_code == 422 and "removed in 1.1.0" in removed.text
+    removed_seg = client.post(
+        "/mgmt/envs/prod/rules",
+        json={"id": "bad-seg", "prompt_id": "support/system",
+              "when": {"segment": "beta-us"}, "serve": {"version": 2}},
+        headers=auth(),
+    )
+    assert removed_seg.status_code == 422 and "segments were removed" in removed_seg.text
 
     with session_scope() as s:
         assert s.get(models.Rule, "bad-op") is None
-        assert s.get(models.Rule, "bad-rollout") is None
-        assert s.execute(select(models.Segment).where(
-            models.Segment.environment_id == "prod",
-            models.Segment.name == "poison",
-        )).scalar_one_or_none() is None
+        assert s.get(models.Rule, "bad-label") is None
+        assert s.get(models.Rule, "bad-seg") is None
 
 
 def test_operator_cannot_move_pointer(client):
@@ -159,18 +152,16 @@ def test_operator_cannot_move_pointer(client):
     assert r.status_code == 403
 
 
-def test_project_operator_cannot_create_global_rule(client):
+def test_project_operator_creates_rules_and_rules_always_name_a_prompt(client):
     op = make_key(client, "operator", project="support")
-    # A prompt-scoped rule in their own project is allowed.
     r = client.post("/mgmt/envs/prod/rules",
-                    json={"id": "r-sup", "scope": "prompt", "prompt_id": "support/system",
+                    json={"id": "r-sup", "prompt_id": "support/system",
                           "priority": 5, "serve": {"version": 2}}, headers=auth(op))
     assert r.status_code == 200, r.text
-    # A global rule governs every project -> forbidden for a project operator.
+    # No global scope exists: a rule without a prompt is a schema error.
     r = client.post("/mgmt/envs/prod/rules",
-                    json={"id": "r-glob", "scope": "global", "priority": 5,
-                          "serve": {"version": 2}}, headers=auth(op))
-    assert r.status_code == 403
+                    json={"id": "r-glob", "priority": 5, "serve": {"version": 2}}, headers=auth(op))
+    assert r.status_code == 422
 
 
 def test_health_and_ready(client):
@@ -253,7 +244,6 @@ def test_mgmt_overview_and_versions(client):
     assert r.status_code == 200, r.text
     data = r.json()
     versions = {v["version"]: v for v in data["versions"]}
-    assert versions[3]["label"] == "voice-v2"
     assert versions[1]["status"] == "archived"
     # each live version reports the publishing principal.
     assert versions[2]["live_by"] == "Dana"
@@ -279,12 +269,12 @@ def test_version_metadata_and_archive_lifecycle_endpoint(client):
     # v3 is targeted by rules and live in staging, but nobody's default: archivable.
     r = client.patch(
         "/mgmt/prompts/support/system/versions/3",
-        json={"label": "stable", "notes": "retired voice", "status": "archived"},
+        json={"notes": "retired voice", "status": "archived"},
         headers=auth(),
     )
     assert r.status_code == 200, r.text
     assert r.json() == {
-        "prompt_id": "support/system", "version": 3, "label": "stable",
+        "prompt_id": "support/system", "version": 3,
         "notes": "retired voice", "status": "archived",
     }
     versions = client.get(
@@ -313,11 +303,6 @@ def test_version_metadata_and_archive_lifecycle_endpoint(client):
     r = client.post("/mgmt/envs/staging/defaults",
                     json={"prompt_id": "support/system", "version_number": 3}, headers=auth())
     assert r.status_code == 400, r.text
-
-    # A label names exactly one version of a prompt.
-    r = client.patch("/mgmt/prompts/support/system/versions/2",
-                     json={"label": "stable"}, headers=auth())
-    assert r.status_code == 409 and "already names v3" in r.json()["detail"], r.text
 
     # Unarchive → targetable and serving again.
     r = client.patch("/mgmt/prompts/support/system/versions/3",

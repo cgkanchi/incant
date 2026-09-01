@@ -195,7 +195,7 @@ async function screenDraft() {
     return;
   }
 
-  const [draft, tcs, rulesRes, segsRes] = await Promise.all([
+  const [draft, tcs, rulesRes] = await Promise.all([
     GET(`/mgmt/drafts/${enc(draftId)}`),
     GET(`/mgmt/prompts/${enc(pid)}/test-contexts`),
     // Targeting data feeds the ad-hoc context form: the flags rules actually
@@ -205,7 +205,6 @@ async function screenDraft() {
     // suggestions (the editor types them by hand) — a graceful degrade, not a misleading
     // "no rules" claim, so no warning strip is needed here.
     fetchEnvRules(State.env, pid),
-    GET(`/mgmt/envs/${enc(State.env)}/segments`).catch(() => ({ segments: [] })),
   ]);
 
   // Page state survives in-tab updates (test contexts, diff controls); autosave is
@@ -215,7 +214,7 @@ async function screenDraft() {
     // No saved contexts is not a dead end — fall back to the ad-hoc context form.
     tcActive: tcs.test_contexts[0]?.name || "__custom",
     customVars: null, customFlags: null,
-    flagDefs: targetingFlags(rulesRes.rules, segsRes.segments, [pid, ...(dv.includes || [])]),
+    flagDefs: targetingFlags(rulesRes.rules, [pid, ...(dv.includes || [])]),
     committedVars: (dv.variables || []).slice(),
     // Draft truth when it parses; the committed set is the fallback while it doesn't.
     varDefs: (draft.variables && !draft.variables.error)

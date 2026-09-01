@@ -1,9 +1,8 @@
-"""TargetingService — per-environment rules, segments, pointers, defaults, kills.
+"""TargetingService — per-environment rules, pointers, defaults, kills.
 
 Every mutation snapshots to rule_revisions and bumps the environment's monotonic
 rules_version. Pointer-class changes (make-live, default) are the governed acts;
-rule/segment edits are low-friction. Rules and pointers may only reference
-validated SHAs.
+rule edits are low-friction. Rules and pointers may only reference validated SHAs.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..core.parse import parse_condition, parse_rule as parse_core_rule
+from ..core.parse import parse_rule as parse_core_rule
 from .audit import record_audit
 
 
@@ -29,8 +28,8 @@ def capture_state(session: Session, env_id: str) -> dict:
     recorded on every revision (``_bump``) so rollback can restore everything and
     ``pin.rules_version`` can replay it (§7, §9). Content is still only SHAs.
 
-    ``versions`` folds live pointers (newest move), tips (newest validated), labels
-    and status per ``(prompt, version)`` — the same inputs an ``EnvSnapshot``'s
+    ``versions`` folds live pointers (newest move), tips (newest validated) and
+    status per ``(prompt, version)`` — the same inputs an ``EnvSnapshot``'s
     ``VersionInfo`` is built from, minus ``previous_live`` (a replay never falls
     back within a version: degraded replay would be a lie, it 409s instead)."""
     rules = [
@@ -38,12 +37,6 @@ def capture_state(session: Session, env_id: str) -> dict:
         for r in session.execute(
             select(models.Rule).where(models.Rule.environment_id == env_id)
             .order_by(models.Rule.priority, models.Rule.id)
-        ).scalars()
-    ]
-    segments = [
-        {"name": s.name, "clauses": s.clauses, "version": s.version}
-        for s in session.execute(
-            select(models.Segment).where(models.Segment.environment_id == env_id)
         ).scalars()
     ]
     defaults = {
@@ -106,12 +99,10 @@ def capture_state(session: Session, env_id: str) -> dict:
     for v in session.execute(select(models.Version)).scalars():
         key = (v.prompt_id, v.number)
         versions[_version_key(*key)] = {
-            "live": live.get(key), "tip": tips.get(key),
-            "label": v.label, "status": v.status,
+            "live": live.get(key), "tip": tips.get(key), "status": v.status,
         }
 
-    return {"rules": rules, "segments": segments, "defaults": defaults,
-            "kills": kills, "versions": versions}
+    return {"rules": rules, "defaults": defaults, "kills": kills, "versions": versions}
 
 
 class TargetingError(Exception):
@@ -214,89 +205,25 @@ class TargetingService:
             )
         ).first() is not None
 
-    def _segment_names(self, env_id: str) -> set[str]:
-        return set(self.s.execute(select(models.Segment.name).where(
-            models.Segment.environment_id == env_id)).scalars())
-
-    def _validate_segment_refs(self, env_id: str, when) -> None:
-        """Every segment a condition references must exist in this environment. A
-        dangling reference is not "never matches" — the evaluator skips and counts the
-        rule — so refuse it at write time where the author can fix it."""
-        refs = _segment_refs(when)
-        if not refs:
-            return
-        missing = sorted(refs - self._segment_names(env_id))
-        if missing:
+    def _validate_rule_targets(self, prompt_id: str, serve: dict) -> None:
+        """Integrity (§7): a rule may only serve a version that exists — and is active —
+        for its prompt, and a pinned SHA must be a validated commit for that exact
+        prompt/version."""
+        version_number = int(serve["version"])
+        at, sha = serve.get("at"), serve.get("sha")
+        if not self._version_exists(prompt_id, version_number):
             raise TargetingError(
-                f"unknown segment(s) {missing} in {env_id!r} — create the segment first")
-
-    def _validate_segment_cycle(self, env_id: str, name: str, clauses) -> None:
-        """Segments may reference segments; refuse a reference chain that leads back to
-        the segment being saved (a -> b -> a) — such a rule could never match."""
-        graph = {
-            s.name: _segment_refs(s.clauses)
-            for s in self.s.execute(select(models.Segment).where(
-                models.Segment.environment_id == env_id)).scalars()
-        }
-        graph[name] = _segment_refs(clauses)
-        path: list[str] = []
-        seen: set[str] = set()
-
-        def walk(node: str) -> bool:
-            if node == name and path:
-                return True
-            if node in seen:
-                return False
-            seen.add(node)
-            path.append(node)
-            for nxt in sorted(graph.get(node, ())):
-                if walk(nxt):
-                    return True
-            path.pop()
-            return False
-
-        if walk(name):
-            raise TargetingError("segment cycle: " + " -> ".join(path + [name]))
-
-    def _validate_rule_targets(self, scope: str, prompt_id: str | None, serve: dict) -> None:
-        """Integrity: a prompt-scoped rule may only serve versions that exist for the
-        prompt (§7), and a pinned SHA must be a validated commit for that
-        prompt/version. A global rule serving an explicit version must name a version
-        at least one prompt actively has (labels are not checked — a prompt without the
-        label simply skips the rule)."""
-        # (version_number, at, sha) targets carried by this serve.
-        targets: list[tuple[int, str | None, str | None]] = []
-        if "version" in serve:
-            targets.append((int(serve["version"]), serve.get("at"), serve.get("sha")))
-        if isinstance(serve.get("rollout"), dict):
-            for band in serve["rollout"].get("weights", []):
-                if band.get("version") is not None and not band.get("default"):
-                    targets.append((int(band["version"]), None, None))
-        if scope != "prompt" or not prompt_id:
-            for version_number, _at, _sha in targets:
-                exists = self.s.execute(select(models.Version.id).where(
-                    models.Version.number == version_number,
-                    models.Version.status == "active",
-                )).first() is not None
-                if not exists:
-                    raise TargetingError(
-                        f"version {version_number} exists (active) for no prompt — a global "
-                        "rule serving it could never match")
-            return
-        for version_number, at, sha in targets:
-            if not self._version_exists(prompt_id, version_number):
+                f"version {version_number} does not exist or is archived for "
+                f"prompt {prompt_id!r}")
+        if at == "sha":
+            if not sha:
                 raise TargetingError(
-                    f"version {version_number} does not exist or is archived for "
-                    f"prompt {prompt_id!r}")
-            if at == "sha":
-                if not sha:
-                    raise TargetingError(
-                        f"serve pins at a SHA but none was given for {prompt_id!r} "
-                        f"v{version_number}")
-                if not self._is_validated_for(prompt_id, version_number, sha):
-                    raise TargetingError(
-                        f"SHA {sha} is not a validated commit for {prompt_id!r} "
-                        f"v{version_number}")
+                    f"serve pins at a SHA but none was given for {prompt_id!r} "
+                    f"v{version_number}")
+            if not self._is_validated_for(prompt_id, version_number, sha):
+                raise TargetingError(
+                    f"SHA {sha} is not a validated commit for {prompt_id!r} "
+                    f"v{version_number}")
 
     # ── rules ────────────────────────────────────────────────────────
 
@@ -323,27 +250,17 @@ class TargetingService:
         # Compute the MERGED row first and validate it BEFORE the session is touched: a
         # caller that catches the TargetingError and carries on in the same session must
         # not find a half-built rule committed under it.
-        scope = rule.get("scope", (existing.scope if existing else None) or "prompt")
         prompt_id = rule.get("prompt_id", existing.prompt_id if existing else None)
-        if scope == "global":
-            # The MERGED row must satisfy the global⇒no-prompt invariant even when a
-            # service-level caller omits prompt_id while rescoping (the HTTP layer
-            # always sends it explicitly; plain dicts may not). Without this, the
-            # stale prompt_id survives the merge, the DB check rejects the flush,
-            # and — had it landed — the next snapshot rebuild's strict parse would
-            # take the whole environment down.
-            prompt_id = None
+        if not prompt_id:
+            raise TargetingError("a rule requires prompt_id")
         clauses = rule.get("when", rule.get("clauses"))
         serve = rule["serve"]
         # Integrity: reject targets that reference a non-existent version or an
-        # unvalidated pinned SHA, and conditions naming segments this environment
-        # lacks, before this write bumps rules_version.
-        self._validate_rule_targets(scope, prompt_id, serve)
-        self._validate_segment_refs(env_id, clauses)
+        # unvalidated pinned SHA before this write bumps rules_version.
+        self._validate_rule_targets(prompt_id, serve)
         if existing is None:
             existing = models.Rule(id=rid, environment_id=env_id)
             self.s.add(existing)
-        existing.scope = scope
         existing.prompt_id = prompt_id
         existing.priority = int(rule.get("priority", existing.priority or 10))
         existing.clauses = clauses
@@ -370,40 +287,6 @@ class TargetingService:
         record_audit(self.s, self.actor, f"rule.{status}", "rule", rule_id,
                      before=before, after=_rule_snapshot(r))
         return r
-
-    # ── segments ─────────────────────────────────────────────────────
-
-    def list_segments(self, env_id: str) -> list[models.Segment]:
-        return list(self.s.execute(
-            select(models.Segment).where(models.Segment.environment_id == env_id)
-        ).scalars())
-
-    def upsert_segment(self, env_id: str, name: str, clauses: dict) -> models.Segment:
-        env = self._env(env_id)
-        if not isinstance(name, str) or not name.strip() or len(name) > 255:
-            raise TargetingError("segment name must be 1-255 non-whitespace characters")
-        try:
-            parse_condition(clauses)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise TargetingError(f"invalid segment condition: {exc}") from exc
-        name = name.strip()
-        self._validate_segment_refs(env_id, clauses)
-        self._validate_segment_cycle(env_id, name, clauses)
-        existing = self.s.execute(
-            select(models.Segment).where(
-                models.Segment.environment_id == env_id, models.Segment.name == name
-            )
-        ).scalar_one_or_none()
-        if existing is None:
-            existing = models.Segment(environment_id=env_id, name=name, clauses=clauses, version=1)
-            self.s.add(existing)
-        else:
-            existing.clauses = clauses
-            existing.version += 1
-        self.s.flush()
-        self._bump(env, "segment", {"name": name, "clauses": clauses})
-        record_audit(self.s, self.actor, "segment.upsert", "segment", name, after={"clauses": clauses})
-        return existing
 
     # ── pointers (governed) ──────────────────────────────────────────
 
@@ -532,7 +415,6 @@ class TargetingService:
                 self.s.delete(rule)
                 changed += 1
             else:
-                rule.scope = snap.get("scope", rule.scope)
                 rule.prompt_id = snap.get("prompt_id")
                 rule.priority = snap.get("priority", rule.priority)
                 rule.clauses = snap.get("when")
@@ -544,7 +426,7 @@ class TargetingService:
         for rid, snap in target.items():
             if rid not in existing:
                 self.s.add(models.Rule(
-                    id=rid, environment_id=env_id, scope=snap.get("scope", "prompt"),
+                    id=rid, environment_id=env_id,
                     prompt_id=snap.get("prompt_id"), priority=snap.get("priority", 10),
                     clauses=snap.get("when"), serve=snap.get("serve"),
                     status=snap.get("status", "active"), comment=snap.get("comment", ""),
@@ -554,8 +436,8 @@ class TargetingService:
 
     def rollback(self, env_id: str, to_rules_version: int) -> dict:
         """Restore the environment's COMPLETE targeting state as of
-        ``to_rules_version`` — rules, segments, defaults, kill switches, and live
-        pointers — from the revision's captured state (§7 "one-click rollback of …
+        ``to_rules_version`` — rules, defaults, kill switches, and live pointers —
+        from the revision's captured state (§7 "one-click rollback of …
         the whole environment's targeting state").
 
         Pointer restoration preserves the append-only model: a changed pointer gets
@@ -569,28 +451,16 @@ class TargetingService:
                 f"rules_version {to_rules_version} has no exact captured state for {env_id!r}"
             )
 
+        if state.get("segments") or any(
+            r.get("scope") == "global" or set(r.get("serve") or {}) & {"label", "rollout"}
+            for r in state.get("rules", [])
+        ):
+            raise TargetingError(
+                f"rules_version {to_rules_version} predates 1.1.0 and uses removed targeting "
+                "features (segments, labels, rollouts or global rules); it cannot be restored")
+
         changed = {"rules": self._rollback_rules(
             env_id, {r["id"]: r for r in state.get("rules", [])})}
-
-        # Segments: restore the exact recorded set, including removals.
-        changed["segments"] = 0
-        existing_segments = {s.name: s for s in self.list_segments(env_id)}
-        recorded_segments = {s["name"]: s for s in state.get("segments", [])}
-        for name, seg in existing_segments.items():
-            if name not in recorded_segments:
-                self.s.delete(seg)
-                changed["segments"] += 1
-        for name, snap in recorded_segments.items():
-            seg = existing_segments.get(name)
-            if seg is None:
-                self.s.add(models.Segment(
-                    environment_id=env_id, name=name,
-                    clauses=snap["clauses"], version=snap.get("version", 1)))
-                changed["segments"] += 1
-            elif seg.clauses != snap["clauses"] or seg.version != snap.get("version", 1):
-                seg.clauses = snap["clauses"]
-                seg.version = snap.get("version", 1)
-                changed["segments"] += 1
 
         # Defaults: exactly the recorded map — updates, inserts, AND removals
         # (a default added after the target is part of what's being undone).
@@ -753,23 +623,19 @@ def _apply_deltas(base_state: dict, deltas: list[models.RuleRevision]) -> dict:
     copy first — checkpoint states are shared history, never mutated). Every
     non-checkpoint kind's snapshot fully describes its change: rules carry the
     whole rule, pointers carry (prompt, version, to_sha) including tombstones,
-    defaults/kills carry their new value, segments their new clauses. Baseline and
-    rollback — the two kinds whose snapshot does NOT describe their effect — are
-    always checkpoints, so they never appear as deltas."""
+    defaults/kills carry their new value. Baseline and rollback — the two kinds whose
+    snapshot does NOT describe their effect — are always checkpoints, so they never
+    appear as deltas. Pre-1.1.0 "segment" deltas are carried through untouched so the
+    state still reports them (and replay refuses honestly)."""
     import copy
     state = copy.deepcopy(base_state)
     rules = {r["id"]: r for r in state.get("rules", [])}
-    segments = {s["name"]: s for s in state.get("segments", [])}
     for rev in deltas:
         snap = rev.snapshot or {}
         if rev.kind == "rule" and rev.rule_id:
             rules[rev.rule_id] = snap
         elif rev.kind == "segment":
-            existing = segments.get(snap.get("name"))
-            version = (existing.get("version", 0) + 1) if existing else 1
-            segments[snap["name"]] = {"name": snap["name"],
-                                      "clauses": snap.get("clauses"),
-                                      "version": version}
+            state.setdefault("segments", []).append(snap)
         elif rev.kind == "default":
             state.setdefault("defaults", {})[snap["prompt_id"]] = snap["version"]
         elif rev.kind == "kill":
@@ -779,45 +645,21 @@ def _apply_deltas(base_state: dict, deltas: list[models.RuleRevision]) -> dict:
         elif rev.kind == "pointer":
             key = _version_key(snap["prompt_id"], snap["version"])
             entry = state.setdefault("versions", {}).setdefault(
-                key, {"live": None, "tip": None, "label": None, "status": "active"})
+                key, {"live": None, "tip": None, "status": "active"})
             entry["live"] = snap.get("to_sha")
         elif rev.kind == "version":
-            # Registry metadata that targeting depends on (label, archived status).
+            # Registry metadata that targeting depends on (archived status).
             key = _version_key(snap["prompt_id"], snap["version"])
             entry = state.setdefault("versions", {}).setdefault(
-                key, {"live": None, "tip": None, "label": None, "status": "active"})
-            if "label" in snap:
-                entry["label"] = snap["label"]
+                key, {"live": None, "tip": None, "status": "active"})
             if "status" in snap:
                 entry["status"] = snap["status"]
     state["rules"] = list(rules.values())
-    state["segments"] = list(segments.values())
     return state
-
-
-def _segment_refs(cond) -> set[str]:
-    """Segment names a raw condition (JSON shape) references, at any depth."""
-    out: set[str] = set()
-
-    def walk(c) -> None:
-        if not isinstance(c, dict):
-            return
-        seg = c.get("segment")
-        if isinstance(seg, str) and seg.strip():
-            out.add(seg.strip())
-        for k in ("all", "any"):
-            if isinstance(c.get(k), list):
-                for x in c[k]:
-                    walk(x)
-        if "not" in c:
-            walk(c["not"])
-
-    walk(cond)
-    return out
 
 
 def _rule_snapshot(r: models.Rule) -> dict:
     return {
-        "id": r.id, "scope": r.scope, "prompt_id": r.prompt_id, "priority": r.priority,
+        "id": r.id, "prompt_id": r.prompt_id, "priority": r.priority,
         "when": r.clauses, "serve": r.serve, "status": r.status, "comment": r.comment,
     }

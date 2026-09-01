@@ -318,7 +318,14 @@ class AppContext:
                 f"{env_id!r} (it may predate state-tracked revisions); replay with "
                 "pin.versions instead — the response's versions map is SHA-exact",
             )
-        snap = snapshot_from_state(state, env_id, rules_version, current.servable)
+        try:
+            snap = snapshot_from_state(state, env_id, rules_version, current.servable)
+        except ValueError as exc:
+            raise ServingError(
+                422,
+                f"rules_version {rules_version} of {env_id!r} cannot be replayed: {exc}; "
+                "replay with pin.versions instead — the response's versions map is SHA-exact",
+            )
         # Variable defaults ride along from the live snapshot: refinements are
         # authoring metadata, not targeting state (documented replay semantics).
         snap.refinement_defaults = current.refinement_defaults
@@ -564,7 +571,7 @@ class AppContext:
         for pid, res in result.contributions.items():
             # Full 40-char SHAs: the reproducibility tuple must be SHA-exact and is fed
             # back verbatim as a `pin` (which now accepts only full SHAs — §9, §4).
-            entry = {"version": res.version, "commit": res.commit, "label": res.label}
+            entry = {"version": res.version, "commit": res.commit}
             if res.content_fallback:
                 entry["fallback"] = True
             versions[pid] = entry
@@ -591,7 +598,7 @@ class AppContext:
             # True iff at least one active rule was in play for this prompt — feeds
             # incant_flag_eval_fallthrough_total (matched_rule == "default" despite
             # rules existing: dead-rule telemetry, §14). Stripped by the route.
-            "_rules_considered": bool(snap.global_rules() or snap.prompt_rules(prompt_id)),
+            "_rules_considered": bool(snap.prompt_rules(prompt_id)),
         }
 
 

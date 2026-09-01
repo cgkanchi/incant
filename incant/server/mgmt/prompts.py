@@ -186,7 +186,6 @@ def get_versions(
         live = _current_live(session, environment, prompt_id, v.number)
         out.append({
             "version": v.number,
-            "label": v.label,
             "status": v.status,
             "notes": v.notes,
             "is_default": v.number == default_v,
@@ -228,8 +227,7 @@ def update_version(
     _require(ident, "editor", project=_project_of(prompt_id))
     try:
         version = app.registry(session, ident.name).update_version(
-            prompt_id, version_number,
-            label=req.label, notes=req.notes, status=req.status,
+            prompt_id, version_number, notes=req.notes, status=req.status,
         )
     except RegistryConflict as exc:
         raise HTTPException(409, str(exc))
@@ -239,7 +237,6 @@ def update_version(
     return {
         "prompt_id": prompt_id,
         "version": version.number,
-        "label": version.label,
         "notes": version.notes,
         "status": version.status,
     }

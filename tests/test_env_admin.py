@@ -11,9 +11,9 @@ from incant.db import session_scope
 from .test_server import ADMIN, auth, client, make_key  # noqa: F401 (client is a fixture)
 
 
-# The seven tables scoped to one environment by ``environment_id`` — each seeded/asserted.
+# The six tables scoped to one environment by ``environment_id`` — each seeded/asserted.
 _ENV_MODELS = (
-    models.Rule, models.Segment, models.EnvDefault, models.KillSwitch,
+    models.Rule, models.EnvDefault, models.KillSwitch,
     models.PointerMove, models.RuleRevision, models.RoleBinding,
 )
 
@@ -22,9 +22,8 @@ def _seed_env_rows(env: str) -> None:
     """Seed one row of each non-binding env-scoped kind. (The RoleBinding is seeded
     separately, via a real key issuance, so it has a valid principal FK.)"""
     with session_scope() as s:
-        s.add(models.Rule(id=f"rule-{env}", environment_id=env, scope="global",
+        s.add(models.Rule(id=f"rule-{env}", environment_id=env, prompt_id="support/system",
                           serve={"version": 1}))
-        s.add(models.Segment(environment_id=env, name=f"seg-{env}", clauses={"all": []}))
         s.add(models.EnvDefault(environment_id=env, prompt_id="support/system",
                                 version_number=2))
         s.add(models.KillSwitch(environment_id=env, prompt_id="support/system", engaged=True))
@@ -133,7 +132,7 @@ def test_delete_env_non_admin_403(client):
 def test_delete_env_removes_all_scoped_rows_and_spares_others(client):
     client.post("/mgmt/envs", json={"id": "doomed"}, headers=auth())
     client.post("/mgmt/envs", json={"id": "kept"}, headers=auth())
-    # Seed six kinds directly + the seventh (RoleBinding) via a real env-scoped key.
+    # Seed five kinds directly + the sixth (RoleBinding) via a real env-scoped key.
     _seed_env_rows("doomed")
     _seed_env_rows("kept")
     make_key(client, "viewer", env="doomed", name="viewer-doomed")
@@ -143,7 +142,7 @@ def test_delete_env_removes_all_scoped_rows_and_spares_others(client):
     r = client.delete("/mgmt/envs/doomed?confirm=doomed", headers=auth())
     assert r.status_code == 200, r.text
     assert r.json()["deleted"]["pointer_moves"] == 1
-    # Every one of the seven kinds is gone for the deleted env…
+    # Every one of the six kinds is gone for the deleted env…
     gone = _env_row_counts("doomed")
     assert all(c == 0 for c in gone.values()), gone
     assert "doomed" not in _env_ids(client)

@@ -15,15 +15,13 @@ import pytest
 from sqlalchemy import select, text
 
 from incant import models
-from incant.core import IncludeDepthExceeded, parse_condition, parse_rule, resolve
+from incant.core import IncludeDepthExceeded, parse_condition
 from incant.core.clauses import eval_condition
-from incant.core.model import EnvSnapshot
 from incant.db import session_scope
 from incant.service import ServingError, get_app
 from incant.targeting.observed import Observation, flush_observations, record_suppressions
 from incant.targeting.snapshot import build_snapshot
 
-from .conftest import snapshot, vinfo
 from .test_integration import _author_version, app  # noqa: F401 - fixture
 from .test_server import auth, make_client, make_key
 
@@ -62,45 +60,6 @@ def test_rename_env_repoints_observed_flags_instead_of_cascading_them_away(clien
         assert [(o.environment_id, o.flag, o.value) for o in rows] == [("scratch2", "plan", "pro")]
         sups = s.execute(select(models.ObservedFlagSuppression)).scalars().all()
         assert [(x.environment_id, x.flag) for x in sups] == [("scratch2", "uid")]
-
-
-# ── 2. a missing segment is a counted skip, never "everyone" ─────────
-
-def _rules_snapshot(rules, segments=None):
-    versions = {PID: {1: vinfo(1, live="c1"), 2: vinfo(2, live="c2")}}
-    return snapshot(versions=versions, defaults={PID: 1}, rules=[parse_rule(r) for r in rules],
-                    segments=segments or {})
-
-
-def test_rule_with_missing_segment_is_skipped_and_counted_even_under_not():
-    rule = {"id": "neg", "scope": "prompt", "prompt_id": PID, "priority": 1,
-            "when": {"not": {"segment": "gone"}}, "serve": {"version": 2}}
-    skips = []
-    res = resolve(_rules_snapshot([rule]), PID, {"user_id": "u_1"}, skips=skips)
-    assert res.version == 1 and res.match_scope == "default"      # NOT "match everyone"
-    assert [(s.rule_id, s.reason) for s in skips] == [("neg", "segment 'gone' does not exist")]
-    # Nested under all/any as well; a later healthy rule still gets its turn.
-    rules = [
-        {"id": "broken", "scope": "prompt", "prompt_id": PID, "priority": 1,
-         "when": {"all": [{"flag": "tier", "op": "eq", "value": "pro"},
-                          {"any": [{"segment": "gone"}]}]}, "serve": {"version": 2}},
-        {"id": "healthy", "scope": "prompt", "prompt_id": PID, "priority": 2,
-         "when": {"flag": "tier", "op": "eq", "value": "pro"}, "serve": {"version": 2}},
-    ]
-    skips = []
-    res = resolve(_rules_snapshot(rules), PID, {"tier": "pro"}, skips=skips)
-    assert res.rule_id == "healthy" and [s.rule_id for s in skips] == ["broken"]
-
-
-def test_segment_cycle_at_eval_is_a_counted_skip():
-    from incant.core.model import Segment
-    segs = {"a": Segment("a", parse_condition({"segment": "b"})),
-            "b": Segment("b", parse_condition({"segment": "a"}))}
-    rule = {"id": "cyc", "scope": "prompt", "prompt_id": PID, "priority": 1,
-            "when": {"segment": "a"}, "serve": {"version": 2}}
-    skips = []
-    res = resolve(_rules_snapshot([rule], segs), PID, {}, skips=skips)
-    assert res.match_scope == "default" and "cycle" in skips[0].reason
 
 
 # ── 3. include failures name the fragment and never 500 ─────────────
@@ -180,27 +139,6 @@ def test_bad_data_in_one_environment_keeps_the_others_refreshing(client):
     assert _render(client, {}).status_code == 200
 
 
-# ── 5. labels name exactly one version; resolution is deterministic ─
-
-def test_version_for_label_prefers_highest_active_and_ignores_archived():
-    snap = EnvSnapshot(environment="prod", rules_version=1, versions={PID: {
-        1: vinfo(1, live="c1", label="stable"),
-        2: vinfo(2, live="c2", label="stable"),
-        3: vinfo(3, live="c3", label="stable", status="archived"),
-    }})
-    assert snap.version_for_label(PID, "stable") == 2
-    assert snap.version_for_label(PID, "nope") is None
-
-
-def test_label_rule_skips_prompt_without_label_silently(client=None):
-    """Design: a global label rule simply does not apply to a prompt lacking the label —
-    that is a fall-through, not a skip, and must stay uncounted."""
-    rule = {"id": "lbl", "scope": "global", "priority": 1, "when": None, "serve": {"label": "voice-v2"}}
-    skips = []
-    res = resolve(_rules_snapshot([rule]), PID, {}, skips=skips)
-    assert res.match_scope == "default" and skips == []
-
-
 # ── 6. a deleted environment is evicted from every node's cache ──────
 
 def test_environment_deleted_elsewhere_is_evicted_on_refresh(client):
@@ -219,44 +157,6 @@ def test_environment_deleted_elsewhere_is_evicted_on_refresh(client):
         with pytest.raises(ServingError) as ei:
             appctx.get_snapshot(s, "gone")
     assert ei.value.status == 404
-
-
-# ── 7/8. write-time validation: global versions, segment refs, cycles ─
-
-def test_global_rule_explicit_version_must_exist_for_some_prompt(client):
-    body = {"id": "g99", "scope": "global", "priority": 1, "when": None, "serve": {"version": 99}}
-    r = client.post("/mgmt/envs/prod/rules", json=body, headers=auth())
-    assert r.status_code == 400 and "no prompt" in r.json()["detail"], r.text
-    body["serve"] = {"version": 2}
-    assert client.post("/mgmt/envs/prod/rules", json=body, headers=auth()).status_code == 200
-
-
-def test_dangling_segment_references_are_refused_at_write_time(client):
-    r = client.post("/mgmt/envs/prod/rules",
-                    json={"id": "dangling", "scope": "prompt", "prompt_id": PID, "priority": 1,
-                          "when": {"not": {"segment": "nope"}}, "serve": {"version": 2}},
-                    headers=auth())
-    assert r.status_code == 400 and "unknown segment" in r.json()["detail"], r.text
-    r = client.post("/mgmt/envs/prod/segments",
-                    json={"name": "outer", "when": {"all": [{"segment": "nope"}]}}, headers=auth())
-    assert r.status_code == 400 and "unknown segment" in r.json()["detail"], r.text
-    # Segment-in-segment is fine…
-    assert client.post("/mgmt/envs/prod/segments", json={"name": "inner", "when": {
-        "flag": "tier", "op": "eq", "value": "pro"}}, headers=auth()).status_code == 200
-    assert client.post("/mgmt/envs/prod/segments", json={"name": "outer", "when": {
-        "segment": "inner"}}, headers=auth()).status_code == 200
-    # …until it closes a cycle.
-    r = client.post("/mgmt/envs/prod/segments", json={"name": "inner", "when": {
-        "any": [{"flag": "tier", "op": "eq", "value": "pro"}, {"segment": "outer"}]}}, headers=auth())
-    assert r.status_code == 400 and "segment cycle" in r.json()["detail"], r.text
-    # Rule listing surfaces a reference that went stale another way (rollback-style).
-    with session_scope() as s:
-        s.execute(text("UPDATE rules SET clauses = '{\"segment\": \"vanished\"}' "
-                       "WHERE id = (SELECT id FROM rules WHERE environment_id='prod' LIMIT 1)"))
-        s.execute(text("UPDATE environments SET rules_version = rules_version + 1 WHERE id='prod'"))
-    get_app().invalidate("prod")
-    rules = client.get("/mgmt/envs/prod/rules", headers=auth()).json()["rules"]
-    assert any("'vanished' does not exist" in (r["unservable_reason"] or "") for r in rules)
 
 
 # ── 9. rollback reports what it could not restore ───────────────────
@@ -419,19 +319,19 @@ VALUE_OPS = ["eq", "neq", "in", "not_in", "contains", "starts_with", "ends_with"
 def test_missing_flag_never_matches_for_every_operator(op):
     body = {"flag": "f", "op": op}
     body["values" if op in ("in", "not_in") else "value"] = ["1.0.0"] if op in ("in", "not_in") else "1.0.0"
-    assert eval_condition(parse_condition(body), {}, {}) is False
-    assert eval_condition(parse_condition({"flag": "f", "op": "exists"}), {}, {}) is False
+    assert eval_condition(parse_condition(body), {}) is False
+    assert eval_condition(parse_condition({"flag": "f", "op": "exists"}), {}) is False
 
 
 def test_incomparable_and_odd_values_never_raise():
     c = parse_condition
-    assert eval_condition(c({"flag": "f", "op": "contains", "value": "x"}), {"f": 5}, {}) is False
-    assert eval_condition(c({"flag": "f", "op": "gt", "value": 1}), {"f": None}, {}) is False
-    assert eval_condition(c({"flag": "f", "op": "lt", "value": "a"}), {"f": 1}, {}) is False
-    assert eval_condition(c({"flag": "f", "op": "eq", "value": [1, 2]}), {"f": [1, 2]}, {}) is True
-    assert eval_condition(c({"flag": "f", "op": "semver_gt", "value": "1.2.0"}), {"f": "abc"}, {}) is False
-    assert eval_condition(c({"flag": "f", "op": "semver_gt", "value": "garbage"}), {"f": "1.3.0"}, {}) is False
-    assert eval_condition(c({"flag": "f", "op": "semver_lt", "value": "2.0.0"}), {"f": "1.2.3+build"}, {}) is True
+    assert eval_condition(c({"flag": "f", "op": "contains", "value": "x"}), {"f": 5}) is False
+    assert eval_condition(c({"flag": "f", "op": "gt", "value": 1}), {"f": None}) is False
+    assert eval_condition(c({"flag": "f", "op": "lt", "value": "a"}), {"f": 1}) is False
+    assert eval_condition(c({"flag": "f", "op": "eq", "value": [1, 2]}), {"f": [1, 2]}) is True
+    assert eval_condition(c({"flag": "f", "op": "semver_gt", "value": "1.2.0"}), {"f": "abc"}) is False
+    assert eval_condition(c({"flag": "f", "op": "semver_gt", "value": "garbage"}), {"f": "1.3.0"}) is False
+    assert eval_condition(c({"flag": "f", "op": "semver_lt", "value": "2.0.0"}), {"f": "1.2.3+build"}) is True
 
 
 # ── observed flags: unicode ──────────────────────────────────────────

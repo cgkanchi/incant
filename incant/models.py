@@ -63,7 +63,6 @@ class Version(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     prompt_id: Mapped[str] = mapped_column(ForeignKey("prompts.id"))
     number: Mapped[int] = mapped_column(Integer)
-    label: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, default="active")      # active | archived
     notes: Mapped[str] = mapped_column(Text, default="")
     created_by: Mapped[str] = mapped_column(String, default="")
@@ -226,35 +225,15 @@ class KillSwitch(Base):
     at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
-class Segment(Base):
-    __tablename__ = "segments"
-    __table_args__ = (
-        UniqueConstraint("environment_id", "name", name="uq_segment"),
-        CheckConstraint("version > 0", name="ck_segment_version"),
-    )
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    environment_id: Mapped[str] = mapped_column(ForeignKey("environments.id"), index=True)
-    name: Mapped[str] = mapped_column(String)
-    clauses: Mapped[Any] = mapped_column(JSON)                          # condition tree
-    version: Mapped[int] = mapped_column(Integer, default=1)
-
-
 class Rule(Base):
     __tablename__ = "rules"
     __table_args__ = (
-        CheckConstraint("scope IN ('global', 'prompt')", name="ck_rule_scope"),
         CheckConstraint("status IN ('active', 'paused', 'archived')", name="ck_rule_status"),
         CheckConstraint("priority BETWEEN 0 AND 1000000", name="ck_rule_priority"),
-        CheckConstraint(
-            "(scope = 'prompt' AND prompt_id IS NOT NULL) OR "
-            "(scope = 'global' AND prompt_id IS NULL)",
-            name="ck_rule_prompt_scope",
-        ),
     )
     id: Mapped[str] = mapped_column(String, primary_key=True)
     environment_id: Mapped[str] = mapped_column(ForeignKey("environments.id"), index=True)
-    scope: Mapped[str] = mapped_column(String)                          # global | prompt
-    prompt_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    prompt_id: Mapped[str] = mapped_column(String, index=True)
     priority: Mapped[int] = mapped_column(Integer, default=10)
     clauses: Mapped[Any] = mapped_column(JSON, nullable=True)           # when-condition
     serve: Mapped[Any] = mapped_column(JSON)
@@ -271,7 +250,7 @@ class RuleRevision(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     environment_id: Mapped[str] = mapped_column(String, index=True)
     rule_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
-    kind: Mapped[str] = mapped_column(String)                           # rule | segment | pointer | default | kill
+    kind: Mapped[str] = mapped_column(String)                           # rule | pointer | default | kill | version | baseline | rollback (+ legacy segment)
     rules_version: Mapped[int] = mapped_column(Integer, default=1, index=True)  # env rules_version after this change
     snapshot: Mapped[Any] = mapped_column(JSON)                         # the changed object (revision-list display)
     # COMPLETE environment targeting state after this change — materialized only on

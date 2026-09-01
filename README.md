@@ -10,7 +10,7 @@ See [DESIGN.md](./DESIGN.md) for the full design. This repository implements it.
 
 - **Git is the content store.** One canonical bare repo, Incant-owned, one file per
   version (`support/system/v2.j2`). Per-file history, immutable SHAs, diffs.
-- **Postgres is the control plane.** Targeting rules, segments, live pointers,
+- **Postgres is the control plane.** Targeting rules, live pointers,
   review state, RBAC, audit — SHAs only, never template text.
 - **Memory is the serving plane.** Compiled templates + rule snapshots; the render
   path is **memory-first** — the common case touches no git, no disk, no DB.
@@ -73,7 +73,7 @@ curl -s localhost:8080/prompt/support/system \
 ```
 
 Discovery for the same credential: `GET /prompts?environment=…` lists what the key can
-render (ids, descriptions, versions, defaults, labels — renderer-scoped), and
+render (ids, descriptions, versions, defaults — renderer-scoped), and
 `GET /prompt/{id}/spec` says what to pass — variables merged across the versions
 targeting can currently serve, plus the flags active rules consult.
 
@@ -106,7 +106,7 @@ incant/
 ├── gitstore/    # canonical bare repo (git plumbing), commit + validation pipeline,
 │                #   content-addressed ContentStore for the hot path
 ├── registry/    # version registry, drafts, review policy, refinements, test contexts
-├── targeting/   # rules, segments, append-only pointers, defaults, kills, snapshots
+├── targeting/   # rules, append-only pointers, defaults, kills, snapshots
 ├── server/      # FastAPI: serving API, mgmt API, browser sessions, RBAC, audit, metrics
 ├── ui/          # single-page UI ("Signal" direction), vanilla JS, served as static assets
 ├── service.py   # AppContext: wiring + snapshot cache + serve/evaluate hot path

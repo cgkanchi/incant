@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 from ..core.parse import parse_condition, parse_serve
 
@@ -81,7 +81,6 @@ class CreatePromptRequest(BaseModel):
 
 
 class VersionUpdateRequest(BaseModel):
-    label: Optional[str] = None
     notes: Optional[str] = None
     status: Optional[Literal["active", "archived"]] = None
 
@@ -160,8 +159,7 @@ class TestContextRequest(BaseModel):
 
 class RuleRequest(BaseModel):
     id: str = Field(min_length=1, max_length=255)
-    scope: Literal["global", "prompt"] = "prompt"
-    prompt_id: Optional[str] = None
+    prompt_id: str = Field(min_length=1)
     priority: int = Field(default=10, ge=0, le=1_000_000)
     when: Optional[dict[str, Any]] = None
     serve: dict[str, Any]
@@ -180,13 +178,6 @@ class RuleRequest(BaseModel):
         parse_serve(value)
         return value
 
-    @model_validator(mode="after")
-    def _valid_scope(self):
-        if self.scope == "prompt" and not (self.prompt_id or "").strip():
-            raise ValueError("prompt-scoped rules require prompt_id")
-        if self.scope == "global" and self.prompt_id is not None:
-            raise ValueError("global rules must not set prompt_id")
-        return self
 
 
 class RuleBatchRequest(BaseModel):
@@ -199,17 +190,6 @@ class RuleBatchRequest(BaseModel):
 
 class RuleStatusRequest(BaseModel):
     status: Literal["active", "paused", "archived"]
-
-
-class SegmentRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
-    when: Optional[dict[str, Any]] = None
-
-    @field_validator("when")
-    @classmethod
-    def _valid_when(cls, value):
-        parse_condition(value)
-        return value
 
 
 class RollbackRequest(BaseModel):

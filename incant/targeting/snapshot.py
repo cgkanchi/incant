@@ -12,9 +12,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..core import EnvSnapshot, VersionInfo
-from ..core.parse import parse_condition, parse_rule
+from ..core.parse import parse_rule
 from ..core.model import Rule as CoreRule
-from ..core.model import Segment as CoreSegment
 from .. import models
 
 # Newest-K per (prompt, version) kept in the ordering lists these helpers build. Only the
@@ -123,12 +122,13 @@ def snapshot_from_state(
     recoverable from targeting state alone. Exact content replay is what
     ``pin.versions`` is for; this replays *targeting*.
     """
+    # A revision recorded before 1.1.0 may carry segments, label/rollout targets or
+    # global rules. Those cannot be replayed faithfully by the flags-only evaluator —
+    # and a replay that quietly dropped them would be a lie — so refuse (the caller
+    # maps this to 422 with the pin.versions alternative).
+    if state.get("segments"):
+        raise ValueError("revision uses segments, removed in 1.1.0")
     rules = [parse_rule(r) for r in state.get("rules", [])]
-    segments = {
-        s["name"]: CoreSegment(name=s["name"], condition=parse_condition(s["clauses"]),
-                               version=s.get("version", 1))
-        for s in state.get("segments", [])
-    }
     versions: dict[str, dict[int, VersionInfo]] = defaultdict(dict)
     for key, vinfo in state.get("versions", {}).items():
         prompt_id, _, vpart = key.rpartition("@v")
@@ -137,7 +137,6 @@ def snapshot_from_state(
             version=number,
             live_sha=vinfo.get("live"),
             tip_sha=vinfo.get("tip"),
-            label=vinfo.get("label"),
             status=vinfo.get("status", "active"),
             previous_live=(),
         )
@@ -145,7 +144,6 @@ def snapshot_from_state(
         environment=env_id,
         rules_version=rules_version,
         rules=rules,
-        segments=segments,
         defaults=dict(state.get("defaults", {})),
         refinement_defaults={},   # supplied by the caller from the live snapshot
         versions={k: dict(v) for k, v in versions.items()},
@@ -185,7 +183,6 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
             version=v.number,
             live_sha=live_sha,
             tip_sha=tip_sha,
-            label=v.label,
             status=v.status,
             previous_live=tuple(previous),
         )
@@ -211,19 +208,10 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
         select(models.Rule).where(models.Rule.environment_id == env_id)
     ).scalars().all():
         rules.append(parse_rule({
-            "id": r.id, "scope": r.scope, "prompt_id": r.prompt_id,
+            "id": r.id, "prompt_id": r.prompt_id,
             "priority": r.priority, "when": r.clauses, "serve": r.serve,
             "status": r.status, "comment": r.comment,
         }))
-
-    # Segments
-    segments: dict[str, CoreSegment] = {}
-    for s in session.execute(
-        select(models.Segment).where(models.Segment.environment_id == env_id)
-    ).scalars().all():
-        segments[s.name] = CoreSegment(
-            name=s.name, condition=parse_condition(s.clauses), version=s.version
-        )
 
     # Kill switches
     killed = {
@@ -240,7 +228,6 @@ def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> Env
         environment=env_id,
         rules_version=env.rules_version,
         rules=rules,
-        segments=segments,
         defaults=defaults,
         refinement_defaults={k: dict(v) for k, v in refinement_defaults.items()},
         versions={k: dict(v) for k, v in versions.items()},

@@ -10,7 +10,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class RuleMatch:
-    scope: str          # "prompt" | "global"
+    scope: str          # "prompt"
     id: str
 
 
@@ -73,7 +73,6 @@ class Resolution:
     version: int
     commit: str
     matched_rule: RuleMatch | str
-    label: str | None = None
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
 
@@ -83,7 +82,6 @@ class PromptInfo:
     description: str
     versions: tuple[int, ...]
     default_version: int | None
-    labels: dict[int, str]
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
 

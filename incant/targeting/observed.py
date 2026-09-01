@@ -38,9 +38,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..core.model import (
-    All, Any_, Clause, Condition, EnvSnapshot, Not, Rule, SegmentRef, ServeRollout,
-)
+from ..core.model import All, Any_, Clause, Condition, EnvSnapshot, Not, Rule
 
 log = logging.getLogger("incant.observed")
 
@@ -88,7 +86,7 @@ def typed_value(value: str, value_type: str):
 
 # ── rule-derived flags (the zero-traffic baseline) ────────────────────
 
-def _collect(cond: Condition, segments: dict, out: dict[str, set]) -> None:
+def _collect(cond: Condition, out: dict[str, set]) -> None:
     if cond is None:
         return
     if isinstance(cond, Clause):
@@ -98,34 +96,21 @@ def _collect(cond: Condition, segments: dict, out: dict[str, set]) -> None:
                 vals.add(v)
     elif isinstance(cond, (All, Any_)):
         for c in cond.of:
-            _collect(c, segments, out)
+            _collect(c, out)
     elif isinstance(cond, Not):
-        _collect(cond.of, segments, out)
-    elif isinstance(cond, SegmentRef):
-        seg = segments.get(cond.name)
-        if seg is not None:
-            _collect(seg.condition, segments, out)
+        _collect(cond.of, out)
 
 
 def collect_rule_flags(snap: EnvSnapshot, rules: Iterable[Rule]) -> dict[str, set]:
-    """Flag names the given rules consult → the enumerable values their clauses name
-    (following segment references), plus any rollout bucketing flag (no values)."""
+    """Flag names the given rules consult → the enumerable values their clauses name."""
     flags: dict[str, set] = {}
     for r in rules:
-        _collect(r.when, snap.segments, flags)
-        if isinstance(r.serve, ServeRollout):
-            flags.setdefault(r.serve.bucket_by, set())
+        _collect(r.when, flags)
     return flags
 
 
 def all_rules(snap: EnvSnapshot) -> list[Rule]:
-    seen: set[int] = set()
-    out: list[Rule] = []
-    for r in snap.global_rules() + [r for pid in snap.all_prompt_ids() for r in snap.prompt_rules(pid)]:
-        if id(r) not in seen:
-            seen.add(id(r))
-            out.append(r)
-    return out
+    return [r for pid in snap.all_prompt_ids() for r in snap.prompt_rules(pid)]
 
 
 # ── request-path observer ─────────────────────────────────────────────

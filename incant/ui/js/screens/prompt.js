@@ -32,7 +32,6 @@ async function screenOverview() {
   for (const t of testing) {
     const title = t.tip ? "The latest unpublished draft is being tried by a group"
       : t.version != null ? `Version ${t.version} is being tested with a group`
-      : t.label ? `Label ${esc(t.label)} is being tested with a group`
       : "A change is being tested with a group";
     const desc = t.rule.comment ? esc(t.rule.comment) : describeWhen(t.rule.when);
     heroRows.push(`<div class="hero-row">
@@ -66,7 +65,6 @@ async function screenOverview() {
 
   // ── all versions ──
   const vrows = d.versions.map((v) => {
-    const chip = v.label ? pill("acc", esc(v.label)) : "";
     // A non-live version being served to a group reads as "Testing"; the live version
     // itself always reads "Live for everyone" (its draft-testing shows in the hero).
     const vTesting = testing.some((t) => t.version === v.version && v.version !== liveVersion);
@@ -81,7 +79,7 @@ async function screenOverview() {
     const meta = v.tip_author ? `Updated ${ago(v.tip_when)} · ${esc(v.tip_author)}` : "";
     return `<div class="prow">
       <span style="font-size:14px;font-weight:700;width:34px;flex:none">v${v.version}</span>
-      ${chip}${status}${edits}
+      ${status}${edits}
       <div class="grow"></div>
       <span class="prow-meta">${meta}</span>
       <a class="link sm" style="margin-left:10px;font-size:12px" href="#/p/${enc(pid)}/draft?v=${v.version}" data-act="go" data-hash="#/p/${enc(pid)}/draft?v=${v.version}">Open</a>

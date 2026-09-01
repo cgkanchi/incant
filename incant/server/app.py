@@ -474,7 +474,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title="Incant",
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
         description=(
             "Prompt management: git for content, flag-based targeting for who sees "

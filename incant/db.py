@@ -221,7 +221,8 @@ def _adoption_revision(inspector) -> str:
       * c4e8a17d5b23 — the ``rule_revisions.state`` column;
       * d7f3b92e6a41 — the ``users`` table;
       * e9a1c4f27b63 — immutable principal-id columns on drafts/reviews/comments;
-      * f2a7c9d41e58 — the ``observed_flags`` table.
+      * f2a7c9d41e58 — the ``observed_flags`` table;
+      * a9c4e17f2b60 — flags-only targeting (``segments`` table gone).
 
     We never return anything older than the baseline: a populated schema is assumed to
     contain at least ``da3e34b2b8fe``'s tables (that is what "has tables but no
@@ -238,7 +239,9 @@ def _adoption_revision(inspector) -> str:
     if "reviewer_principal_id" in {
         c["name"] for c in inspector.get_columns("reviews")
     }:
-        return "head" if "observed_flags" in tables else "e9a1c4f27b63"
+        if "observed_flags" not in tables:
+            return "e9a1c4f27b63"
+        return "head" if "segments" not in tables else "f2a7c9d41e58"
     if not _has_unique_columns(inspector, "reviews", ["draft_id", "reviewer"]):
         return "a3f1c8e29b41"
     if "state" not in {c["name"] for c in inspector.get_columns("rule_revisions")}:

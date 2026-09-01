@@ -60,7 +60,7 @@ def _pinned(ctx: _RenderCtx, prompt_id: str) -> Resolution | None:
     if p is None:
         return None
     version, commit = p
-    return Resolution(prompt_id, version, commit, "sha", "pin", None, None)
+    return Resolution(prompt_id, version, commit, "sha", "pin", None)
 
 
 _current: contextvars.ContextVar[_RenderCtx | None] = contextvars.ContextVar(
@@ -323,7 +323,7 @@ def render_source(
     import hashlib
 
     ctx = _RenderCtx(snapshot=snapshot, flags=flags, content=content)
-    root = Resolution(prompt_id, 0, "draft", "live", "default", None, None)
+    root = Resolution(prompt_id, 0, "draft", "live", "default", None)
     ctx.contributions[prompt_id] = root
     blob_sha = "draft:" + hashlib.sha256(source.encode()).hexdigest()[:16]
     return _render_compiled(ctx, prompt_id, blob_sha, source, variables, defaults, root)

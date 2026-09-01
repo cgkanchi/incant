@@ -56,7 +56,6 @@ def test_discovery_tools(mcp):
 
     rules = call(mcp, "list_rules", environment="prod")
     assert "beta-gets-v3" in {r["id"] for r in rules["rules"]}
-    assert any(s["name"] == "beta-us" for s in rules["segments"])
 
     envs = call(mcp, "list_environments")
     assert {e["id"]: e["protected"] for e in envs["environments"]}["prod"] is True

@@ -9,7 +9,6 @@ function describeWhen(c) {
   if (c.all) return c.all.map(describeWhen).join(' <span class="muted">and</span> ');
   if (c.any) return c.any.map(describeWhen).join(' <span class="muted">or</span> ');
   if (c.not) return '<span class="muted">not</span> ' + describeWhen(c.not);
-  if (c.segment) return 'in segment <b>' + esc(c.segment) + "</b>";
   if (c.flag) {
     const val = c.values ? c.values.join(", ") : c.value;
     if (c.op === "exists") return '<span class="codeinline">' + esc(c.flag) + " exists</span>";
@@ -19,32 +18,18 @@ function describeWhen(c) {
 }
 function describeServe(s) {
   if (!s) return "";
-  if (s.rollout) {
-    const parts = (s.rollout.weights || []).map((w) =>
-      (w.default ? "default" : (w.label || "v" + w.version)) + " " + w.weight + "%");
-    return "rollout by <b>" + esc(s.rollout.bucket_by) + "</b> → " + parts.join(" / ");
-  }
-  if (s.label) return "label <b>" + esc(s.label) + "</b> @ live";
   if (s.version != null) return "<b>v" + s.version + " @ " + (s.at || "live") + "</b>";
   return esc(JSON.stringify(s));
 }
 
-// Which active rules apply to a prompt: a prompt-scoped rule matching this id, or
-// any global rule (global rules apply to every prompt). Paused/archived excluded.
+// Which active rules apply to a prompt. Paused/archived excluded.
 function activeRulesFor(rules, pid) {
-  return (rules || []).filter((r) => r.status === "active" &&
-    (r.scope === "global" || r.prompt_id === pid));
+  return (rules || []).filter((r) => r.status === "active" && r.prompt_id === pid);
 }
-// What a rule's serve targets: {version?, label?, tip}. Rollouts report the first
-// non-default weighted arm. Returns null when nothing concrete is served.
+// What a rule's serve targets: {version, tip}. Null when nothing concrete is served.
 function serveTarget(serve) {
   if (!serve) return null;
-  if (serve.rollout) {
-    const w = (serve.rollout.weights || []).find((x) => !x.default && (x.version != null || x.label));
-    return w ? { version: w.version, label: w.label, tip: false } : null;
-  }
   if (serve.version != null) return { version: serve.version, tip: serve.at === "tip" };
-  if (serve.label) return { label: serve.label, tip: serve.at === "tip" };
   return null;
 }
 // Testing descriptors for a prompt: active rules serving a non-default version, or a
@@ -56,7 +41,7 @@ function testingFor(rules, pid, liveVersion) {
     if (!t) continue;
     const differs = t.version != null && t.version !== liveVersion;
     if (!t.tip && !differs) continue;   // serving the live version, not "testing"
-    out.push({ rule: r, version: t.version, label: t.label, tip: t.tip });
+    out.push({ rule: r, version: t.version, tip: t.tip });
   }
   return out;
 }
@@ -67,42 +52,29 @@ function ordinal(n) {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 // A rule's serve target in a short plain phrase — returns trusted HTML (numbers are
-// safe, labels are esc()'d). Used in the "rules that will be ignored" list.
+// safe). Used in the "rules that will be ignored" list.
 function serveTargetPlain(serve) {
   const t = serveTarget(serve);
   if (!t) return "the default";
   if (t.tip) return `latest draft of Version ${t.version}`;
-  if (t.version != null) return `Version ${t.version}`;
-  if (t.label) return `label ${esc(t.label)}`;
-  return "the default";
+  return `Version ${t.version}`;
 }
 // The prose body line under an ordinal rule row: "See Version N — who it's for".
-// Trusted HTML; describeWhen/serveTarget already esc() their values.
+// Trusted HTML; describeWhen already esc()s its values.
 function ruleServeLine(r) {
   const t = serveTarget(r.serve);
-  if (r.serve && r.serve.rollout) {
-    const w = (r.serve.rollout.weights || []).find((x) => !x.default && (x.version != null || x.label));
-    const bucket = esc(r.serve.rollout.bucket_by || "user");
-    if (w && w.version != null)
-      return `<b>${w.weight}% of users</b>, chosen by ${bucket}, see <b>Version ${w.version}</b>; the rest see the default`;
-    return `A share of users see a newer version; the rest see the default`;
-  }
   if (t && t.tip)
     return `See the <b>latest unpublished draft of Version ${t.version}</b> <span class="muted">— how you try changes before publishing them for everyone</span>`;
-  if (t && t.version != null)
+  if (t)
     return `See <b>Version ${t.version}</b> <span class="muted">— ${describeWhen(r.when)}</span>`;
-  if (t && t.label)
-    return `See <b>label ${esc(t.label)}</b> <span class="muted">— ${describeWhen(r.when)}</span>`;
   return `<span class="muted">${describeWhen(r.when)} → ${describeServe(r.serve)}</span>`;
 }
 
 // ── ad-hoc test context: structured form ─────────────────────────────
 // The flags targeting actually consults for this prompt (and its includes):
-// collected from active rules' clauses, the segments those clauses reference,
-// and rollout bucket_by keys — each with the candidate values rules compare against.
-function targetingFlags(rules, segments, pids) {
-  const segWhen = {};
-  (segments || []).forEach((s) => { segWhen[s.name] = s.when; });
+// collected from active rules' clauses, each with the candidate values rules compare
+// against.
+function targetingFlags(rules, pids) {
   const found = new Map();
   const add = (name, vals) => {
     if (!found.has(name)) found.set(name, new Set());
@@ -113,15 +85,12 @@ function targetingFlags(rules, segments, pids) {
     if (c.all) return c.all.forEach((x) => walk(x, depth + 1));
     if (c.any) return c.any.forEach((x) => walk(x, depth + 1));
     if (c.not) return walk(c.not, depth + 1);
-    if (c.segment) return walk(segWhen[c.segment], depth + 1);
     if (c.flag) add(c.flag, c.values || (c.value != null ? [c.value] : []));
   };
   for (const r of rules || []) {
     if (r.status !== "active") continue;
     if (r.prompt_id && !pids.includes(r.prompt_id)) continue;
     walk(r.when, 0);
-    const bucket = r.serve && r.serve.rollout && r.serve.rollout.bucket_by;
-    if (bucket) add(bucket, []);
   }
   return [...found.entries()].map(([name, vals]) => ({ name, values: [...vals] }));
 }
@@ -204,13 +173,11 @@ function ctxFormHtml(dp) {
 }
 
 // ══ targeting composer + reusable clause builder ═════════════════════════════
-// The clause builder drives three surfaces: the rule composer's "People who match…",
-// the segments editor, and the composer's inline "＋ new segment" mini-form. State is a
-// plain object {rows, advanced, advancedJson}; each row is
-//   {kind:"flag"|"segment", flag, op, value, segment, newSeg}. Rows AND together.
-// Shapes the row builder can't express (any / not / nested all) fall back to a raw-JSON
-// textarea (advanced=true). window._composer / window._segEdit hold open-surface state
-// (the window._dp idiom); the html builders are pure functions for round-trip testing.
+// The clause builder drives the rule composer's "People who match…". State is a plain
+// object {rows, advanced, advancedJson}; each row is {flag, op, value}. Rows AND
+// together. Shapes the row builder can't express (any / not / nested all) fall back to a
+// raw-JSON textarea (advanced=true). window._composer holds open-surface state (the
+// window._dp idiom); the html builders are pure functions for round-trip testing.
 
 const CLAUSE_OPS = [
   ["eq", "is"], ["neq", "is not"], ["in", "is one of"], ["not_in", "is not one of"],
@@ -219,7 +186,7 @@ const CLAUSE_OPS = [
   ["semver_gt", "semver >"], ["semver_lt", "semver <"], ["exists", "exists"],
 ];
 
-function isLeafClause(c) { return !!c && (c.segment !== undefined || c.flag !== undefined); }
+function isLeafClause(c) { return !!c && c.flag !== undefined; }
 // Coerce a typed value to a JSON scalar (number / bool / string) for the rule payload.
 function coerceVal(s) {
   const t = String(s == null ? "" : s).trim();
@@ -230,18 +197,12 @@ function coerceVal(s) {
   return t;
 }
 function clauseToRow(c) {
-  if (c.segment !== undefined)
-    return { kind: "segment", segment: c.segment, flag: "", op: "eq", value: "", newSeg: null };
   let value = "";
   if (c.values !== undefined) value = (c.values || []).join(", ");
   else if (c.value !== undefined) value = String(c.value);
-  return { kind: "flag", flag: c.flag || "", op: c.op || "eq", value, segment: "", newSeg: null };
+  return { flag: c.flag || "", op: c.op || "eq", value };
 }
 function rowToClause(row) {
-  if (row.kind === "segment") {
-    const name = row.segment === "__new" ? ((row.newSeg && row.newSeg.name) || "").trim() : row.segment;
-    return name ? { segment: name } : null;
-  }
   const flag = (row.flag || "").trim();
   if (!flag) return null;
   if (row.op === "exists") return { flag, op: "exists" };
@@ -263,7 +224,7 @@ function rowsToWhen(rows) {
   if (clauses.length === 1) return clauses[0];
   return { all: clauses };
 }
-function emptyFlagRow() { return { kind: "flag", flag: "", op: "eq", value: "", segment: "", newSeg: null }; }
+function emptyFlagRow() { return { flag: "", op: "eq", value: "" }; }
 function newCb(when) {
   const rows = whenToRows(when);
   if (rows == null) return { rows: [], advanced: true, advancedJson: JSON.stringify(when, null, 2) };
@@ -274,17 +235,8 @@ function opOptions(sel) {
   return CLAUSE_OPS.map(([v, label]) =>
     `<option value="${v}"${v === sel ? " selected" : ""}>${esc(label)}</option>`).join("");
 }
-function segOptions(sel, segments, allowNew) {
-  const opts = ['<option value="">— pick a segment —</option>'].concat(
-    (segments || []).map((s) => `<option value="${esc(s)}"${s === sel ? " selected" : ""}>${esc(s)}</option>`));
-  if (allowNew) opts.push(`<option value="__new"${sel === "__new" ? " selected" : ""}>＋ new segment…</option>`);
-  return opts.join("");
-}
-
-// cb: {rows, advanced, advancedJson}; prefix: DOM-id namespace; segCtx: {segments, allowNew}.
-function cbHtml(cb, prefix, segCtx) {
-  const segments = (segCtx && segCtx.segments) || [];
-  const allowNew = !(segCtx && segCtx.allowNew === false);
+// cb: {rows, advanced, advancedJson}; prefix: DOM-id namespace.
+function cbHtml(cb, prefix) {
   if (cb.advanced) {
     return `<div class="cb" id="${prefix}-wrap">
       <div class="cb-adv-note">Advanced condition — a shape the simple builder can't show (any-of / not / nesting). Edit the raw JSON.</div>
@@ -292,7 +244,7 @@ function cbHtml(cb, prefix, segCtx) {
       <div class="cb-foot"><button type="button" class="link btn-bare" data-act="cbSimple" data-prefix="${prefix}">↺ back to the simple builder</button></div>
     </div>`;
   }
-  const rows = cb.rows.map((row, i) => cbRowHtml(row, prefix, i, segments, allowNew)).join("");
+  const rows = cb.rows.map((row, i) => cbRowHtml(row, prefix, i)).join("");
   const empty = cb.rows.length === 0
     ? `<div class="cb-empty"><b>Everyone</b> matches — every request. Add a condition to narrow who this applies to.</div>` : "";
   return `<div class="cb" id="${prefix}-wrap">
@@ -303,67 +255,35 @@ function cbHtml(cb, prefix, segCtx) {
       <span class="grow"></span>
       <button type="button" class="link mut btn-bare" data-act="cbAdvanced" data-prefix="${prefix}">edit as JSON</button>
     </div>
-    <div class="cb-hint">Rows combine with <b>AND</b>. Need OR? build a segment and reference it here.</div>
+    <div class="cb-hint">Rows combine with <b>AND</b>. Need OR or NOT? edit as JSON (<span class="mono">any</span> / <span class="mono">not</span>).</div>
   </div>`;
 }
-function cbRowHtml(row, prefix, i, segments, allowNew) {
+function cbRowHtml(row, prefix, i) {
   const p = `${prefix}-r${i}`;
-  const kindSel = `<select class="cb-sel" id="${p}-kind" data-act="cbKind" data-prefix="${prefix}" data-ri="${i}">
-      <option value="flag"${row.kind === "flag" ? " selected" : ""}>flag</option>
-      <option value="segment"${row.kind === "segment" ? " selected" : ""}>in segment</option></select>`;
-  let controls, nested = "";
-  if (row.kind === "segment") {
-    controls = `<select class="cb-sel grow" id="${p}-seg" data-act="cbSeg" data-prefix="${prefix}" data-ri="${i}">${segOptions(row.segment, segments, allowNew)}</select>`;
-    if (row.segment === "__new") {
-      const ns = row.newSeg || { name: "", cb: newCb(null) };
-      nested = `<div class="cb-newseg">
-        <div class="field" style="margin:0 0 8px"><label>New segment name</label>
-          <input id="${p}-nsname" value="${esc(ns.name || "")}" placeholder="e.g. enterprise-us" spellcheck="false" style="font-family:'IBM Plex Mono',monospace"></div>
-        <div class="cb-newseg-label">who's in it — match all of:</div>
-        ${cbHtml(ns.cb || newCb(null), `${p}-ns`, { segments, allowNew: false })}</div>`;
-    }
-  } else {
-    const isExists = row.op === "exists";
-    const valPh = (row.op === "in" || row.op === "not_in") ? "comma,separated,values" : "value";
-    // data-sugg opts the inputs into the §7 typeahead (suggest.js): flag names known to
-    // the environment, then values traffic has sent for the flag named beside them.
-    controls = `<input class="cb-flag" id="${p}-flag" value="${esc(row.flag)}" placeholder="flag name" spellcheck="false" autocomplete="off" data-sugg="flag" aria-autocomplete="list">
+  const isExists = row.op === "exists";
+  const valPh = (row.op === "in" || row.op === "not_in") ? "comma,separated,values" : "value";
+  // data-sugg opts the inputs into the §7 typeahead (suggest.js): flag names known to
+  // the environment, then values traffic has sent for the flag named beside them.
+  const controls = `<input class="cb-flag" id="${p}-flag" value="${esc(row.flag)}" placeholder="flag name" spellcheck="false" autocomplete="off" data-sugg="flag" aria-autocomplete="list">
       <select class="cb-sel" id="${p}-op" data-act="cbOp" data-prefix="${prefix}" data-ri="${i}">${opOptions(row.op)}</select>
       ${isExists ? "" : `<input class="cb-val grow" id="${p}-val" value="${esc(row.value)}" placeholder="${valPh}" spellcheck="false" autocomplete="off" data-sugg="value" data-flag-input="${p}-flag" data-op-input="${p}-op" aria-autocomplete="list">`}`;
-  }
-  return `<div class="cb-row">${kindSel}${controls}
-    <button type="button" class="cb-del btn-bare" data-act="cbDel" data-prefix="${prefix}" data-ri="${i}" aria-label="Remove condition">✕</button></div>${nested}`;
+  return `<div class="cb-row">${controls}
+    <button type="button" class="cb-del btn-bare" data-act="cbDel" data-prefix="${prefix}" data-ri="${i}" aria-label="Remove condition">✕</button></div>`;
 }
-// Read the live DOM values of one builder back into its state (recurses into new-segments).
+// Read the live DOM values of one builder back into its state.
 function cbSync(cb, prefix) {
   if (cb.advanced) { const ta = el(`${prefix}-adv`); if (ta) cb.advancedJson = ta.value; return; }
   cb.rows.forEach((row, i) => {
     const p = `${prefix}-r${i}`;
-    const k = el(`${p}-kind`); if (k) row.kind = k.value;
-    if (row.kind === "flag") {
-      const f = el(`${p}-flag`); if (f) row.flag = f.value;
-      const o = el(`${p}-op`); if (o) row.op = o.value;
-      const v = el(`${p}-val`); if (v) row.value = v.value;
-    } else {
-      const s = el(`${p}-seg`); if (s) row.segment = s.value;
-      if (row.segment === "__new") {
-        if (!row.newSeg) row.newSeg = { name: "", cb: newCb(null) };
-        const n = el(`${p}-nsname`); if (n) row.newSeg.name = n.value;
-        cbSync(row.newSeg.cb, `${p}-ns`);
-      }
-    }
+    const f = el(`${p}-flag`); if (f) row.flag = f.value;
+    const o = el(`${p}-op`); if (o) row.op = o.value;
+    const v = el(`${p}-val`); if (v) row.value = v.value;
   });
 }
 // Resolve a builder prefix to its state object + the host surface that owns it.
 function cbResolve(prefix) {
   if (prefix === "co") return { cb: window._composer && window._composer.cb, host: "composer" };
-  if (prefix === "sg") return { cb: window._segEdit && window._segEdit.cb, host: "seg" };
-  const m = prefix.match(/^co-r(\d+)-ns$/);
-  if (m && window._composer) {
-    const row = window._composer.cb.rows[+m[1]];
-    if (row && row.newSeg) return { cb: row.newSeg.cb, host: "composer" };
-  }
   return { cb: null, host: null };
 }
-function cbHostSync(host) { if (host === "composer") composerSync(); else if (host === "seg") segEditSync(); }
-function cbHostRender(host) { if (host === "composer") renderComposer(); else if (host === "seg") renderSegEditor(); }
+function cbHostSync(host) { if (host === "composer") composerSync(); }
+function cbHostRender(host) { if (host === "composer") renderComposer(); }

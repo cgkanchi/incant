@@ -14,17 +14,16 @@ async function screenRules() {
     fetchEnvRules(env, pid),
     fetchEnvRevisions(env, pid, 25),
   ]);
-  // On a prompt's own targeting page, show ONLY the rules that govern THIS prompt:
-  // its prompt-scoped rules plus global rules (which apply to every prompt). Other
+  // On a prompt's own targeting page, show ONLY the rules that govern THIS prompt. Other
   // prompts' rules must not appear here — a "Stop test & publish" on a row belonging
   // to a different prompt would advance and mutate that unrelated prompt.
-  if (pid) d = { ...d, rules: d.rules.filter((r) => r.prompt_id === pid || r.scope === "global") };
+  if (pid) d = { ...d, rules: d.rules.filter((r) => r.prompt_id === pid) };
   _rulesData = d;   // stashed for the "turn targeting off" confirm modal
   // If the rule list itself couldn't be loaded (outage), the rows below would read as
   // "No rules yet" — warn instead so an empty screen isn't mistaken for empty targeting.
   const rulesWarn = rulesUnavailableNote(d.status);
   // Kill semantics are per-prompt; the header toggle governs the route prompt or,
-  // on the env-wide screen, the first prompt-scoped rule's prompt.
+  // on the env-wide screen, the first rule's prompt.
   const defaultPid = pid || (d.rules.find((r) => r.prompt_id)?.prompt_id) || null;
   const defV = defaultPid ? d.defaults[defaultPid] : null;
   const killEngaged = !!(defaultPid && d.kills[defaultPid]);
@@ -56,9 +55,7 @@ async function screenRules() {
     const statusToggle = r.status === "active"
       ? `<button type="button" class="link mut btn-bare" data-act="ruleStatus" data-id="${esc(r.id)}" data-status="archived">Archive</button>`
       : `<button type="button" class="link btn-bare" data-act="ruleStatus" data-id="${esc(r.id)}" data-status="active">Activate</button>`;
-    const scopeChip = r.scope === "global"
-      ? pill("acc", "all prompts")
-      : (r.prompt_id ? `<span class="mono faint" style="font-size:11.5px">${esc(r.prompt_id)}</span>` : "");
+    const scopeChip = r.prompt_id ? `<span class="mono faint" style="font-size:11.5px">${esc(r.prompt_id)}</span>` : "";
     const up = i > 0 ? `<button type="button" class="ord-move btn-bare" data-act="ruleMove" data-id="${esc(r.id)}" data-dir="up" title="move earlier" aria-label="Move rule earlier">↑</button>` : "";
     const down = i < sorted.length - 1 ? `<button type="button" class="ord-move btn-bare" data-act="ruleMove" data-id="${esc(r.id)}" data-dir="down" title="move later" aria-label="Move rule later">↓</button>` : "";
     const stopTest = (isTip && r.prompt_id && r.status === "active")
@@ -135,13 +132,11 @@ function openTargetingOffModal(pid) {
   const d = _rulesData; if (!d) return;
   const defV = d.defaults[pid];
   const defTxt = defV != null ? `Version ${defV} (live)` : "the environment default";
-  // The kill is PER-PROMPT: list only the rules that actually govern this prompt
-  // (its own + global ones, noting the latter are ignored for this prompt only) —
-  // not every rule in the environment, which overstates the blast radius.
-  const affected = d.rules.filter((r) =>
-    r.status === "active" && (r.prompt_id === pid || r.scope === "global"));
+  // The kill is PER-PROMPT: list only the rules that actually govern this prompt — not
+  // every rule in the environment, which overstates the blast radius.
+  const affected = d.rules.filter((r) => r.status === "active" && r.prompt_id === pid);
   const ignored = affected.map((r) =>
-    `<div style="font-size:12.5px;color:var(--mut)">· ${esc(r.comment || r.id)} <span class="faint">→ ${serveTargetPlain(r.serve)}${r.scope === "global" ? " · global — ignored for this prompt only" : ""}</span></div>`
+    `<div style="font-size:12.5px;color:var(--mut)">· ${esc(r.comment || r.id)} <span class="faint">→ ${serveTargetPlain(r.serve)}</span></div>`
   ).join("") || '<div class="faint" style="font-size:12.5px">No active rules govern this prompt.</div>';
   openModal(`
     <div style="display:flex;align-items:center;gap:10px">
@@ -165,9 +160,7 @@ function activeOrderedRules(rules, excludeId) {
     .slice().sort((a, b) => a.priority - b.priority);
 }
 function ruleUpsertBody(r, priority) {
-  const x = { id: r.id, scope: r.scope, priority, when: r.when, serve: r.serve, status: r.status, comment: r.comment };
-  if (r.scope === "prompt") x.prompt_id = r.prompt_id;
-  return x;
+  return { id: r.id, prompt_id: r.prompt_id, priority, when: r.when, serve: r.serve, status: r.status, comment: r.comment };
 }
 // Renumber active rules 10/20/30… with the new rule inserted at `slot`; returns the new
 // rule's priority + the neighbours whose priority must change (upsert plan).
@@ -207,7 +200,6 @@ function slugId(comment) {
     .replace(/^-+|-+$/g, "").slice(0, 40) || "rule";
   return `${base}-${Math.random().toString(36).slice(2, 6)}`;
 }
-function segmentPayload(name, when) { return { name: String(name || "").trim(), when: when == null ? null : when }; }
 
 // ── serve <-> composer state (pure, testable) ────────────────────────
 function defaultVersion(versions, pid, defaults) {
@@ -217,48 +209,15 @@ function defaultVersion(versions, pid, defaults) {
   return versions && versions[0] ? versions[0].version : null;
 }
 function serveToComposer(serve, versions, pid, defaults) {
-  const out = { serveMode: "version", version: null, at: "live",
-    rollout: { bucket_by: "user_id", weights: [], defaultWeight: 100 }, serveNote: "" };
-  if (serve && serve.rollout) {
-    out.serveMode = "rollout";
-    const ws = serve.rollout.weights || [];
-    out.rollout.bucket_by = serve.rollout.bucket_by || "user_id";
-    out.rollout.weights = ws.filter((w) => !w.default)
-      .map((w) => ({ version: w.version != null ? w.version : "", weight: w.weight, label: w.label || "" }));
-    const def = ws.find((w) => w.default);
-    out.rollout.defaultWeight = def ? def.weight
-      : Math.max(0, 100 - out.rollout.weights.reduce((a, w) => a + (Number(w.weight) || 0), 0));
-    out.version = defaultVersion(versions, pid, defaults);
-    return out;
-  }
+  const out = { version: null, at: "live" };
   if (serve && serve.version != null) {
     out.version = serve.version; out.at = serve.at === "tip" ? "tip" : "live"; return out;
-  }
-  if (serve && serve.label) {
-    out.serveNote = `This rule serves label “${serve.label}”. Saving replaces it with the version-based serve below.`;
-    out.version = defaultVersion(versions, pid, defaults); return out;
   }
   out.version = defaultVersion(versions, pid, defaults);
   return out;
 }
 // Build the serve payload from composer state; throws a human string on validation error.
 function composerServe(co) {
-  if (co.serveMode === "rollout") {
-    const weights = [];
-    for (const w of co.rollout.weights) {
-      if (w.version === "" || w.version == null) throw "Pick a version for every rollout arm.";
-      const wt = Number(w.weight);
-      if (!(wt >= 0)) throw "Every rollout weight must be a number ≥ 0.";
-      const arm = { version: Number(w.version), weight: wt };
-      if (w.label) arm.label = w.label;
-      weights.push(arm);
-    }
-    if (!weights.length) throw "Add at least one version to the rollout.";
-    weights.push({ default: true, weight: Number(co.rollout.defaultWeight) || 0 });
-    const sum = weights.reduce((a, w) => a + w.weight, 0);
-    if (sum !== 100) throw `Weights must add up to 100 (currently ${sum}).`;
-    return { rollout: { bucket_by: (co.rollout.bucket_by || "").trim() || "user_id", weights } };
-  }
   if (co.version == null || co.version === "") throw "Pick a version to serve.";
   return co.at === "tip" ? { version: Number(co.version), at: "tip" } : { version: Number(co.version) };
 }
@@ -271,7 +230,7 @@ function composerVersionHtml(co) {
     if (v.status === "archived") tag = "archived";
     else if (v.version === liveVer) tag = "live for everyone";
     else if (v.live_sha) tag = "live";
-    return `Version ${v.version}${v.label ? " · " + v.label : ""} — ${tag}`;
+    return `Version ${v.version} — ${tag}`;
   };
   const picker = (co.versions && co.versions.length)
     ? `<select class="cb-sel" id="co-version" data-act="cbVersion" style="min-width:280px">${
@@ -283,34 +242,7 @@ function composerVersionHtml(co) {
       ? "Serves the newest edits on this version — how you try changes before publishing them for everyone."
       : "Serves what's live now for this version."}</div></div>`;
 }
-function composerRolloutHtml(co) {
-  const rows = co.rollout.weights.map((w, i) => {
-    const vsel = (co.versions && co.versions.length)
-      ? `<select class="cb-sel" id="co-rv${i}" data-act="cbRoWeight"><option value="">— version —</option>${
-          co.versions.map((v) => `<option value="${v.version}"${String(w.version) === String(v.version) ? " selected" : ""}>v${v.version}${v.label ? " · " + esc(v.label) : ""}</option>`).join("")}</select>`
-      : `<input class="cb-flag" id="co-rv${i}" value="${esc(w.version)}" placeholder="version" style="width:100px" data-act="cbRoWeight">`;
-    return `<div class="ro-row">${vsel}
-      <input class="cb-val" id="co-rw${i}" value="${esc(w.weight)}" style="width:80px" aria-label="Weight %" data-act="rolloutWeightInput" inputmode="numeric"><span class="faint" style="font-size:12px">%</span>
-      <button type="button" class="cb-del btn-bare" data-act="cbRoDel" data-ri="${i}" aria-label="Remove rollout arm">✕</button></div>`;
-  }).join("");
-  const sum = co.rollout.weights.reduce((a, w) => a + (Number(w.weight) || 0), 0) + (Number(co.rollout.defaultWeight) || 0);
-  return `<div class="cmp-serve">${rows}
-    <div class="ro-row"><span class="muted" style="font-size:12.5px;min-width:130px">everyone else (default)</span>
-      <input class="cb-val" id="co-rdef" value="${esc(co.rollout.defaultWeight)}" style="width:80px" data-act="rolloutWeightInput" inputmode="numeric"><span class="faint" style="font-size:12px">%</span></div>
-    <div class="ro-foot"><button type="button" class="link btn-bare" data-act="cbRoAdd">＋ add a version</button><span class="grow"></span>
-      <span class="ro-sum ${sum === 100 ? "ok" : "bad"}" id="rolloutSum">sum: ${sum}%</span></div>
-    <div class="field" style="margin-top:12px;margin-bottom:0"><label>Bucket by (flag)</label>
-      <input id="co-bucket" value="${esc(co.rollout.bucket_by)}" placeholder="user_id" spellcheck="false" autocomplete="off" data-sugg="flag" aria-autocomplete="list" style="max-width:220px;font-family:'IBM Plex Mono',monospace"></div>
-    <div class="cb-hint">Each request is bucketed by this flag; a given user stays in the same arm as you ramp the weights.</div></div>`;
-}
-function composerServeHtml(co) {
-  const body = co.serveMode === "rollout" ? composerRolloutHtml(co) : composerVersionHtml(co);
-  const note = co.serveNote ? `<div class="cb-hint" style="color:var(--warn)">${esc(co.serveNote)}</div>` : "";
-  return `<div class="cmp-modes">
-      <button type="button" class="cmp-mode btn-bare ${co.serveMode === "version" ? "active" : ""}" aria-pressed="${co.serveMode === "version"}" data-act="cbServeMode" data-mode="version">A version</button>
-      <button type="button" class="cmp-mode btn-bare ${co.serveMode === "rollout" ? "active" : ""}" aria-pressed="${co.serveMode === "rollout"}" data-act="cbServeMode" data-mode="rollout">A percentage rollout</button>
-    </div>${body}${note}`;
-}
+function composerServeHtml(co) { return composerVersionHtml(co); }
 function slotOptions(co) {
   const active = activeOrderedRules(co.rules, co.editing ? co.origId : null);
   const nameOf = (r) => r.comment || r.id;
@@ -327,8 +259,7 @@ function slotOptions(co) {
 function composerShadowHtml(co) {
   const active = activeOrderedRules(co.rules, co.editing ? co.origId : null);
   const before = active.slice(0, Math.min(co.slot, active.length));
-  const applies = (r) => co.scope === "global" ? true : (r.scope === "global" || r.prompt_id === co.prompt_id);
-  const shadowers = before.filter(applies);
+  const shadowers = before.filter((r) => r.prompt_id === co.prompt_id);
   if (!shadowers.length)
     return `<div class="shadowbox ok">Nothing is checked before this rule — it gets first say for its audience.</div>`;
   const anyEveryone = shadowers.some((r) => r.when == null);
@@ -345,13 +276,11 @@ function composerShadowHtml(co) {
     ${rows}<div class="shadow-foot">If one of these matches a request first, your rule never fires for that request.</div></div>`;
 }
 function composerBodyHtml(co) {
-  const scopePill = co.scope === "global" ? pill("acc", "all prompts")
-    : (co.prompt_id ? `<span class="mono faint" style="font-size:11px">${esc(co.prompt_id)}</span>` : "");
   const idLine = co.editing ? `<span class="mono faint" style="font-size:11px">id ${esc(co.origId)} · can't change</span>` : "";
   return `
     <h3>${co.editing ? "Edit rule" : "New rule"}</h3>
     ${co.err ? `<div class="banner danger" style="margin:6px 0 14px"><span style="font-size:12.5px;font-weight:600">${esc(co.err)}</span></div>` : ""}
-    <div class="cmp-sec"><div class="cmp-h">People who match…</div>${cbHtml(co.cb, "co", { segments: co.segments, allowNew: true })}</div>
+    <div class="cmp-sec"><div class="cmp-h">People who match…</div>${cbHtml(co.cb, "co")}</div>
     <div class="cmp-sec"><div class="cmp-h">…should see</div>${composerServeHtml(co)}</div>
     <div class="cmp-sec"><div class="cmp-h">Position</div>
       <div class="cmp-pos"><span class="muted" style="font-size:12.5px">Checked</span>
@@ -360,7 +289,7 @@ function composerBodyHtml(co) {
     <div class="cmp-sec">
       <div class="field" style="margin-bottom:8px"><label>What is this for?</label>
         <input id="co-comment" value="${esc(co.comment)}" placeholder="e.g. Beta on enterprise" spellcheck="false" style="font-family:'Instrument Sans',sans-serif"></div>
-      <label class="cmp-check"><input type="checkbox" id="co-global" data-act="cbScope"${co.scope === "global" ? " checked" : ""}> applies to <b>all prompts</b> ${scopePill}</label>
+      <div class="faint" style="font-size:11.5px">applies to <span class="mono">${esc(co.prompt_id || "")}</span> in <b>${esc(State.env)}</b></div>
       <div style="margin-top:6px">${idLine}</div></div>
     <div class="modal-actions">
       <button class="btn" data-act="closeModal">Cancel</button>
@@ -371,32 +300,21 @@ function renderComposer() { const b = el("composerBody"); if (b && window._compo
 function composerSync() {
   const co = window._composer; if (!co) return;
   const c = el("co-comment"); if (c) co.comment = c.value;
-  const g = el("co-global"); if (g) co.scope = g.checked ? "global" : "prompt";
   const slot = el("co-slot"); if (slot) co.slot = parseInt(slot.value);
   cbSync(co.cb, "co");
-  if (co.serveMode === "version") {
-    const v = el("co-version"); if (v) co.version = v.value === "" ? null : (co.versions.length ? Number(v.value) : v.value);
-    const t = el("co-tip"); if (t) co.at = t.checked ? "tip" : "live";
-  } else {
-    co.rollout.weights.forEach((w, i) => {
-      const rv = el(`co-rv${i}`); if (rv) w.version = rv.value;
-      const rw = el(`co-rw${i}`); if (rw) w.weight = rw.value;
-    });
-    const rdef = el("co-rdef"); if (rdef) co.rollout.defaultWeight = rdef.value;
-    const b = el("co-bucket"); if (b) co.rollout.bucket_by = b.value;
-  }
+  const v = el("co-version"); if (v) co.version = v.value === "" ? null : (co.versions.length ? Number(v.value) : v.value);
+  const t = el("co-tip"); if (t) co.at = t.checked ? "tip" : "live";
 }
-function buildComposerState({ rule, duplicate, targetPid, scope, rulesData, segments, versions }) {
+function buildComposerState({ rule, duplicate, targetPid, rulesData, versions }) {
   const co = {
     editing: !!rule && !duplicate,
     origId: rule && !duplicate ? rule.id : null,
     routePid: targetPid || null,
-    scope: scope === "global" ? "global" : "prompt",
-    prompt_id: scope === "global" ? null : (targetPid || null),
+    prompt_id: targetPid || null,
     status: rule ? rule.status : "active",
     comment: rule ? (rule.comment || "") : "",
     cb: newCb(rule ? rule.when : null),
-    segments: segments || [], versions: versions || [],
+    versions: versions || [],
     rules: rulesData.rules || [], defaults: rulesData.defaults || {}, protected: !!rulesData.protected,
     err: "",
   };
@@ -411,40 +329,18 @@ async function openComposer({ rule, duplicate, pid }) {
   const env = State.env;
   const targetPid = (rule && rule.prompt_id) || pid || State.route.pid || null;
   openModal(`<div id="composerBody"><div class="empty">Loading…</div></div>`, "wide");
-  let rulesData, segsData, versions = [];
+  let rulesData, versions = [];
   try {
     // Reuse the screen's stashed rules if present; otherwise fetch, retrying scoped to the
     // target prompt's project on a 403 (a project-scoped operator composing their own rule).
     rulesData = _rulesData || await fetchEnvRules(env, targetPid);
-    segsData = await GET(`/mgmt/envs/${enc(env)}/segments`);
   } catch (e) { const b = el("composerBody"); if (b) b.innerHTML = `<div class="empty">⚠ ${esc(errText(e))}</div>`; return; }
-  const scope = rule ? rule.scope : (targetPid ? "prompt" : "global");
-  if (targetPid) {
-    try { const dv = await GET(`/mgmt/prompts/${enc(targetPid)}/versions?environment=${enc(env)}`); versions = dv.versions; }
-    catch (_) { /* fall back to a free version-number input */ }
-  }
-  window._composer = buildComposerState({
-    rule, duplicate, targetPid, scope, rulesData,
-    segments: (segsData.segments || []).map((s) => s.name), versions,
-  });
+  if (!targetPid) { const b = el("composerBody"); if (b) b.innerHTML = `<div class="empty">Open a prompt's rules to add one — every rule targets one prompt.</div>`; return; }
+  try { const dv = await GET(`/mgmt/prompts/${enc(targetPid)}/versions?environment=${enc(env)}`); versions = dv.versions; }
+  catch (_) { /* fall back to a free version-number input */ }
+  window._composer = buildComposerState({ rule, duplicate, targetPid, rulesData, versions });
   renderComposer();
 }
-// Create any inline "＋ new segment" rows before saving the rule; rewrites the row to
-// reference the created segment by name.
-async function composerCreateNewSegments(co) {
-  for (const row of co.cb.rows) {
-    if (row.kind === "segment" && row.segment === "__new" && row.newSeg) {
-      const name = (row.newSeg.name || "").trim();
-      if (!name) throw "Name the new segment (or pick an existing one).";
-      const segWhen = row.newSeg.cb.advanced
-        ? (row.newSeg.cb.advancedJson.trim() ? JSON.parse(row.newSeg.cb.advancedJson) : null)
-        : rowsToWhen(row.newSeg.cb.rows);
-      await POST(`/mgmt/envs/${enc(State.env)}/segments`, segmentPayload(name, segWhen));
-      row.segment = name;
-    }
-  }
-}
-
 // ── audience tester ──────────────────────────────────────────────────
 function audienceResult(r, pid) {
   const matched = typeof r.matched_rule === "string" ? r.matched_rule : `${r.matched_rule.scope}:${r.matched_rule.id}`;

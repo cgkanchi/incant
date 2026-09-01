@@ -131,6 +131,17 @@ def test_everything_present_returns_head():
     assert _adoption_revision(insp) == "head"
 
 
+def test_observed_flags_present_but_segments_still_there_adopts_at_f2a7():
+    """observed_flags exists but the segments table does too → a9c4e17f2b60 hasn't run;
+    adopt at f2a7c9d41e58 so the flags-only migration applies."""
+    ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
+    insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users", "observed_flags", "segments"],
+                         unique_constraints=ucs,
+                         columns={"rule_revisions": [{"name": "state"}],
+                                  "reviews": [{"name": "reviewer_principal_id"}]})
+    assert _adoption_revision(insp) == "f2a7c9d41e58"
+
+
 def test_principal_identity_present_but_observed_flags_missing_adopts_at_e9a1():
     """Principal-id columns present but no ``observed_flags`` table → f2a7c9d41e58
     hasn't run; adopt at e9a1c4f27b63 so the observed-flags migration applies."""
@@ -249,9 +260,12 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         insp = inspect(db.engine())
         with db.engine().connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "f2a7c9d41e58"
+        assert version == "a9c4e17f2b60"
         assert "observed_flags" in insp.get_table_names()
         assert "observed_flag_suppressions" in insp.get_table_names()
+        assert "segments" not in insp.get_table_names()                      # 1.1.0: flags only
+        assert "label" not in {c["name"] for c in insp.get_columns("versions")}
+        assert "scope" not in {c["name"] for c in insp.get_columns("rules")}
         assert {ix["name"] for ix in insp.get_indexes("observed_flags")} >= {
             "ix_observed_flags_value_trgm", "ix_observed_flags_last_seen"}
         assert _has_unique_columns(insp, "api_keys", ["prefix"])

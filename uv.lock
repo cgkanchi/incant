@@ -438,7 +438,7 @@ wheels = [
 
 [[package]]
 name = "incant"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -493,7 +493,7 @@ dev = [
 
 [[package]]
 name = "incant-mcp"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "mcp/python" }
 dependencies = [
     { name = "incant-sdk" },
@@ -508,7 +508,7 @@ requires-dist = [
 
 [[package]]
 name = "incant-sdk"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "sdk/python" }
 dependencies = [
     { name = "httpx" },

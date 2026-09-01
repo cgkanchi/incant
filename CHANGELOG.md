@@ -1,18 +1,27 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-08-31
 
+**Breaking — targeting is flags-only.** Segments, version labels, percentage
+rollouts and global-scope rules are removed. A rule is a flag condition on ONE prompt
+that serves ONE of that prompt's versions (`{version, at: live|tip|sha}`). Who is in a
+cohort — a beta list, a percentage — is decided by the caller's feature-flag system
+and arrives as a flag; Incant does not bucket users itself. This is the v1 surface; a
+unified, cleaner audience/content abstraction is planned for v1.5/v2.
+
+- Removed: `segments` (table, `/mgmt/envs/{env}/segments`, `{segment: name}`
+  conditions), `versions.label` (and `label` in the versions/render/evaluate/`/prompts`
+  responses and SDK models), `{label}` / `{rollout}` serve targets, `scope: global`
+  (the `scope` field is gone; `prompt_id` is required). The MCP server loses
+  `upsert_segment` (22 tools). Rule payloads that still carry `scope: "prompt"` are
+  accepted. Migration `a9c4e17f2b60` REFUSES to run while any rule uses a removed
+  construct — restate or archive those rules first.
+- Replays (`pin.rules_version`) and rollbacks of revisions recorded before 1.1.0 that
+  used removed constructs are refused honestly (422 / 400) rather than approximated.
 - **Archived versions stop serving** (DESIGN.md §5). A rule targeting an archived
-  version is skipped and counted; labels ignore archived versions; archiving an
-  environment's default is refused (409); unarchive to serve again. Label and status
-  changes now propagate to replicas (a `version` revision per environment).
-- **Labels are unique per prompt** (409 on a duplicate) and label resolution is
-  deterministic (highest active version).
-- **Broken conditions are counted skips, never matches**: a rule referencing a segment
-  the environment lacks (or a segment cycle) is skipped and reported — previously it
-  evaluated as false, so `not: {segment: gone}` matched everyone. Dangling segment
-  references and segment cycles are refused at write time; global rules serving an
-  explicit version must name one some prompt actively has.
+  version is skipped and counted; archiving an environment's default is refused (409);
+  unarchive to serve again. Status changes propagate to replicas (a `version` revision
+  per environment).
 - **Include failures are honest**: an include that cannot resolve reports the fragment
   ("included by …"), and a targeting-induced include cycle or depth overflow is a 409,
   not a 500.
@@ -20,14 +29,15 @@
   environment no longer aborts the poll for every other environment
   (`incant_snapshot_build_failures_total{environment}`); environments deleted on
   another node are evicted from the serving cache on the next poll.
-- **Rollback reports `defaults_skipped`** (a recorded default naming an archived
-  version is not restored) alongside `pointers_skipped`.
 - **The kill switch beats replay**: a pin naming a killed prompt — or a
   `rules_version` replay of one — returns 409 with `error: "killed"` instead of
-  serving the killed content (reproducibility already yields to validation; now to
-  the emergency lever too). Unpinned requests still degrade to the default.
+  serving the killed content. Unpinned requests still degrade to the default.
+- **Rollback reports `defaults_skipped`** (a recorded default naming an archived
+  version is not restored) alongside `pointers_skipped`.
 - Fixes: renaming an environment no longer deletes its observed flags and
-  suppressions; `GET /prompt/{id}/spec` no longer collapses `1` and `true` into one value.
+  suppressions; `GET /prompt/{id}/spec` no longer collapses `1` and `true` into one
+  value; `upsert_rule` validates before touching the session; semver comparison drops
+  `+build` metadata.
 
 ## 1.0.0 — 2026-08-31
 

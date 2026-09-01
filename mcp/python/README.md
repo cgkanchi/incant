@@ -44,7 +44,7 @@ skills instruct agents to relay that confirmation to a human first.
   `commit_draft`, `review_draft`, `set_prompt_metadata`
 - **Release & target**: `publish_prompt` (pointer + optional default promotion +
   rule archive, atomic), `rollback_pointer`, `upsert_rule`, `set_rule_status`,
-  `upsert_segment`, `set_default`, `kill_switch`, `rollback_targeting`
+  `set_default`, `kill_switch`, `rollback_targeting`
 
 ## Skills
 
