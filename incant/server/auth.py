@@ -81,21 +81,46 @@ class _AnyEnvironment:
 ANY_ENVIRONMENT = _AnyEnvironment()
 
 
+class _AnyProject:
+    """Sentinel for the ``project=`` argument of :meth:`Identity.has` /
+    :meth:`Identity.require`: match a binding *regardless* of the project it is scoped
+    to — the project-dimension twin of :data:`ANY_ENVIRONMENT`. With one project per
+    deployment, "viewer of some project" IS "viewer of this deployment", and the
+    sentinel says so without a DB lookup for the project's name.
+
+    Use it ONLY for viewer-level reads of instance-wide facts that every project's
+    viewer legitimately sees — today the environment list behind the UI's env switcher
+    (``GET /mgmt/envs``). It still refuses a renderer-only key: no binding of that key
+    implies ``viewer``, so the role check fails before scope is even considered. Never
+    for writes, and never for anything that would be project-divisible.
+    """
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # keeps require()'s "*/..." error message readable
+        return "*"
+
+
+ANY_PROJECT = _AnyProject()
+
+
 @dataclass
 class Identity:
     principal_id: str
     name: str
     bindings: list  # of Binding (cache) or models.RoleBinding — both duck-type here
 
-    def has(self, role: str, *, project: str | None = None,
+    def has(self, role: str, *, project: "str | _AnyProject | None" = None,
             environment: "str | _AnyEnvironment | None" = None) -> bool:
         for b in self.bindings:
             if role not in _IMPLIES.get(b.role, set()):
                 continue
             # A project-scoped binding satisfies only checks for *that* project;
             # in particular it must NOT satisfy an instance-wide (project=None)
-            # check — otherwise a project operator gains instance-wide power.
-            if b.project_id is not None and b.project_id != project:
+            # check — otherwise a project operator gains instance-wide power. The
+            # ANY_PROJECT sentinel is the one deliberate waiver (see its docstring).
+            if (b.project_id is not None
+                    and project is not ANY_PROJECT
+                    and b.project_id != project):
                 continue
             # An environment-scoped binding normally satisfies only checks for THAT env.
             # The one exception is the ANY_ENVIRONMENT sentinel: the caller is reading
@@ -110,7 +135,7 @@ class Identity:
             return True
         return False
 
-    def require(self, role: str, *, project: str | None = None,
+    def require(self, role: str, *, project: "str | _AnyProject | None" = None,
                 environment: "str | _AnyEnvironment | None" = None) -> None:
         if not self.has(role, project=project, environment=environment):
             raise AuthError(403, f"requires {role} on "
@@ -158,6 +183,14 @@ def needs_upgrade(stored: str, pepper: str | None = None) -> bool:
     """True iff a verified key is stored legacy but a pepper is now configured, so it
     should be opportunistically re-hashed to `v2$` in place."""
     return bool(_current_pepper(pepper)) and not stored.startswith(_V2_PREFIX)
+
+
+def _writes_allowed() -> bool:
+    """Only the full node writes. A serve replica runs against a read-only DB role
+    (§15), so it must not even *attempt* the opportunistic hash upgrade — the write
+    would fail, be swallowed, and re-fire on every request carrying that key."""
+    from ..config import get_settings
+    return get_settings().mode == "full"
 
 
 # Stored lookup prefix. Historically 16 chars (with the 10-char `incant_sk_` literal
@@ -289,6 +322,11 @@ class _KeyEntry:
     principal_id: str
     principal_name: str
     bindings: tuple[Binding, ...]
+    # Set when the opportunistic `v2$` re-hash of this (legacy) key failed — see
+    # _upgrade_hash. Suppresses the retry until the next full reload rebuilds the entry
+    # from the DB, so a transient DB error costs one failed write per key per reload,
+    # not one per request.
+    upgrade_failed: bool = False
 
 
 def _expired(expires_at, now: dt.datetime) -> bool:
@@ -493,6 +531,17 @@ class AuthCache:
                 # Confirmed absent: remember both probe lengths so the repeat costs nothing.
                 self._negcache_add(probes)
 
+    def _replace_entry(self, entry: _KeyEntry, **changes) -> None:
+        """Swap ``entry`` in its bucket for a copy with ``changes`` applied. A no-op if
+        a reload has already replaced the bucket — the fresh entry is the DB's truth."""
+        with self._lock:
+            bucket = self._entries.get(entry.prefix)
+            if bucket:
+                for i, cur in enumerate(bucket):
+                    if cur.hash == entry.hash and cur.principal_id == entry.principal_id:
+                        bucket[i] = replace(cur, **changes)
+                        break
+
     def _upgrade_hash(self, entry: _KeyEntry, raw: str) -> None:
         """Opportunistically re-hash a legacy key to `v2$` once a pepper is configured.
 
@@ -502,6 +551,12 @@ class AuthCache:
         session for just this UPDATE. The write is a one-shot per key — the row (and
         the in-memory entry) become `v2$`, so it never fires again for that key — so
         this is not a per-request write, and it is skipped entirely with no pepper set.
+
+        Two guards keep "one-shot" honest (see :meth:`identify`): only the full node
+        runs it at all (a serve replica's DB role is read-only, §15), and a failure is
+        remembered on the cached entry (``upgrade_failed``) so a DB that is down costs
+        one failed write per key per cache reload, never one per request. The next full
+        ``_load`` rebuilds entries from the DB and the upgrade is attempted again.
         """
         new_hash = hash_key(raw)
         try:
@@ -517,14 +572,9 @@ class AuthCache:
                     return
                 row.hash = new_hash
         except SQLAlchemyError:
-            return  # best-effort; a failed upgrade just retries next auth
-        with self._lock:
-            bucket = self._entries.get(entry.prefix)
-            if bucket:
-                for i, cur in enumerate(bucket):
-                    if cur.hash == entry.hash and cur.principal_id == entry.principal_id:
-                        bucket[i] = replace(cur, hash=new_hash)
-                        break
+            self._replace_entry(entry, upgrade_failed=True)
+            return
+        self._replace_entry(entry, hash=new_hash)
 
     def identify(self, session: Session, authorization: str | None) -> Identity:
         if not authorization or not authorization.lower().startswith("bearer "):
@@ -540,7 +590,7 @@ class AuthCache:
                 continue
             if _expired(entry.expires_at, now):
                 raise AuthError(401, "credential expired")
-            if needs_upgrade(entry.hash):
+            if needs_upgrade(entry.hash) and not entry.upgrade_failed and _writes_allowed():
                 self._upgrade_hash(entry, raw)
             # No last_used_at write here — the serving path must not write (§8, §15).
             return Identity(entry.principal_id, entry.principal_name, list(entry.bindings))

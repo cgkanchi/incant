@@ -3,12 +3,19 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import func, select
 
 from incant import models
 from incant.db import session_scope
 
-from .test_server import ADMIN, auth, client, make_key  # noqa: F401 (client is a fixture)
+from .test_server import ADMIN, auth, make_client, make_key
+
+
+@pytest.fixture()
+def client(tmp_path):
+    with make_client(tmp_path) as c:
+        yield c
 
 
 # The six tables scoped to one environment by ``environment_id`` — each seeded/asserted.
@@ -228,3 +235,20 @@ def test_list_envs_marks_exactly_one_default(client):
     assert defaults[0]["id"] == "prod"
     # staging is present and not the default.
     assert any(e["id"] == "staging" and e["default"] is False for e in envs)
+
+
+# ── read guard ───────────────────────────────────────────────────────
+
+def test_list_envs_requires_viewer_in_some_scope(client):
+    # Every other mgmt read is role-guarded; this one was open to a renderer-only key,
+    # which could enumerate environments. Renderer → 403 …
+    assert client.get("/mgmt/envs", headers=auth(client.renderer_key)).status_code == 403
+    assert client.get("/mgmt/envs", headers=auth(make_key(client, "renderer"))).status_code == 403
+    # … while the UI's env switcher keeps working for viewers however narrowly scoped:
+    # project-only, project+ONE env, instance-wide, and admin.
+    for key in (make_key(client, "viewer", project="support"),
+                make_key(client, "viewer", project="support", env="staging"),
+                make_key(client, "viewer"), ADMIN):
+        r = client.get("/mgmt/envs", headers=auth(key))
+        assert r.status_code == 200, r.text
+        assert {e["id"] for e in r.json()["environments"]} >= {"prod", "staging"}

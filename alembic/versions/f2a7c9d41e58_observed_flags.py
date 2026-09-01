@@ -19,7 +19,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # pg_trgm is a trusted contrib extension (PG13+): the database owner may create it
-    # without superuser, and every hosted Postgres ships it.
+    # without superuser, and every hosted Postgres ships it. On PG12, or a managed
+    # instance with an extension allowlist, an operator pre-creates it as superuser
+    # (docs/DEPLOYING.md) and IF NOT EXISTS makes this a no-op.
     op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
     op.create_table(
         "observed_flags",

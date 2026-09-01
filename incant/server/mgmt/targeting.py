@@ -12,7 +12,7 @@ from ...targeting.audit import record_audit
 from ...targeting.observed import (
     all_rules, collect_rule_flags, forget_flag, load_suppressions, typed_value,
 )
-from ..auth import Identity
+from ..auth import ANY_ENVIRONMENT, ANY_PROJECT, Identity
 from ..deps import app_context, get_session, identity
 from ...service import AppContext
 from ..schemas import (
@@ -50,6 +50,13 @@ def list_envs(
     session: Session = Depends(get_session),
     ident: Identity = Depends(identity),
 ):
+    # Viewer in ANY scope. Every other mgmt read is role-guarded; this one was open to a
+    # renderer-only key, which could enumerate environments. The UI's env switcher lists
+    # envs for project-scoped viewers too (their binding names a project and possibly ONE
+    # env), so the check waives both scope dimensions: with one project per deployment,
+    # "viewer of some project" is "viewer of this deployment" — while a renderer key (no
+    # binding implies viewer) is still refused.
+    _require(ident, "viewer", project=ANY_PROJECT, environment=ANY_ENVIRONMENT)
     # `default` marks the serving/registry default env (settings.default_environment); the
     # UI uses it to disable rename/delete on that env with an explanation.
     default_env = app.settings.default_environment

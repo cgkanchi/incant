@@ -158,9 +158,13 @@ bound the exposure window on a dashboard.
 
 The same remotes distribute content to **serve replicas** (`INCANT_MODE=serve`): a
 replica with an empty volume hydrates itself by mirror-cloning an enabled remote, then
-follows it with a mirror-fetch every `INCANT_CONTENT_FETCH_SECONDS` — so a "make live"
-that references a fresh commit finds its content on every replica within one interval.
-Sharing the full node's volume works too (set the interval to 0).
+follows it with a mirror-fetch every `INCANT_CONTENT_FETCH_SECONDS`. Nothing pushes on
+publish, so a "make live" that references a fresh commit finds its content on every
+replica within one backup push interval plus one fetch interval
+(`INCANT_BACKUP_POLL_SECONDS` + `INCANT_CONTENT_FETCH_SECONDS`: ~45 s worst case at the
+defaults); until then the replica keeps serving that version's previous live commit,
+flagged `content_fallback` (DESIGN.md §10). Sharing the full node's volume works too
+(set the interval to 0).
 
 ## Testing
 

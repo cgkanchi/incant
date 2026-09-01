@@ -86,14 +86,12 @@ def update_remote(
     _require(ident, "admin")
     r = _get_remote(session, remote_id)
     before = {"url": redact_url(r.url), "enabled": r.enabled}
-    if req.url is not None:
-        if not req.url.strip():
-            raise HTTPException(400, "remote url must not be empty")
-        if req.url != r.url:
-            # A different repository has its own (empty) push history.
-            r.url = req.url.strip()
-            r.last_pushed_sha = None
-            r.last_push_at = None
+    if req.url is not None and req.url != r.url:
+        # A different repository has its own (empty) push history. (The schema has
+        # already validated and stripped the URL.)
+        r.url = req.url
+        r.last_pushed_sha = None
+        r.last_push_at = None
     if req.auth_ref is not None:
         r.auth_ref = req.auth_ref or None
     if req.enabled is not None:

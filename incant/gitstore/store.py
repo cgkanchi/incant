@@ -10,6 +10,8 @@ uses git plumbing against a temporary index, so it works on a bare repo.
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -61,6 +63,75 @@ class RemoteGitError(GitError):
         super().__init__(f"{operation} for {self.display_url} failed: {self.detail}")
 
 
+# ── remote URL / credential-path grammar ─────────────────────────────
+#
+# Both values below end up inside strings that git hands to a SHELL: GIT_SSH_COMMAND
+# is run through `sh -c`, and a credential helper is too. Quoting (see _remote_auth)
+# is the actual defence; these validators are the belt to those suspenders — they turn
+# a hostile or merely mistyped admin input into a clear 422 / boot error instead of an
+# opaque git failure, and they keep the accepted alphabet small enough that the
+# quoted form is always the plain form.
+
+AUTH_REF_MAX = 1024
+# An absolute path of ordinary filename characters: no whitespace, no shell
+# metacharacters, no leading `-` (an option look-alike to ssh/git).
+_AUTH_REF_RE = re.compile(r"^/[A-Za-z0-9._/@-]+$")
+
+REMOTE_URL_MAX = 2048
+# scp-like `[user@]host:path` — the form deploy keys are documented with
+# (`git@github.com:acme/backup.git`). The path after the colon must not start with
+# another colon: `ext::` / `fd::` are git's *remote-helper* transports (a shell
+# command, a file descriptor) and never a backup target.
+_SCP_LIKE_RE = re.compile(r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+:(?!:)\S+$")
+_ALLOWED_SCHEMES = ("https://", "http://", "ssh://", "file://")
+
+REMOTE_URL_GRAMMAR = (
+    "allowed forms: https://…, http://…, ssh://…, scp-like user@host:path, file://…, "
+    "or an absolute local path; no whitespace; remote-helper transports (ext::, fd::) "
+    "and other schemes are refused"
+)
+
+
+def validate_auth_ref(path: str) -> str:
+    """The credential PATH grammar (``auth_ref`` on a remote, INCANT_BOOTSTRAP_REMOTE_KEY).
+    Raises ``ValueError`` with the reason."""
+    if not isinstance(path, str) or not path:
+        raise ValueError("auth_ref must be a non-empty absolute path")
+    if len(path) > AUTH_REF_MAX:
+        raise ValueError(f"auth_ref longer than {AUTH_REF_MAX} characters")
+    if not _AUTH_REF_RE.fullmatch(path):   # fullmatch: `$` would admit a trailing newline
+        raise ValueError(
+            f"invalid auth_ref {path!r}: must be an absolute path made of letters, digits, "
+            "'.', '_', '-', '@' and '/' — no spaces or shell characters"
+        )
+    return path
+
+
+def validate_remote_url(url: str) -> str:
+    """The remote URL grammar. Returns the stripped URL; raises ``ValueError``."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("remote url must not be empty")
+    url = url.strip()
+    if len(url) > REMOTE_URL_MAX:
+        raise ValueError(f"remote url longer than {REMOTE_URL_MAX} characters")
+    if any(c.isspace() for c in url) or not url.isprintable():
+        raise ValueError(f"invalid remote url: whitespace/control characters; {REMOTE_URL_GRAMMAR}")
+    if re.match(r"^[A-Za-z0-9._-]+::", url):
+        raise ValueError(
+            f"invalid remote url {url!r}: remote-helper transports (ext::, fd::) are not "
+            f"allowed; {REMOTE_URL_GRAMMAR}"
+        )
+    # Git's own split: anything with `://` is a scheme URL (so `git://h/x` must not be
+    # read as scp-like host `git`); otherwise it is scp-like or a local path.
+    if "://" in url:
+        if url.startswith(_ALLOWED_SCHEMES):
+            return url
+        raise ValueError(f"invalid remote url {url!r}: scheme not allowed; {REMOTE_URL_GRAMMAR}")
+    if url.startswith("/") or _SCP_LIKE_RE.fullmatch(url):
+        return url
+    raise ValueError(f"invalid remote url {url!r}: {REMOTE_URL_GRAMMAR}")
+
+
 def _remote_auth(url: str, auth_ref: str | None,
                  known_hosts_path: str | None) -> tuple[list[str], dict[str, str]]:
     """(extra git argv, extra env) for a remote operation, by URL scheme.
@@ -74,18 +145,25 @@ def _remote_auth(url: str, auth_ref: str | None,
     * http(s) URLs — path to a git *credential-store* file (one line:
       ``https://user:token@host``), wired via ``credential.helper=store`` so the
       remote URL in the DB stays credential-free.
+
+    Git runs BOTH of these through ``sh -c`` (GIT_SSH_COMMAND always; a credential
+    helper whenever its command line carries shell syntax). Every path is therefore
+    ``shlex.quote``d so it reaches ssh / git-credential-store as exactly one argument:
+    a path with a space still works, and a path carrying ``;``/``$(...)`` is an
+    (inert, misspelt) filename rather than a second command. For the plain paths the
+    validators admit, quoting is the identity — the strings below are unchanged.
     """
     argv: list[str] = []
     env: dict[str, str] = {}
     if url.startswith(("http://", "https://")):
         if auth_ref:
-            argv += ["-c", f"credential.helper=store --file={auth_ref}"]
+            argv += ["-c", f"credential.helper=store --file={shlex.quote(auth_ref)}"]
         return argv, env
     parts = ["ssh"]
     if auth_ref:
-        parts += ["-i", auth_ref, "-o", "IdentitiesOnly=yes"]
+        parts += ["-i", shlex.quote(auth_ref), "-o", "IdentitiesOnly=yes"]
     if known_hosts_path:
-        parts += ["-o", f"UserKnownHostsFile={known_hosts_path}"]
+        parts += ["-o", f"UserKnownHostsFile={shlex.quote(known_hosts_path)}"]
     if len(parts) > 1:
         env["GIT_SSH_COMMAND"] = " ".join(parts)
     return argv, env
@@ -220,11 +298,14 @@ class GitStore:
         return self.blob_sha(path, ref) is not None
 
     def list_files(self, ref: str = "main", suffix: str = ".j2") -> list[str]:
+        # ``-z`` (NUL-separated) is load-bearing: without it git C-quotes any path
+        # holding a quote, backslash, newline or non-ASCII byte (``"a\\"b/v1.j2"``), so
+        # the entry no longer ends in ``.j2`` and a DR adoption silently drops it.
         try:
-            out = self._git("ls-tree", "-r", "--name-only", ref)
+            out = self._git("ls-tree", "-r", "-z", "--name-only", ref)
         except GitError:
             return []
-        return sorted(p for p in out.splitlines() if p.endswith(suffix))
+        return sorted(p for p in out.split("\0") if p.endswith(suffix))
 
     def history(self, path: str, limit: int = 50, ref: str = "main") -> list[CommitInfo]:
         try:
@@ -351,13 +432,14 @@ class GitStore:
         content history. ``auth_ref`` is the remote's credential PATH (ssh deploy
         key, or an https credential-store file — see ``_remote_auth``);
         ``known_hosts_path`` pins host keys so a container with no ~/.ssh still
-        verifies the remote host.
+        verifies the remote host. ``--`` precedes the URL in every remote
+        invocation so a value beginning with ``-`` is a (bad) URL, never an option.
         """
         try:
             auth_argv, auth_env = _remote_auth(url, auth_ref, known_hosts_path)
             proc = subprocess.run(
                 ["git", *auth_argv, "--git-dir", str(self.repo),
-                 "push", "--mirror", "--quiet", url],
+                 "push", "--mirror", "--quiet", "--", url],
                 capture_output=True, text=True, timeout=timeout,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **auth_env},
             )
@@ -400,8 +482,9 @@ class GitStore:
     # propagate by itself: a make-live can point at a commit a replica's repo copy
     # has never seen. Replicas therefore hydrate (mirror-clone) and then follow
     # (periodic mirror-fetch) a backup remote — the same remotes the full node
-    # pushes to — so every SHA targeting references becomes fetchable within one
-    # fetch interval.
+    # pushes to. Nothing pushes on publish, so a SHA is fetchable within one backup
+    # push interval PLUS one fetch interval (~45 s at the defaults); the §10
+    # within-version fallback serves the previous live SHA across that window.
 
     def mirror_fetch(
         self, url: str, *,
@@ -416,7 +499,7 @@ class GitStore:
             auth_argv, auth_env = _remote_auth(url, auth_ref, known_hosts_path)
             proc = subprocess.run(
                 ["git", *auth_argv, "--git-dir", str(self.repo),
-                 "fetch", "--prune", "--quiet", url, "+refs/*:refs/*"],
+                 "fetch", "--prune", "--quiet", "--", url, "+refs/*:refs/*"],
                 capture_output=True, text=True, timeout=timeout,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **auth_env},
             )
@@ -439,7 +522,7 @@ class GitStore:
         try:
             auth_argv, auth_env = _remote_auth(url, auth_ref, known_hosts_path)
             proc = subprocess.run(
-                ["git", *auth_argv, "clone", "--mirror", "--quiet", url, str(self.repo)],
+                ["git", *auth_argv, "clone", "--mirror", "--quiet", "--", url, str(self.repo)],
                 capture_output=True, text=True, timeout=timeout,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **auth_env},
             )

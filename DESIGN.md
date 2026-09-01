@@ -312,9 +312,13 @@ the DB for status.
   ignored — Incant force-pushes its own lineage on conflict.
 - **Remotes double as the content-distribution channel**: `serve` replicas hydrate
   (mirror-clone on first boot against an empty volume) and follow (periodic
-  mirror-fetch, `INCANT_CONTENT_FETCH_SECONDS`) an enabled remote, so every SHA a
-  targeting change references becomes fetchable on every replica within one fetch
-  interval — rules propagate through the DB poll, content through this.
+  mirror-fetch, `INCANT_CONTENT_FETCH_SECONDS`) an enabled remote — rules propagate
+  through the DB poll, content through this. Nothing pushes on publish, so a SHA a
+  targeting change references becomes fetchable on every replica within one backup
+  push interval **plus** one fetch interval (`INCANT_BACKUP_POLL_SECONDS` +
+  `INCANT_CONTENT_FETCH_SECONDS`: ~45 s worst case at the defaults). The §10
+  within-version fallback covers that window — the replica serves the version's
+  previous live SHA, flagged `content_fallback`, until the new one arrives.
 - **Restore**: content = clone from any remote (it's the real repo — full history, no
   reconstruction step); control plane = Postgres backup. Losing only the DB never loses
   content; the version registry rebuilds from the tree + trailers, targeting/RBAC/audit

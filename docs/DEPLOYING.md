@@ -130,7 +130,12 @@ INCANT_DATABASE_URL=postgresql+psycopg://incant:PASS@db.internal:5432/incant?ssl
   taken *per database*, so two full nodes on the same DB refuse to double-write,
   but two deployments must not share one.
 - The role needs to own its database (DDL at boot: Alembic migrations) plus
-  ordinary DML. No superuser, no extensions required.
+  ordinary DML. No superuser: the boot migration runs `CREATE EXTENSION IF NOT
+  EXISTS pg_trgm` itself (the targeting composer's typeahead), and `pg_trgm` is a
+  *trusted* contrib extension on PostgreSQL 13+, so the database owner suffices. On
+  PostgreSQL 12, or a managed instance that gates extensions behind an allowlist,
+  pre-create it once as a superuser (`CREATE EXTENSION pg_trgm;`) before the first
+  boot — the migration's `IF NOT EXISTS` then makes it a no-op.
 - `sslmode=require` (or `verify-full` with a CA bundle) for anything off-host.
 - **No transaction-pooling PgBouncer in front of the full node.** The single-writer
   lock is a *session*-level advisory lock; a transaction-mode pooler hands every

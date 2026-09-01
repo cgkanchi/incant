@@ -7,9 +7,14 @@ Remote down → the queue grows, ``incant_backup_lag_seconds`` rises, nothing el
 happens (§6: "nothing user-visible").
 
 The same remotes double as the content-distribution channel: serve replicas
-hydrate (mirror-clone) and follow (periodic mirror-fetch) an enabled remote, so a
-make-live that references a fresh commit becomes fetchable on every replica within
-one fetch interval. Rules propagate via the DB poll; content propagates via this.
+hydrate (mirror-clone) and follow (periodic mirror-fetch) an enabled remote. Rules
+propagate via the DB poll; content propagates via this — and nothing pushes on
+publish, so a make-live that references a fresh commit becomes fetchable on every
+replica within one backup push interval PLUS one fetch interval
+(``INCANT_BACKUP_POLL_SECONDS`` + ``INCANT_CONTENT_FETCH_SECONDS``: ~45 s worst case
+at the defaults). The §10 within-version fallback covers that window — the replica
+keeps serving the version's previous live SHA, flagged ``content_fallback``, until
+the new one arrives.
 """
 
 from __future__ import annotations

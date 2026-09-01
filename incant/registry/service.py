@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..core import ExtractedVars, extract
+from ..core.ids import validate_prompt_id
 from ..gitstore import ContentStore, GitStore, validate_source
 from ..gitstore.store import ConcurrentUpdate
 
@@ -100,6 +101,12 @@ class RegistryService:
         return p
 
     def create_prompt(self, prompt_id: str, description: str = "") -> models.Prompt:
+        # The one grammar (incant.core.ids), enforced here as well as in the mgmt schema
+        # so seed/CLI callers can't create a row for a path git will refuse to write.
+        try:
+            validate_prompt_id(prompt_id)
+        except ValueError as exc:
+            raise RegistryError(str(exc)) from exc
         if self.s.get(models.Prompt, prompt_id):
             raise RegistryError(f"prompt {prompt_id!r} already exists")
         project_id = prompt_id.split("/", 1)[0]

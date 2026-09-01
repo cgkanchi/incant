@@ -45,6 +45,7 @@ from ..db import (
     writer_role_held,
     writer_role_lost,
 )
+from ..gitstore.store import validate_auth_ref, validate_remote_url
 from ..registry import (
     adopt_content_tree,
     reconcile_drafts,
@@ -459,6 +460,19 @@ async def lifespan(app: FastAPI):
         # The control-poll loop re-checks it every tick from here on.
         claim_full_writer_role()
         metrics.writer_lock_held.set(1)
+        # The bootstrap remote + key become a registered remote's url/auth_ref, i.e.
+        # they reach a shell via git exactly as an admin-supplied remote does — so they
+        # pass the same grammar the mgmt API enforces, and a bad value fails the boot
+        # with its reason instead of being registered as a backup target.
+        if settings.bootstrap_remote:
+            try:
+                validate_remote_url(settings.bootstrap_remote)
+                if settings.bootstrap_remote_key:
+                    validate_auth_ref(settings.bootstrap_remote_key)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"INCANT_BOOTSTRAP_REMOTE / INCANT_BOOTSTRAP_REMOTE_KEY rejected: {exc}"
+                ) from exc
         # First-boot content bootstrap (§6): with INCANT_BOOTSTRAP_REMOTE set and an
         # EMPTY repo volume, clone the remote — a populated Incant repo gets adopted
         # below; a blank one means "start fresh and push here" (initialize() seeds

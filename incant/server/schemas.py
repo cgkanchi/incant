@@ -6,7 +6,9 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from ..core.ids import validate_prompt_id
 from ..core.parse import parse_condition, parse_serve
+from ..gitstore.store import validate_auth_ref, validate_remote_url
 
 
 # ── serving ──────────────────────────────────────────────────────────
@@ -78,6 +80,14 @@ class UserStatusRequest(BaseModel):
 class CreatePromptRequest(BaseModel):
     prompt_id: str
     description: str = ""
+
+    @field_validator("prompt_id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        # The one grammar (incant.core.ids), applied before any row exists: an id git
+        # would refuse (`..`, trailing `/`) used to create the prompt row and then 500
+        # on the first draft write; an empty id bound the deployment to project "".
+        return validate_prompt_id(v)
 
 
 class VersionUpdateRequest(BaseModel):
@@ -258,26 +268,46 @@ class KillRequest(BaseModel):
 # ── admin ────────────────────────────────────────────────────────────
 
 class RemoteRequest(BaseModel):
-    # A backup remote (§6): any URL `git push` understands. `auth_ref` is a path to a
-    # push-only ssh deploy key (mounted into the container); https URLs may embed a
-    # token instead (redacted in every response/log).
+    # A backup remote (§6): a URL `git push` understands, restricted to the transports a
+    # backup target can be (https/http/ssh/scp-like/file/local path — never git's
+    # remote-helper `ext::`/`fd::`). `auth_ref` is a PATH to a push-only ssh deploy key
+    # or an https credential-store file (mounted into the container); https URLs may
+    # embed a token instead (redacted in every response/log). Both values reach a
+    # shell via git, so both are validated against a tight grammar here
+    # (gitstore.store.validate_*) on top of the quoting in `_remote_auth`.
     url: str
     auth_ref: Optional[str] = None
     enabled: bool = True
 
     @field_validator("url")
     @classmethod
-    def _nonempty_url(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("remote url must not be empty")
-        return v.strip()
+    def _valid_url(cls, v: str) -> str:
+        return validate_remote_url(v)
+
+    @field_validator("auth_ref")
+    @classmethod
+    def _valid_auth_ref(cls, v: Optional[str]) -> Optional[str]:
+        # Empty ⇒ no credential file (agent-provided key, anonymous, or URL-embedded).
+        return validate_auth_ref(v) if v else None
 
 
 class RemotePatchRequest(BaseModel):
-    # Partial update; unset fields untouched.
+    # Partial update; unset fields untouched. Same grammars as RemoteRequest; an empty
+    # `auth_ref` string means "clear the credential path" and is passed through.
     url: Optional[str] = None
     auth_ref: Optional[str] = None
     enabled: Optional[bool] = None
+
+    @field_validator("url")
+    @classmethod
+    def _valid_url(cls, v: Optional[str]) -> Optional[str]:
+        return None if v is None else validate_remote_url(v)
+
+    @field_validator("auth_ref")
+    @classmethod
+    def _valid_auth_ref(cls, v: Optional[str]) -> Optional[str]:
+        return validate_auth_ref(v) if v else v
+
 
 class ProjectRequest(BaseModel):
     id: str
