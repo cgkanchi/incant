@@ -154,7 +154,7 @@ def test_on_miss_reload_picks_up_a_freshly_issued_key(app):
     assert ident.principal_id == "p_svc" and ident.has("viewer")
 
 
-def test_snapshot_invalidation_runs_only_after_commit(app):
+def test_snapshot_refresh_runs_only_after_commit_and_never_empties_the_cache(app):
     _author_version(app, "support/system", 1, "v1")
     with session_scope() as s:
         cached = app.get_snapshot(s, "prod")
@@ -164,12 +164,15 @@ def test_snapshot_invalidation_runs_only_after_commit(app):
         app.invalidate_after_commit(s, "prod")
         assert app._snapshots["prod"].snapshot is cached
         s.rollback()
-        assert app._snapshots["prod"].snapshot is cached
+        assert app._snapshots["prod"].snapshot is cached   # rolled back: nothing happened
 
         app.invalidate_after_commit(s, "prod")
-        assert app._snapshots["prod"].snapshot is cached
+        assert app._snapshots["prod"].snapshot is cached   # not yet committed
         s.commit()
-        assert "prod" not in app._snapshots
+        # Committed: the entry is REBUILT in place (a fresh snapshot object), never
+        # dropped — the next render is still a memory hit, not a cold DB build.
+        assert app._snapshots["prod"].snapshot is not cached
+        assert app.get_snapshot(BoomSession(), "prod") is app._snapshots["prod"].snapshot
     finally:
         s.close()
 

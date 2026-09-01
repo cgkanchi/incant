@@ -450,7 +450,11 @@ target, so the history stays append-only and the §10 fallback never reaches pas
 an un-make-live. The same capture is what makes §9's `pin.rules_version` replay
 possible. Nodes hold rule snapshots in memory; a 2s control-plane poll propagates
 bumps (see Divergences: LISTEN/NOTIFY is deliberately unbuilt). Target: any
-targeting change — including "make live" — serves everywhere in **< 2 s**.
+targeting change — including "make live" — serves everywhere in **< 2 s**. Snapshot
+inputs that are *not* targeting — a new validated SHA (it moves a tip and the
+servable index), a new version row, a variable default — advance a deployment-wide
+**`content_version`** on every environment instead of minting a targeting revision,
+and the same poll rebuilds on either key.
 
 ### Observed flags
 
@@ -601,6 +605,11 @@ GET  /healthz  /readyz  /metrics
 Node state: the canonical repo (durable — content system of record), content + compiled
 caches (rebuildable), rule snapshots (memory). Postgres is authoritative
 for the control plane and sits on the refresh/write paths only, never per-request.
+A node's own writes never empty its snapshot cache: after the transaction commits it
+rebuilds the affected snapshots in place (built fully, then swapped), so the next
+request is still a memory hit — the freeze posture below holds through the write
+itself; every other node converges on its next poll (`rules_version` /
+`content_version`, §7).
 
 | Failure | Behavior |
 |---|---|

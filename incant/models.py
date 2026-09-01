@@ -179,12 +179,24 @@ class ReviewComment(Base):
 
 class Environment(Base):
     __tablename__ = "environments"
-    __table_args__ = (CheckConstraint("rules_version >= 1", name="ck_environment_rules_version"),)
+    __table_args__ = (
+        CheckConstraint("rules_version >= 1", name="ck_environment_rules_version"),
+        CheckConstraint("content_version >= 1", name="ck_environment_content_version"),
+    )
     id: Mapped[str] = mapped_column(String, primary_key=True)          # == name
     name: Mapped[str] = mapped_column(String)
     protected: Mapped[bool] = mapped_column(Boolean, default=False)
     track_tip: Mapped[bool] = mapped_column(Boolean, default=False)
     rules_version: Mapped[int] = mapped_column(Integer, default=1)
+    # Freshness key for the snapshot inputs that are NOT targeting: a new validated SHA
+    # (moves tips and the servable index), a new version row, a variable default. Those
+    # are global to the deployment, so a change advances EVERY environment's row at once
+    # (``targeting.service.bump_content_version``) and each node's poll rebuilds when
+    # either key moved. Deliberately separate from ``rules_version``: that one is the
+    # user-visible pin/replay key and the rule_revisions unique key, so minting a
+    # targeting revision per commit would flood targeting history with non-changes.
+    content_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1")
 
 
 class PointerMove(Base):

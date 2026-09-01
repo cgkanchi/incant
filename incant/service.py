@@ -1,9 +1,11 @@
 """AppContext — wires the git store, content cache, DB, and serving hot path.
 
 Holds the per-environment snapshot cache (RulesSync, poll-fallback form): a
-snapshot is rebuilt when the environment's ``rules_version`` advances. If the DB
-is unreachable, serving continues on the last-known-good snapshot with
-``stale_rules: true`` — the design's "rules freeze" availability posture.
+snapshot is rebuilt when either of the environment's freshness keys advances —
+``rules_version`` (targeting) or ``content_version`` (validated SHAs, versions,
+variable defaults). If the DB is unreachable, serving continues on the
+last-known-good snapshot with ``stale_rules: true`` — the design's "rules freeze"
+availability posture.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -37,6 +39,7 @@ from .db import after_commit, init_db
 from .gitstore import BackupPusher, ContentStore, GitStore
 from .registry import MainReconcileResult, RegistryService
 from .targeting import TargetingService, build_snapshot, snapshot_from_state
+from .targeting.snapshot import load_validated_index
 
 log = logging.getLogger("incant.service")
 
@@ -78,13 +81,27 @@ class WarmError(Exception):
 
 @dataclass
 class _CachedSnapshot:
+    # The two poll freshness keys the snapshot was built under (models.Environment):
+    # targeting moves rules_version, content inputs move content_version. A rebuild is
+    # due when EITHER differs from the DB's — one key alone missed every commit.
     rules_version: int
+    content_version: int
     snapshot: EnvSnapshot
     # Monotonic time of the last successful freshness check against the DB (build,
-    # or a healthy poll confirming rules_version unchanged). Feeds the §14
+    # or a healthy poll confirming both keys unchanged). Feeds the §14
     # incant_rules_snapshot_age_seconds gauge: a rising age means the poll can't
     # reach Postgres and targeting changes are not propagating to this node.
     confirmed_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class _RefreshPlan:
+    """The cache changes one control-plane read implies — computed apart from applying
+    them, so a write can BUILD inside its own transaction and SWAP after its commit."""
+
+    rebuilt: dict[str, _CachedSnapshot] = field(default_factory=dict)
+    evicted: set[str] = field(default_factory=set)    # cached ids the DB no longer has
+    confirmed: set[str] = field(default_factory=set)  # cached, keys unchanged, not forced
 
 
 _HISTORICAL_CACHE_MAX = 64  # replayed (env, rules_version) snapshots kept in memory
@@ -146,10 +163,34 @@ class AppContext:
         self.auth.invalidate()
 
     def invalidate_after_commit(self, session: Session, env_id: str | None = None) -> None:
+        """Bring THIS node's snapshots up to date the instant ``session``'s transaction
+        commits — same-node freshness for a control-plane write.
+
+        The affected snapshots are rebuilt NOW, inside the write's own transaction (which
+        sees its uncommitted rows), and only SWAPPED IN after the commit; a rollback
+        discards them (``db.after_commit``). Two properties hang on that shape:
+
+        * The cache never empties. The old "clear the cache" made the next request a cold
+          DB build — a 503 on a Postgres blip, the §10 rules-freeze posture lost in
+          exactly that window. Here a rebuilt entry replaces the old one atomically.
+        * The swap is instant. FastAPI's request-scoped session dependency commits AFTER
+          the response is sent, so a client's very next request can arrive between the
+          commit and whatever runs after it. A post-commit rebuild would widen that
+          window by a whole build and the client would still see the old snapshot —
+          breaking "commit, then render sees the new tip". Building before the commit
+          keeps the window at the commit alone, the same as the old clear.
+
+        ``env_id`` names an environment to rebuild even if its freshness keys did not
+        move (an env-settings edit mints no revision); None means "whatever the keys say
+        changed" — right for content writes, which bump every ``content_version``. Call
+        it after the write's LAST mutation: the plan reflects the transaction as of this
+        call (a later call with the same ``env_id`` supersedes an earlier one).
+        """
+        plan = self._plan_refresh(session, force=(env_id,) if env_id is not None else ())
         after_commit(
             session,
             ("snapshot", id(self), env_id),
-            lambda: self.invalidate(env_id),
+            lambda: self._apply_refresh(plan),
         )
 
     def invalidate_auth_after_commit(self, session: Session) -> None:
@@ -206,29 +247,37 @@ class AppContext:
             env = session.get(models.Environment, env_id)
             if env is None:
                 raise ServingError(404, f"unknown environment {env_id!r}")
+            # Keys read BEFORE the build: a bump landing mid-build then leaves this entry
+            # behind and the next poll rebuilds — never a snapshot recorded as current
+            # that isn't.
             snap = build_snapshot(session, env_id)
-            self._snapshots[env_id] = _CachedSnapshot(env.rules_version, snap)
+            self._snapshots[env_id] = _CachedSnapshot(
+                env.rules_version, env.content_version, snap)
             return snap
         except SQLAlchemyError:
             raise ServingError(503, "node not ready: no cached targeting")
 
     def refresh_control_plane(self, session: Session) -> None:
-        """Pull targeting + auth changes from the DB into memory. This is the ONLY place
-        the control plane reaches the serving snapshots on a warm node, and it is driven
-        by the background poll loop (``server.app._control_poll_loop``), never by a
-        request. That is precisely what buys DESIGN.md §8's "No DB per request" and §10's
-        "the DB is never on the per-request path": the periodic DB read moves off the hot
-        path onto this poll — the fallback for §7's Postgres LISTEN/NOTIFY — so a targeting
-        change (including "make live") lands on every replica in < 2 s.
+        """Pull targeting + content + auth changes from the DB into memory. This is the
+        ONLY place the control plane reaches the serving snapshots on a warm node from
+        OUTSIDE a write, and it is driven by the background poll loop
+        (``server.app._control_poll_loop``), never by a request. That is precisely what
+        buys DESIGN.md §8's "No DB per request" and §10's "the DB is never on the
+        per-request path": the periodic DB read moves off the hot path onto this poll —
+        the fallback for §7's Postgres LISTEN/NOTIFY — so a targeting change (including
+        "make live") or a publish lands on every replica in < 2 s. (A node's OWN writes
+        take the same plan/apply pair through :meth:`invalidate_after_commit`.)
 
-        One best-effort pass:
+        One best-effort pass — :meth:`_plan_refresh` then :meth:`_apply_refresh`:
 
-        * SELECT every environment's ``(id, rules_version)`` in a single query. For each
-          environment already cached whose ``rules_version`` advanced (e.g. a write on
-          another replica), rebuild its snapshot and atomically swap the cache entry —
-          built fully *then* assigned, so a concurrent reader on the hot path never sees a
-          half-built snapshot. Cold (uncached) environments are left alone; they build
-          lazily on first request in :meth:`get_snapshot`.
+        * SELECT every environment's ``(id, rules_version, content_version)`` in a single
+          query. For each environment already cached where EITHER key differs from the
+          cached one (a targeting write, or a commit/refinement bumping every
+          ``content_version`` — e.g. on the full node while this is a replica), rebuild
+          its snapshot and atomically swap the cache entry — built fully *then* assigned,
+          so a concurrent reader on the hot path never sees a half-built snapshot. Cold
+          (uncached) environments are left alone; they build lazily on first request in
+          :meth:`get_snapshot`.
         * Refresh the in-memory auth cache when its table has aged past its TTL.
 
         Availability (§10 "rules freeze"): on any ``SQLAlchemyError`` mark the node
@@ -237,38 +286,7 @@ class AppContext:
         poll succeeds and clears the flag — the loop must never die on a transient outage.
         """
         try:
-            rows = session.execute(
-                select(models.Environment.id, models.Environment.rules_version)
-            ).all()
-            live = {env_id for env_id, _ in rows}
-            # An environment deleted on another node must stop serving here too: evict
-            # cached snapshots (and replay states) for ids the DB no longer has.
-            for env_id in [e for e in self._snapshots if e not in live]:
-                self._snapshots.pop(env_id, None)
-                for key in [k for k in self._historical if k[0] == env_id]:
-                    self._historical.pop(key, None)
-                log.warning("environment %r no longer exists — evicted from the snapshot cache", env_id)
-            for env_id, rules_version in rows:
-                cached = self._snapshots.get(env_id)
-                if cached is None:
-                    continue
-                if cached.rules_version != rules_version:
-                    try:
-                        snap = build_snapshot(session, env_id)          # build fully…
-                    except SQLAlchemyError:
-                        raise
-                    except Exception:
-                        # Bad data in ONE environment (an unparseable rule) must not stall
-                        # propagation for every other environment: keep serving this env's
-                        # last good snapshot, count it, and carry on with the pass.
-                        log.exception("snapshot rebuild failed for environment %r — serving "
-                                      "its last good snapshot; other environments continue",
-                                      env_id)
-                        _record_snapshot_build_failure(env_id)
-                        continue
-                    self._snapshots[env_id] = _CachedSnapshot(rules_version, snap)  # …then swap
-                else:
-                    cached.confirmed_at = time.monotonic()  # unchanged, freshly confirmed
+            self._apply_refresh(self._plan_refresh(session))
             # The TTL-driven whole-table auth reload lives here now — off the hot path (§8).
             self.auth.refresh(session)
             self._db_healthy = True
@@ -280,6 +298,70 @@ class AppContext:
                 pass
         self._publish_snapshot_ages()
 
+    def _plan_refresh(self, session: Session, *, force: Iterable[str] = ()) -> _RefreshPlan:
+        """Read every environment's freshness keys and BUILD the snapshots whose keys
+        differ from the cache (or that are ``force``d) — without touching the cache.
+
+        The validated-commit index (the ``servable`` predicate) is environment-
+        independent, so a plan loads it at most once and every snapshot it builds shares
+        that one set; a plan that builds nothing never loads it. Bad data in ONE
+        environment (an unparseable rule) must not stall propagation for the others: it
+        is logged and counted, that environment keeps its last good snapshot, and the
+        pass carries on. DB errors propagate — the caller decides what an outage means.
+        """
+        forced = set(force)
+        plan = _RefreshPlan()
+        rows = session.execute(
+            select(models.Environment.id, models.Environment.rules_version,
+                   models.Environment.content_version)
+        ).all()
+        live = {env_id for env_id, _, _ in rows}
+        # list() copy: request threads write to the cache concurrently with the poll.
+        plan.evicted = {e for e in list(self._snapshots) if e not in live}
+        validated_index = None   # loaded on first build, then shared by the plan
+        for env_id, rules_version, content_version in rows:
+            cached = self._snapshots.get(env_id)
+            if cached is None:
+                continue
+            if (cached.rules_version == rules_version
+                    and cached.content_version == content_version
+                    and env_id not in forced):
+                plan.confirmed.add(env_id)
+                continue
+            if validated_index is None:
+                validated_index = load_validated_index(session)
+            try:
+                snap = build_snapshot(session, env_id, validated_index=validated_index)
+            except SQLAlchemyError:
+                raise
+            except Exception:
+                log.exception("snapshot rebuild failed for environment %r — serving "
+                              "its last good snapshot; other environments continue",
+                              env_id)
+                _record_snapshot_build_failure(env_id)
+                continue
+            plan.rebuilt[env_id] = _CachedSnapshot(rules_version, content_version, snap)
+        return plan
+
+    def _apply_refresh(self, plan: _RefreshPlan) -> None:
+        """Swap a plan into the cache. Each rebuilt entry replaces its predecessor whole
+        (a hot-path reader sees the old or the new snapshot, never a half-built one); an
+        environment deleted on another node — or by the write that planned this — stops
+        serving here too, replay states included; unchanged entries are stamped as
+        freshly confirmed against the DB (the §14 age gauge)."""
+        for env_id in plan.evicted:
+            self._snapshots.pop(env_id, None)
+            for key in [k for k in list(self._historical) if k[0] == env_id]:
+                self._historical.pop(key, None)
+            log.warning("environment %r no longer exists — evicted from the snapshot cache", env_id)
+        for env_id, entry in plan.rebuilt.items():
+            self._snapshots[env_id] = entry
+        now = time.monotonic()
+        for env_id in plan.confirmed:
+            cached = self._snapshots.get(env_id)
+            if cached is not None:
+                cached.confirmed_at = now
+
     def _publish_snapshot_ages(self) -> None:
         """§14 incant_rules_snapshot_age_seconds — refreshed by every poll pass, on
         success AND failure, so an outage shows up as ages climbing in lockstep.
@@ -287,7 +369,7 @@ class AppContext:
         try:
             from .server.metrics import rules_snapshot_age_seconds
             now = time.monotonic()
-            for env_id, cached in self._snapshots.items():
+            for env_id, cached in list(self._snapshots.items()):  # concurrent writers
                 rules_snapshot_age_seconds.labels(env_id).set(now - cached.confirmed_at)
         except Exception:  # pragma: no cover - metrics are best-effort telemetry
             pass
@@ -347,7 +429,12 @@ class AppContext:
                           version: int, sha: str) -> list[str]:
         """§7 track_tip: in environments that track validated tips, advance an
         *existing* live pointer for (prompt, version) to the new tip. Returns the
-        list of environments advanced."""
+        list of environments advanced.
+
+        Same-node freshness is the CALLER's one :meth:`invalidate_after_commit` after
+        its whole write (the commit route's): each advance bumped its environment's
+        rules_version, so that keyed refresh rebuilds exactly these — registering one
+        here as well would only build every snapshot twice."""
         advanced: list[str] = []
         # Deterministic id order: make_live now takes each environment's row lock, so
         # any transaction locking SEVERAL environments must do so in one global order
@@ -362,7 +449,6 @@ class AppContext:
                 continue  # nothing live to follow
             tgt.make_live(env.id, prompt_id, version, sha,
                           comment="track_tip auto-advance")
-            self.invalidate_after_commit(session, env.id)
             advanced.append(env.id)
         return advanced
 
@@ -395,11 +481,14 @@ class AppContext:
         except KeyError:
             return False
 
-    def warm(self, session: Session, env_id: str) -> None:
+    def warm(self, session: Session, env_id: str, *,
+             validated_index: set[tuple[str, int, str]] | None = None) -> None:
         """Eager-warm the content cache for everything reachable in an environment.
 
         Live pointers *and each version's previous-live* (the §10 fallback must be
-        warm to be useful) and tips.
+        warm to be useful) and tips. A caller warming several environments in one pass
+        may hand every call the same pre-loaded ``validated_index`` (see
+        :func:`load_validated_index`) so the snapshots share one set.
 
         Failure criterion (§10): warming FAILS — raising :class:`WarmError` — only when a
         version referenced by a *live pointer* has no servable content at all: its live
@@ -413,7 +502,12 @@ class AppContext:
           or simply no live obligation, exists).
         """
 
-        snap = build_snapshot(session, env_id)
+        # Freshness keys read BEFORE the build (same reasoning as get_snapshot's cold
+        # path): a bump landing mid-warm must leave this entry behind, not current.
+        env = session.get(models.Environment, env_id)
+        if env is None:
+            raise KeyError(f"unknown environment {env_id!r}")
+        snap = build_snapshot(session, env_id, validated_index=validated_index)
         for prompt_id, vers in snap.versions.items():
             for vnum, vinfo in vers.items():
                 # Tips and prior history are best-effort — warm what we can, skip misses.
@@ -438,13 +532,13 @@ class AppContext:
         # either warmed or has a warm previous-live fallback (the one unservable state
         # raised WarmError above). Only NOW — after content warming for this env has
         # succeeded — do we install the snapshot into the same cache the hot path reads
-        # (:meth:`get_snapshot`), in its ``_CachedSnapshot(rules_version, snap)`` shape.
+        # (:meth:`get_snapshot`), in its ``_CachedSnapshot`` shape.
         # Readiness must mean "can serve THIS env with zero DB reads" (§8 "No DB per
         # request"; §10 "the DB is never on the per-request path"): without this install
         # the FIRST render after /readyz went green would do a cold snapshot build (a DB
         # read), so a node that just reported ready would 503 if Postgres died the instant
         # after. With it, that first render is a pure memory hit off already-warm content.
-        self._snapshots[env_id] = _CachedSnapshot(snap.rules_version, snap)
+        self._snapshots[env_id] = _CachedSnapshot(env.rules_version, env.content_version, snap)
 
     # ── serving ──────────────────────────────────────────────────────
 
@@ -574,6 +668,20 @@ class AppContext:
             raise ServingError(409, str(exc))
         except KeyError:
             raise ServingError(409, "resolved content missing from store")
+
+        if pin_rules_version is not None:
+            # Includes that are not pinned resolve INSIDE the historical snapshot, whose
+            # ``killed`` is the recorded one — a fragment killed NOW would still have its
+            # old rules fire there. The kill switch beats replay for every contributor
+            # (§9), so check what actually rendered against the CURRENT kills; the
+            # pre-render checks above only covered the root and the pinned prompts.
+            killed_now = sorted(set(result.contributions) & current_killed)
+            if killed_now:
+                raise ServingError(
+                    409,
+                    f"included prompt {killed_now[0]!r} is killed in {env_id!r} — a "
+                    "rules_version replay cannot serve it; lift the kill switch first",
+                    error="killed")
 
         versions = {}
         for pid, res in result.contributions.items():

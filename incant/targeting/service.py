@@ -9,12 +9,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..core.parse import parse_rule as parse_core_rule
 from .audit import record_audit
+
+
+def bump_content_version(session: Session) -> None:
+    """Advance every environment's ``content_version`` — the poll freshness key for the
+    snapshot inputs that are NOT targeting: a new validated SHA (it moves the tip and
+    the servable index), a new version row, a variable refinement default.
+
+    Those inputs are global to the deployment (versions, validations and refinements
+    have no environment), so one statement touches every row and every node's next
+    poll rebuilds every environment it caches. Not a ``rules_version`` bump on purpose:
+    that is the user-visible pin/replay key and the ``rule_revisions`` unique key, and
+    a commit is not a targeting change.
+
+    Rows are locked in id order — the one global order every multi-environment locker
+    (``auto_advance_tips``, version status changes) must share, or two of them meeting
+    in a commit transaction could deadlock.
+    """
+    session.execute(text(
+        "UPDATE environments SET content_version = content_version + 1 "
+        "WHERE id IN (SELECT id FROM environments ORDER BY id FOR UPDATE)"
+    ))
 
 
 def _version_key(prompt_id: str, version_number: int) -> str:

@@ -34,6 +34,7 @@ class FakeInspector:
         # don't have to spell them out; pass explicitly to model an older schema.
         self._columns = columns if columns is not None else {
             "rule_revisions": [{"name": "state"}],
+            "environments": [{"name": "content_version"}],
         }
 
     def get_table_names(self):
@@ -127,8 +128,21 @@ def test_everything_present_returns_head():
     insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users", "observed_flags"],
                          unique_constraints=ucs,
                          columns={"rule_revisions": [{"name": "state"}],
-                                  "reviews": [{"name": "reviewer_principal_id"}]})
+                                  "reviews": [{"name": "reviewer_principal_id"}],
+                                  "environments": [{"name": "content_version"}]})
     assert _adoption_revision(insp) == "head"
+
+
+def test_flags_only_applied_but_content_version_missing_adopts_at_a9c4():
+    """segments gone (a9c4e17f2b60 ran) but environments has no content_version →
+    b3d8f5a17c92 hasn't run; adopt at a9c4e17f2b60 so the column migration applies."""
+    ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
+    insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users", "observed_flags"],
+                         unique_constraints=ucs,
+                         columns={"rule_revisions": [{"name": "state"}],
+                                  "reviews": [{"name": "reviewer_principal_id"}],
+                                  "environments": [{"name": "rules_version"}]})  # pre-b3d8
+    assert _adoption_revision(insp) == "a9c4e17f2b60"
 
 
 def test_observed_flags_present_but_segments_still_there_adopts_at_f2a7():
@@ -188,7 +202,8 @@ def test_review_uniqueness_detected_via_unique_index():
         indexes={"reviews": [{"name": "some_unique_ix",
                               "column_names": ["draft_id", "reviewer"], "unique": True}]},
         columns={"rule_revisions": [{"name": "state"}],
-                 "reviews": [{"name": "reviewer_principal_id"}]},
+                 "reviews": [{"name": "reviewer_principal_id"}],
+                 "environments": [{"name": "content_version"}]},
     )
     assert _adoption_revision(insp) == "head"
 
@@ -260,7 +275,8 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         insp = inspect(db.engine())
         with db.engine().connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "a9c4e17f2b60"
+        assert version == "b3d8f5a17c92"
+        assert "content_version" in {c["name"] for c in insp.get_columns("environments")}
         assert "observed_flags" in insp.get_table_names()
         assert "observed_flag_suppressions" in insp.get_table_names()
         assert "segments" not in insp.get_table_names()                      # 1.1.0: flags only
@@ -277,6 +293,17 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         }
         assert "state" in {c["name"] for c in insp.get_columns("rule_revisions")}
         assert "users" in insp.get_table_names()
+
+        # The newest migration round-trips: its downgrade removes exactly what its
+        # upgrade added (column + check), and the re-upgrade lands back at head.
+        command.downgrade(db._alembic_config(), "a9c4e17f2b60")
+        insp = inspect(db.engine())
+        assert "content_version" not in {c["name"] for c in insp.get_columns("environments")}
+        assert "ck_environment_content_version" not in {
+            c["name"] for c in insp.get_check_constraints("environments")}
+        command.upgrade(db._alembic_config(), "head")
+        insp = inspect(db.engine())
+        assert "content_version" in {c["name"] for c in insp.get_columns("environments")}
     finally:
         set_settings(saved)
         db.reset_engine()

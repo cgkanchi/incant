@@ -55,8 +55,12 @@ def clear_servable_memo() -> None:
     """Compatibility no-op: servability now lives entirely in each snapshot."""
 
 
-def _validated_index(session: Session) -> set[tuple[str, int, str]]:
-    """Load immutable validation facts while building the control-plane snapshot."""
+def load_validated_index(session: Session) -> set[tuple[str, int, str]]:
+    """The complete ``(prompt, version, sha)`` set of validated commits — the snapshot's
+    ``servable`` predicate. Validation facts are immutable and environment-independent,
+    so a refresh pass that rebuilds several environments loads this ONCE and hands the
+    same set to every :func:`build_snapshot` (``validated_index=``); each snapshot then
+    shares one object instead of holding its own copy of the whole history."""
     rows = session.execute(
         select(
             models.CommitValidation.prompt_id,
@@ -153,13 +157,23 @@ def snapshot_from_state(
     )
 
 
-def build_snapshot(session: Session, env_id: str, *, stale: bool = False) -> EnvSnapshot:
+def build_snapshot(
+    session: Session, env_id: str, *, stale: bool = False,
+    validated_index: set[tuple[str, int, str]] | None = None,
+) -> EnvSnapshot:
+    """Build one environment's evaluable snapshot from the control plane.
+
+    ``validated_index`` lets a caller rebuilding several environments in one pass share
+    a single :func:`load_validated_index` result across them; a lone rebuild (a cold
+    request-path miss) leaves it None and loads its own.
+    """
     env = session.get(models.Environment, env_id)
     if env is None:
         raise KeyError(f"unknown environment {env_id!r}")
 
     validated_by_version = _validated_order(session)
-    validated_index = _validated_index(session)
+    if validated_index is None:
+        validated_index = load_validated_index(session)
     pointer_hist = _pointer_history(session, env_id)
 
     # Versions

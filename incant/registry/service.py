@@ -20,6 +20,7 @@ from ..core import ExtractedVars, extract
 from ..core.ids import validate_prompt_id
 from ..gitstore import ContentStore, GitStore, validate_source
 from ..gitstore.store import ConcurrentUpdate
+from ..targeting.service import bump_content_version
 
 log = logging.getLogger("incant.registry")
 
@@ -185,7 +186,11 @@ class RegistryService:
             # poll interval and pin.rules_version replay reconstructs the change.
             from ..targeting.service import TargetingService
             ts = TargetingService(self.s, self.actor)
-            for env_id in self.s.execute(select(models.Environment.id)).scalars().all():
+            # id order: the global lock order shared with every other multi-environment
+            # locker (bump_content_version, auto_advance_tips) — see bump_content_version.
+            for env_id in self.s.execute(
+                select(models.Environment.id).order_by(models.Environment.id)
+            ).scalars().all():
                 ts._bump(ts._env(env_id), "version",
                          {"prompt_id": prompt_id, "version": number, "status": v.status})
         return v
@@ -612,6 +617,10 @@ class RegistryService:
                 extracted_variables=result.extracted_variables,
             )
             self.s.add(cv)
+            # Every publish changes what snapshots are built from — a new version row
+            # and/or a new validated SHA (tip, servable index) — so every node's poll
+            # must rebuild. Same transaction as the rows it announces.
+            bump_content_version(self.s)
 
             d.status = "committed"
             self.s.flush()
@@ -713,6 +722,9 @@ class RegistryService:
         for k, v in fields.items():
             setattr(existing, k, v)
         self.s.flush()
+        # Refinement defaults are folded into every environment's snapshot (the render
+        # path resolves optional variables from memory), so replicas must rebuild.
+        bump_content_version(self.s)
         return existing
 
     def get_test_contexts(self, prompt_id: str) -> list[models.TestContext]:
