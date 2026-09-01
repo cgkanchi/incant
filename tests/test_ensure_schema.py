@@ -286,3 +286,70 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
                 c.execute(text(f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE)'))
         finally:
             admin_eng.dispose()
+
+
+def test_flags_only_migration_refuses_removed_constructs_but_not_a_flag_named_segment():
+    """a9c4e17f2b60's guard: global/label/rollout/segment rules block the upgrade with
+    their ids; a rule whose FLAG is named "segment" does not; archiving an offender is
+    not enough (the check reads every row) — deleting it is."""
+    import pytest
+    from alembic import command
+    from sqlalchemy import create_engine, inspect, text
+    from sqlalchemy.engine import make_url
+
+    import incant.db as db
+    from incant.config import Settings, get_settings, set_settings
+
+    base = make_url(_PG_URL)
+    scratch_name = (base.database or "incant") + "_migration_guard_scratch"
+    admin = base.set(database="postgres")
+    admin_eng = create_engine(admin, isolation_level="AUTOCOMMIT", future=True)
+    try:
+        with admin_eng.connect() as c:
+            c.execute(text(f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE)'))
+            c.execute(text(f'CREATE DATABASE "{scratch_name}"'))
+    finally:
+        admin_eng.dispose()
+    scratch_url = base.set(database=scratch_name).render_as_string(hide_password=False)
+
+    saved = get_settings()
+    try:
+        set_settings(Settings(database_url=scratch_url))
+        db.reset_engine()
+        cfg = db._alembic_config()
+        command.upgrade(cfg, "e9a1c4f27b63")           # the last pre-flags-only revision
+        with db.engine().begin() as conn:
+            conn.execute(text("INSERT INTO environments (id, name, protected, track_tip, rules_version) "
+                              "VALUES ('prod', 'prod', false, false, 1)"))
+            rows = [
+                ("global-one", "global", None, None, '{"version": 2}', "active"),
+                ("labelled", "prompt", "support/system", None, '{"label": "voice"}', "archived"),
+                ("flag-named-segment", "prompt", "support/system",
+                 '{"flag": "segment", "op": "eq", "value": "enterprise"}', '{"version": 2}', "active"),
+                ("value-is-segment", "prompt", "support/system",
+                 '{"flag": "tier", "op": "in", "values": ["segment", "label"]}', '{"version": 2}', "active"),
+            ]
+            for rid, scope, pid, clauses, serve, status in rows:
+                conn.execute(text(
+                    "INSERT INTO rules (id, environment_id, scope, prompt_id, priority, clauses, serve, status, comment) "
+                    "VALUES (:id, 'prod', :scope, :pid, 5, CAST(:clauses AS json), CAST(:serve AS json), :status, '')"),
+                    {"id": rid, "scope": scope, "pid": pid, "clauses": clauses, "serve": serve, "status": status})
+        with pytest.raises(RuntimeError) as ei:
+            command.upgrade(cfg, "head")
+        msg = str(ei.value)
+        assert "global-one" in msg and "labelled" in msg, msg          # archived offender still named
+        assert "flag-named-segment" not in msg and "value-is-segment" not in msg, msg
+        assert "DELETE" in msg and "archiving is not enough" in msg
+        with db.engine().begin() as conn:
+            conn.execute(text("DELETE FROM rules WHERE id IN ('global-one', 'labelled')"))
+        command.upgrade(cfg, "head")
+        db.reset_engine()
+        insp = inspect(db.engine())
+        assert "scope" not in {c["name"] for c in insp.get_columns("rules")}
+        with db.engine().connect() as conn:
+            kept = conn.execute(text("SELECT id FROM rules ORDER BY id")).scalars().all()
+        assert kept == ["flag-named-segment", "value-is-segment"]
+    finally:
+        set_settings(saved)
+        db.reset_engine()
+

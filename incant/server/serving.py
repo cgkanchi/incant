@@ -120,9 +120,8 @@ def prompt_spec(
     variables (names, types, required/optional, defaults, descriptions; merged
     across every version targeting can currently serve) and the flags that the
     active rules governing this prompt actually consult (with their enumerable
-    values from eq/in-style clauses). Renderer-
-    scoped, same as render: this describes only what the credential could
-    already observe by rendering."""
+    values from eq/in-style clauses). Renderer-scoped, same as render: this
+    describes only what the credential could already observe by rendering."""
     env = _env(app, environment)
     _require_render(ident, prompt_id, env)
     try:
@@ -130,7 +129,9 @@ def prompt_spec(
     except ServingError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
     default_v = snap.defaults.get(prompt_id)
-    known = snap.versions.get(prompt_id, {})
+    # Archived versions do not serve (§5): they are neither resolvable nor spec inputs.
+    known = {n: vi for n, vi in snap.versions.get(prompt_id, {}).items()
+             if vi.status != "archived"}
     if default_v is None and not known:
         raise HTTPException(404, f"unknown prompt {prompt_id!r} in {env!r} — it has "
                                  "no versions and no default here")
@@ -141,7 +142,7 @@ def prompt_spec(
     candidates: set[int] = set()
     if default_v is not None:
         candidates.add(default_v)
-    flags: dict[str, set] = collect_rule_flags(snap, rules)
+    flags: dict[str, set] = collect_rule_flags(rules)
     for r in rules:
         candidates.add(r.serve.version)
     candidates &= set(known)  # spec only versions that actually exist here
@@ -289,7 +290,8 @@ def list_prompts(
         out.append({
             "prompt_id": pid,
             "description": descriptions.get(pid, ""),
-            "versions": sorted(vers.keys()),
+            # Archived versions do not serve (§5) — a render key cannot target them.
+            "versions": sorted(n for n, vi in vers.items() if vi.status != "archived"),
             "default": default_v,
         })
     return {"environment": env, "prompts": out}

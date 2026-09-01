@@ -346,9 +346,27 @@ def put_test_context(
     return {"ok": True}
 
 
+def _default_diff_sha(app: AppContext, session: Session, environment: str,
+                      prompt_id: str, version: int) -> str:
+    """The commit a version diff means when the caller names no SHA: what the
+    environment serves for that version (its live pointer), else its newest validated
+    commit (the tip) — the two ends of the tip/live gap the diff exists to show."""
+    try:
+        snap = app.get_snapshot(session, environment)
+    except ServingError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+    vinfo = snap.version_info(prompt_id, version)
+    sha = (vinfo.live_sha or vinfo.tip_sha) if vinfo else None
+    if not sha:
+        raise HTTPException(404, f"v{version} of {prompt_id!r} has no commit to compare in "
+                                 f"{environment!r} — pass a sha explicitly")
+    return sha
+
+
 @router.get("/prompts/{prompt_id:path}/diff")
 def diff_versions(
-    prompt_id: str, a_version: int, a_sha: str, b_version: int, b_sha: str,
+    prompt_id: str, a_version: int, b_version: int,
+    a_sha: str | None = None, b_sha: str | None = None,
     mode: str = "source", environment: str = "prod", test_context: str | None = None,
     app: AppContext = Depends(app_context),
     session: Session = Depends(get_session),
@@ -359,6 +377,9 @@ def diff_versions(
     # env-agnostically so an env-scoped project viewer can diff — ANY_ENVIRONMENT keeps the
     # project check and waives just the env dimension.
     _require(ident, "viewer", project=_project_of(prompt_id), environment=ANY_ENVIRONMENT)
+    # SHAs are optional: "compare v2 and v3" means what each serves here (live), else tip.
+    a_sha = a_sha or _default_diff_sha(app, session, environment, prompt_id, a_version)
+    b_sha = b_sha or _default_diff_sha(app, session, environment, prompt_id, b_version)
     if mode == "rendered":
         reg = app.registry(session)
         tcs = reg.get_test_contexts(prompt_id)

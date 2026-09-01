@@ -27,7 +27,7 @@ uv run --project /home/cgkanchi/code/incant incant serve --host 127.0.0.1 --port
 - `uv run incant` must resolve the project — use `--project` when cwd is elsewhere.
 - Admin auth: `Authorization: Bearer incant_sk_dev_admin` — but ONLY with `INCANT_ALLOW_DEV_KEY=1`; without a configured key the server generates one and prints it once at first boot. The UI has NO baked-in key: a fresh browser context lands on the signed-out card — **first-run setup** (create-admin form) when no user accounts exist, email+password otherwise. To sign in with the dev key, click the API-key mode link (`[data-act="signinMode"][data-mode="key"]`), fill `#signinKey`, click `#signinBtn` — exactly what `tests/browser/conftest.signin()` does. Cookies are per-context; a new Playwright context must sign in again unless "Stay signed in for 30 days on this device" (`#signinRemember`) was checked.
 - The client is split across `incant/ui/js/**` (ordered classic scripts listed in `index.html`; `js/main.js` is the router/entry point).
-- Seed data: `support/system` (v2 live by Dana, v3 testing via rules, 2 unpublished edits by Sam), `support/greeting` (v2 committed, never published — the "draft, not live" case), `support/style/language-rules`. `prod` is protected (type-to-confirm on publish/rollback), `staging` is track_tip.
+- Seed data: `support/system` (v2 live by Dana, v3 testing via rules, 2 unpublished edits by Sam), `support/greeting` (v2 committed, never published — the "draft, not live" case), `support/style/language-rules`, `support/escalation/triage`. `prod` is protected (type-to-confirm on publish/rollback), `staging` is track_tip.
 
 ## Drive the UI
 

@@ -22,17 +22,21 @@ def upgrade() -> None:
     # Refuse — loudly, with the offenders — rather than silently rewrite targeting: a
     # rule that still relies on a removed construct must be retired or restated as
     # flag clauses by a human before the schema moves on.
+    # The LIKE patterns match the removed constructs as JSON OBJECT KEYS (`"label":`),
+    # never as values — a flag legitimately NAMED "segment" serialises as
+    # `"flag": "segment"` and must not block the upgrade.
     offenders = conn.execute(sa.text(
         "SELECT id FROM rules WHERE scope = 'global' "
-        "   OR serve::text LIKE '%\"label\"%' OR serve::text LIKE '%\"rollout\"%' "
-        "   OR clauses::text LIKE '%\"segment\"%' ORDER BY id"
+        "   OR serve::text LIKE '%\"label\":%' OR serve::text LIKE '%\"rollout\":%' "
+        "   OR clauses::text LIKE '%\"segment\":%' ORDER BY id"
     )).scalars().all()
     if offenders:
         raise RuntimeError(
             "cannot upgrade to flags-only targeting: these rules use removed features "
             f"(global scope, label/rollout serve targets, or segment conditions): "
-            f"{offenders}. Restate them as prompt-scoped rules with flag clauses, or "
-            "archive them, then rerun the migration.")
+            f"{offenders}. Restate each as a prompt-scoped rule with flag clauses, or "
+            "DELETE it (archiving is not enough — the check reads every row), then rerun "
+            "the migration.")
     op.drop_index(op.f("ix_segments_environment_id"), table_name="segments")
     op.drop_table("segments")
     op.drop_column("versions", "label")

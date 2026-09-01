@@ -247,13 +247,12 @@ class TargetingService:
             # another environment via this env's URL (cross-env capture).
             raise TargetingError(
                 f"rule {rid!r} belongs to environment {existing.environment_id!r}, not {env_id!r}")
-        # Compute the MERGED row first and validate it BEFORE the session is touched: a
-        # caller that catches the TargetingError and carries on in the same session must
-        # not find a half-built rule committed under it.
-        prompt_id = rule.get("prompt_id", existing.prompt_id if existing else None)
-        if not prompt_id:
-            raise TargetingError("a rule requires prompt_id")
-        clauses = rule.get("when", rule.get("clauses"))
+        # Validate the target BEFORE any rule row is written: a caller that catches the
+        # TargetingError and carries on in the same session must not find a half-built
+        # rule committed under it. (parse_core_rule above already guaranteed the shape —
+        # prompt_id present, `when` a valid condition, `serve` a version target.)
+        prompt_id = rule["prompt_id"]
+        clauses = rule.get("when")
         serve = rule["serve"]
         # Integrity: reject targets that reference a non-existent version or an
         # unvalidated pinned SHA before this write bumps rules_version.
@@ -368,7 +367,7 @@ class TargetingService:
         forward-apply the ≤K-1 per-object changes up to and including the target.
         ``None`` only when no revision with that number exists at all.
 
-        Reconstructed states carry ``versions``' tips/labels/status as of the
+        Reconstructed states carry ``versions``' tips/status as of the
         checkpoint — those move without bumping ``rules_version``, the same §9
         caveat class the checkpointed states already document.
         """
@@ -451,13 +450,22 @@ class TargetingService:
                 f"rules_version {to_rules_version} has no exact captured state for {env_id!r}"
             )
 
-        if state.get("segments") or any(
-            r.get("scope") == "global" or set(r.get("serve") or {}) & {"label", "rollout"}
-            for r in state.get("rules", [])
-        ):
+        # The same refusal replay applies (snapshot_from_state): a state that predates
+        # 1.1.0 — segments, or any rule the flags-only parser rejects (global scope,
+        # label/rollout serves, segment clauses) — is never written back as live rules.
+        # Parsing every rule here is what keeps _rollback_rules from storing a condition
+        # build_snapshot would later choke on for the whole environment.
+        why = "it uses segments" if state.get("segments") else None
+        for r in (state.get("rules", []) if why is None else []):
+            try:
+                parse_core_rule(r)
+            except ValueError as exc:
+                why = f"rule {r.get('id')!r}: {exc}"
+                break
+        if why is not None:
             raise TargetingError(
-                f"rules_version {to_rules_version} predates 1.1.0 and uses removed targeting "
-                "features (segments, labels, rollouts or global rules); it cannot be restored")
+                f"rules_version {to_rules_version} cannot be restored — it predates 1.1.0 "
+                f"or uses removed targeting features ({why})")
 
         changed = {"rules": self._rollback_rules(
             env_id, {r["id"]: r for r in state.get("rules", [])})}

@@ -267,7 +267,6 @@ const Actions = {
     localStorage.setItem("incant_tech", State.tech ? "1" : "0");
     render();
   },
-  noop() {},
   closeModal() { closeModal(); },
   // Type-to-confirm inputs (locked-env modals + publish impact modal): enable the target
   // button (data-btn) only on an exact token (data-token) match. One delegated input act
@@ -384,9 +383,6 @@ const Actions = {
       <div class="modal-actions">
         <button class="btn" data-act="closeModal">Cancel</button>
         <button class="btn primary" data-act="newVersion">Create new version</button></div>`);
-  },
-  async edit(ds) {
-    go(`#/p/${enc(State.route.pid)}/draft?v=${ds.v}`);
   },
   // Explicit draft creation from the read-only "start" state: create the draft (the same
   // POST the route used to fire automatically) then deep-link into the live editor.
@@ -754,15 +750,6 @@ const Actions = {
     Actions.play();
   },
   unpin() { window._playPin = null; toast("Pin cleared"); render(); },
-  async toggleSelfReview(ds) {
-    const to = ds.to === "true";
-    try {
-      await PATCH(`/mgmt/projects/${enc(ds.project)}`, { allow_self_review: to });
-      toast(to ? "Self-review allowed for " + ds.project
-               : "Distinct reviewer now required for " + ds.project);
-      render();
-    } catch (e) { toast(errText(e), true); }
-  },
   // ── project settings modal (governance) ──────────────────────────
   projectSettings(ds) { openProjectSettings(ds.project, ds.prompt); },
   async setSelfReview(ds) {
@@ -1329,7 +1316,7 @@ const Actions = {
   async stopTestPublish(ds) {
     const rule = ((_rulesData && _rulesData.rules) || []).find((r) => r.id === ds.id);
     if (!rule) return;
-    const pid = rule.prompt_id, t = serveTarget(rule.serve);
+    const pid = rule.prompt_id, t = serveTarget(rule.serve) || {};
     let dv;
     try { dv = await GET(`/mgmt/prompts/${enc(pid)}/versions?environment=${enc(State.env)}`); }
     catch (e) { return toast(errText(e), true); }

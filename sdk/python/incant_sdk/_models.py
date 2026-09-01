@@ -10,8 +10,8 @@ from typing import Any
 
 @dataclass(frozen=True)
 class RuleMatch:
-    scope: str          # "prompt"
-    id: str
+    scope: str              # "prompt", or "pin" for a pinned replay
+    id: str | None          # None on a pinned replay
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,7 @@ class VersionPin:
 
     version: int
     commit: str         # full 40-char SHA
+    fallback: bool = False   # True iff a previous-live SHA served for this prompt (§10)
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class Var:
     default: Any = None
     description: str = ""
     versions: tuple[int, ...] = ()    # which resolvable versions use it
+    inferred_required: bool = False   # required because the template implies it, not declared
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,8 @@ class Flag:
 
     name: str
     values: tuple[Any, ...] = ()
+    observed: bool = False    # some values come from real traffic (observed flags)
+    suppressed: bool = False  # high-cardinality flag: values deliberately not suggested
 
 
 @dataclass(frozen=True)

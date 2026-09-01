@@ -575,7 +575,7 @@ def test_upsert_rule_rejects_unvalidated_pinned_sha(app):
                 "serve": {"version": 1, "at": "sha", "sha": "deadbeef" * 5}})
 
 
-def test_upsert_rule_rejects_missing_version_in_rollout(app):
+def test_upsert_rule_rejects_removed_rollout_serve(app):
     from incant.targeting.service import TargetingError
 
     _author_version(app, "support/system", 1, "v1 {{ x }}", make_live=False)
@@ -656,3 +656,90 @@ def test_checkpointed_revisions_reconstruct_exactly(app, monkeypatch):
             models.EnvDefault.prompt_id == "support/system")).scalar_one_or_none()
         assert (d.version_number if d else None) == truth["defaults"].get("support/system")
     assert out1.sha  # anchor
+
+
+def test_upsert_rule_requires_prompt_id_even_for_an_existing_rule(app):
+    # No merge-from-stored-row: every upsert states its prompt_id (the HTTP schema
+    # requires it too). A partial payload is refused, not silently completed.
+    _author_version(app, "support/system", 1, "v1 {{ x }}")
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.upsert_rule("prod", {"id": "r1", "prompt_id": "support/system", "priority": 5,
+                                 "when": None, "serve": {"version": 1}})
+        with pytest.raises(TargetingError, match="prompt_id"):
+            tgt.upsert_rule("prod", {"id": "r1", "serve": {"version": 1}})
+        # The removed `clauses` alias is not a back door for unvalidated conditions.
+        with pytest.raises(TargetingError):
+            tgt.upsert_rule("prod", {"id": "r1", "prompt_id": "support/system", "priority": 5,
+                                     "when": {"segment": "beta"}, "serve": {"version": 1}})
+
+
+def _legacy_revision_setup(app):
+    """A revision whose reconstructed state predates 1.1.0: r1's recorded delta is
+    rewritten to a label serve (as a 1.0 deployment would have stored it)."""
+    _author_version(app, "support/system", 1, "v1 {{ x }}")
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.upsert_rule("prod", {"id": "r1", "prompt_id": "support/system", "priority": 5,
+                                 "when": None, "serve": {"version": 1}})
+        legacy_rv = s.get(models.Environment, "prod").rules_version
+        tgt.upsert_rule("prod", {"id": "r2", "prompt_id": "support/system", "priority": 1,
+                                 "when": None, "serve": {"version": 1}})
+    with session_scope() as s:
+        rev = s.execute(select(models.RuleRevision).where(
+            models.RuleRevision.environment_id == "prod",
+            models.RuleRevision.rules_version == legacy_rv)).scalar_one()
+        assert rev.kind == "rule" and rev.state is None          # a delta, not a checkpoint
+        rev.snapshot = {**rev.snapshot, "serve": {"label": "voice"}}
+    return legacy_rv
+
+
+def test_pre_1_1_state_cannot_be_replayed_or_restored(app):
+    legacy_rv = _legacy_revision_setup(app)
+    with session_scope() as s:
+        # Replay (pin.rules_version) → 422 naming the removed construct…
+        with pytest.raises(ServingError) as ei:
+            app.snapshot_at(s, "prod", legacy_rv)
+        assert ei.value.status == 422 and "label" in str(ei.value.detail)
+        # …memoized: a retried bad pin is answered without touching the control plane.
+        assert ("prod", legacy_rv) in app._unreplayable
+        with pytest.raises(ServingError) as ei2:
+            app.snapshot_at(s, "prod", legacy_rv)
+        assert ei2.value.detail == ei.value.detail
+        # Rollback refuses the SAME state for the same reason, and writes nothing.
+        with pytest.raises(TargetingError, match="predates 1.1.0"):
+            app.targeting(s, "op").rollback("prod", legacy_rv)
+    with session_scope() as s:
+        assert s.get(models.Rule, "r2") is not None
+        assert s.get(models.Rule, "r1").serve == {"version": 1}
+
+
+def test_legacy_segment_deltas_poison_the_reconstructed_state(app):
+    # A pre-1.1.0 "segment" revision between a checkpoint and the target survives
+    # forward replay as state["segments"], and both consumers refuse that state.
+    _author_version(app, "support/system", 1, "v1 {{ x }}")
+    with session_scope() as s:
+        tgt = app.targeting(s, "op")
+        tgt.upsert_rule("prod", {"id": "r1", "prompt_id": "support/system", "priority": 5,
+                                 "when": None, "serve": {"version": 1}})
+        env = s.get(models.Environment, "prod")
+        env.rules_version += 1
+        seg_rv = env.rules_version
+        s.add(models.RuleRevision(environment_id="prod", rule_id=None, kind="segment",
+                                  rules_version=seg_rv, actor="legacy",
+                                  snapshot={"name": "beta", "when": {"flag": "b", "op": "eq", "value": True}}))
+    with session_scope() as s:
+        # A later real change moves the env past seg_rv, so seg_rv is a historical replay
+        # (a pin naming the CURRENT rules_version is answered from the live snapshot).
+        app.targeting(s, "op").upsert_rule("prod", {
+            "id": "r2", "prompt_id": "support/system", "priority": 1,
+            "when": None, "serve": {"version": 1}})
+    with session_scope() as s:
+        state = app.targeting(s, "op").state_at("prod", seg_rv)
+        assert state is not None and state["segments"] and state["segments"][0]["name"] == "beta"
+        with pytest.raises(TargetingError, match="segments"):
+            app.targeting(s, "op").rollback("prod", seg_rv)
+        with pytest.raises(ServingError) as ei:
+            app.snapshot_at(s, "prod", seg_rv)
+        assert ei.value.status == 422 and "segments" in str(ei.value.detail)
+

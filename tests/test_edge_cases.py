@@ -1,10 +1,10 @@
 """Lifecycle and serving edge cases — the seams where targeting systems rot.
 
 Each test here pins one behaviour that the coverage audit found either unasserted or
-wrong: what happens when a segment vanishes under a rule, an include cannot resolve,
-one environment's data goes bad, an environment is renamed or deleted, labels collide,
-a rollback names things that no longer exist, or the emergency levers meet the edges of
-the model. Regressions here are the kind that look healthy until production.
+wrong: what happens when an include cannot resolve, one environment's data goes bad, an
+environment is renamed or deleted, a version is archived under a rule, a rollback names
+things that no longer exist, or the emergency levers meet the edges of the model.
+Regressions here are the kind that look healthy until production.
 """
 
 from __future__ import annotations
@@ -376,4 +376,48 @@ def test_pins_and_replays_do_not_bypass_the_kill_switch(client):
     r = client.post(f"/prompt/{PID}", headers=auth(client.renderer_key),
                     json={**body, "pin": {"versions": {PID: entry}}})
     assert r.status_code == 200 and r.json()["versions"][PID]["commit"] == entry["commit"]
+
+
+# ── archived versions are not advertised as renderable ─────────────────
+
+def test_archived_versions_are_hidden_from_discovery_and_diff_defaults(client):
+    # Archive v3 (targeted by no default) — it must vanish from what a render key can
+    # target, and from the spec's resolvable set, even while a rule still names it.
+    assert client.post("/mgmt/envs/prod/rules", json={
+        "id": "to-v3", "prompt_id": PID, "priority": 1,
+        "when": {"flag": "tier", "op": "eq", "value": "vip"}, "serve": {"version": 3}},
+        headers=auth()).status_code == 200
+    r = client.patch(f"/mgmt/prompts/{PID}/versions/3", json={"status": "archived"}, headers=auth())
+    assert r.status_code == 200, r.text
+    listing = client.get("/prompts?environment=prod", headers=auth(client.renderer_key)).json()
+    system = next(p for p in listing["prompts"] if p["prompt_id"] == PID)
+    assert 3 not in system["versions"] and 2 in system["versions"]
+    spec = client.get(f"/prompt/{PID}/spec", headers=auth(client.renderer_key)).json()
+    assert 3 not in spec["resolvable_versions"] and 2 in spec["resolvable_versions"]
+    # Diff without shas defaults each side to live-else-tip and works for any version.
+    r = client.get(f"/mgmt/prompts/{PID}/diff?a_version=2&b_version=3&environment=prod", headers=auth())
+    assert r.status_code == 200 and r.json()["left"] != r.json()["right"], r.text
+    r = client.get(f"/mgmt/prompts/{PID}/diff?a_version=2&b_version=9&environment=prod", headers=auth())
+    assert r.status_code == 404 and "no commit to compare" in r.text
+
+
+# ── malformed and pre-1.1.0 payloads are 422s with a reason, never 500s ─────────
+
+def test_malformed_rule_payloads_are_422_not_500(client):
+    base = {"id": "bad", "prompt_id": PID, "priority": 1}
+    for serve in ({"version": None}, {"version": "3"}, {"version": [1]}, {"version": True}):
+        r = client.post("/mgmt/envs/prod/rules", json={**base, "serve": serve}, headers=auth())
+        assert r.status_code == 422, (serve, r.status_code, r.text)
+        assert "positive integer" in r.text
+    r = client.post("/mgmt/envs/prod/rules", json={**base, "serve": {}}, headers=auth())
+    assert r.status_code == 422 and "must name a version" in r.text
+    r = client.post("/mgmt/envs/prod/rules", json=base, headers=auth())     # no serve at all
+    assert r.status_code == 422
+
+
+def test_version_label_is_refused_with_reason(client):
+    r = client.patch(f"/mgmt/prompts/{PID}/versions/2", json={"label": "voice"}, headers=auth())
+    assert r.status_code == 422 and "labels were removed in 1.1.0" in r.text, r.text
+    r = client.patch(f"/mgmt/prompts/{PID}/versions/2", json={"notes": "still fine"}, headers=auth())
+    assert r.status_code == 200, r.text
 

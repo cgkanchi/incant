@@ -101,7 +101,7 @@ def _collect(cond: Condition, out: dict[str, set]) -> None:
         _collect(cond.of, out)
 
 
-def collect_rule_flags(snap: EnvSnapshot, rules: Iterable[Rule]) -> dict[str, set]:
+def collect_rule_flags(rules: Iterable[Rule]) -> dict[str, set]:
     """Flag names the given rules consult → the enumerable values their clauses name."""
     flags: dict[str, set] = {}
     for r in rules:

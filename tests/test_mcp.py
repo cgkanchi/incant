@@ -56,6 +56,10 @@ def test_discovery_tools(mcp):
 
     rules = call(mcp, "list_rules", environment="prod")
     assert "beta-gets-v3" in {r["id"] for r in rules["rules"]}
+    # diff without shas: each side defaults to what prod serves (live) else the tip.
+    d = call(mcp, "diff_versions", prompt_id="support/system", a_version=2, b_version=3,
+             environment="prod")
+    assert d["mode"] == "source" and d["diff"] and d["left"] != d["right"]
 
     envs = call(mcp, "list_environments")
     assert {e["id"]: e["protected"] for e in envs["environments"]}["prod"] is True

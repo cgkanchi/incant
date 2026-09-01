@@ -84,10 +84,10 @@ def get_rules(
     if e is None:
         raise HTTPException(404, f"unknown environment {env!r}")
 
-    def _in_project(prompt_id: str | None) -> bool:
-        # A prompt-scoped row belongs to `project` when its prompt id's leading segment
-        # (the same split _project_of uses) is that project. None never matches.
-        return bool(prompt_id) and _project_of(prompt_id) == project
+    def _in_project(prompt_id: str) -> bool:
+        # A row belongs to `project` when its prompt id's leading path segment (the same
+        # split _project_of uses) is that project.
+        return _project_of(prompt_id) == project
 
     # §7 "skipped, counted, surfaced in the UI": the eval-time skip only shows up in
     # metrics when a request actually hits the rule, so the console does the static
@@ -486,7 +486,7 @@ def list_observed_flags(
     }
     try:
         snap = app.get_snapshot(session, env)
-        in_rules = set(collect_rule_flags(snap, all_rules(snap)))
+        in_rules = set(collect_rule_flags(all_rules(snap)))
     except Exception:  # a degraded environment still lists what traffic saw
         in_rules = set()
     names = sorted(set(observed) | set(suppressed) | in_rules)
@@ -545,7 +545,7 @@ def observed_flag_values(
     # Rule-named values for this flag (the zero-traffic baseline), merged by value.
     try:
         snap = app.get_snapshot(session, env)
-        rule_vals = collect_rule_flags(snap, all_rules(snap)).get(flag, set())
+        rule_vals = collect_rule_flags(all_rules(snap)).get(flag, set())
     except Exception:
         rule_vals = set()
     by_value = {(r["value_type"], str(r["value"])): r for r in values}

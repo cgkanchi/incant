@@ -112,7 +112,8 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
     @mcp.tool(annotations=READ)
     def get_targeting_history(environment: str | None = None, limit: int = 50) -> dict:
         """The environment's targeting change log (rules_version timeline): every
-        rule/default/kill/pointer change with author and comment. Feed a
+        rule/default/kill/pointer/version-status change (plus baseline and rollback
+        anchors) with `actor` and `comment`. Feed a
         listed rules_version to rollback_targeting to restore that exact state."""
         try:
             return api.get(f"/mgmt/envs/{api.env(environment)}/revisions", limit=limit)
@@ -180,9 +181,11 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
                       a_sha: str | None = None, b_sha: str | None = None,
                       mode: str = "source", test_context: str | None = None,
                       environment: str | None = None) -> dict:
-        """Compare two versions (or two commits of one version, via a_sha/b_sha).
-        mode='source' diffs the templates; mode='rendered' diffs what a test
-        context actually produces — the diff that matters before publishing."""
+        """Compare two versions. Without a_sha/b_sha each side is what the environment
+        serves for that version (its live pointer), else its newest validated commit;
+        pass shas to compare exact commits (e.g. tip vs live of one version).
+        mode='source' diffs the templates; mode='rendered' diffs what a test context
+        actually produces — the diff that matters before publishing."""
         try:
             return api.get(f"/mgmt/prompts/{prompt_id}/diff",
                            a_version=a_version, b_version=b_version,
@@ -306,7 +309,8 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
         """Prompt/version metadata. action=
         'version' (version + notes/status — status 'archived' retires a version:
           it stops serving, and new drafts/rules for it are refused; 'active'
-          brings it back),
+          brings it back; archiving an environment's DEFAULT version is refused
+          with 409 — point the default elsewhere first),
         'refine' (version + name [+ type/required/default/description] — record
           what a template variable means),
         'test_context' (name + flags/variables — save a named who-and-what for
@@ -380,7 +384,8 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
     @mcp.tool(annotations=WRITE)
     def upsert_rule(rule: dict, environment: str | None = None) -> dict:
         """Create or update a targeting rule. Shape: {id, prompt_id, priority,
-        when: <condition>, serve: {version, at: 'live'|'tip'}, comment}. Conditions:
+        when: <condition>, serve: {version, at: 'live'|'tip'|'sha' [, sha]},
+        status: 'active'|'paused'|'archived', comment}. Conditions:
         {flag, op, value|values} or {all|any: [...]} / {not: ...}. Rules are
         prompt-scoped and serve one version of that prompt; who is in a cohort (a
         beta, a percentage) is a flag the caller's system sets and sends. The

@@ -91,7 +91,8 @@ def parse_render(data: dict) -> RenderResult:
         prompt_id=data["prompt_id"],
         environment=data["environment"],
         matched_rule=_match(data["matched_rule"]),
-        versions={pid: VersionPin(version=v["version"], commit=v["commit"])
+        versions={pid: VersionPin(version=v["version"], commit=v["commit"],
+                                  fallback=bool(v.get("fallback")))
                   for pid, v in data["versions"].items()},
         rules_version=data["rules_version"],
         stale_rules=bool(data.get("stale_rules")),
@@ -137,10 +138,12 @@ def parse_spec(data: dict) -> PromptSpec:
             Var(name=v["name"], type=v.get("type") or "string",
                 required=bool(v.get("required")), default=v.get("default"),
                 description=v.get("description") or "",
-                versions=tuple(v.get("versions", [])))
+                versions=tuple(v.get("versions", [])),
+                inferred_required=bool(v.get("inferred_required")))
             for v in data.get("variables", [])),
         flags=tuple(
-            Flag(name=f["name"], values=tuple(f.get("values", [])))
+            Flag(name=f["name"], values=tuple(f.get("values", [])),
+                 observed=bool(f.get("observed")), suppressed=bool(f.get("suppressed")))
             for f in data.get("flags", [])),
         includes=tuple(data.get("includes", [])),
         raw=data,

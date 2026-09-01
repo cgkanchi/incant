@@ -22,7 +22,8 @@ r = client.render(
 )
 r.text            # the rendered prompt (str(r) works too)
 r.version, r.sha  # exactly what was served
-r.matched_rule    # "default" or RuleMatch(scope="prompt", id="beta-gets-v3")
+r.matched_rule    # "default", RuleMatch(scope="prompt", id="beta-gets-v3"), or
+                  #   RuleMatch(scope="pin", id=None) on a pinned replay
 ```
 
 ## Reproduce exactly

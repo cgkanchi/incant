@@ -244,10 +244,6 @@ function _roleOpts(sel) {
   return (State._access?.roles || []).map((r) =>
     `<option value="${esc(r)}"${r === sel ? " selected" : ""}>${esc(r)}</option>`).join("");
 }
-function _projectOpts() {
-  return '<option value="">— all projects —</option>' +
-    (State._access?.projects || []).map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join("");
-}
 function _envOpts() {
   return '<option value="">— all environments —</option>' +
     (State._access?.environments || []).map((e) => `<option value="${esc(e)}">${esc(e)}</option>`).join("");
@@ -328,8 +324,9 @@ async function screenEnvironments() {
 }
 
 function renderPlayResult(r, pinned) {
-  const matched = typeof r.matched_rule === "string"
-    ? r.matched_rule : `${r.matched_rule.scope}:${r.matched_rule.id}`;
+  const matched = typeof r.matched_rule === "string" ? r.matched_rule
+    : r.matched_rule.scope === "pin" ? "pinned replay (no rule evaluated)"
+    : `rule ${r.matched_rule.id}`;
   const versLines = Object.entries(r.versions).map(([k, v]) =>
     `${esc(k)} → v${v.version} · ${esc(String(v.commit).slice(0, 7))}${v.fallback ? " (fallback)" : ""}`).join("<br>");
   // Warnings stay visible; the matched rule, rules_version and resolved versions

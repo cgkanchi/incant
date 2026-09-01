@@ -119,3 +119,14 @@ def test_rule_without_prompt_is_rejected(client):
                     json={"id": "g", "scope": "global", "priority": 5, "serve": {"version": 2}},
                     headers=auth())
     assert r.status_code == 422
+    # Even WITH a prompt_id, `scope: global` is refused with the reason — never silently
+    # accepted as a prompt rule (an agent on stale instructions must hear why).
+    r = client.post(f"/mgmt/envs/{ENV}/rules",
+                    json={"id": "g2", "scope": "global", "prompt_id": A_PROMPT, "priority": 5,
+                          "serve": {"version": 2}}, headers=auth())
+    assert r.status_code == 422 and "removed in 1.1.0" in r.text, r.text
+    # `scope: prompt` (pre-1.1.0 payloads) is tolerated.
+    r = client.post(f"/mgmt/envs/{ENV}/rules",
+                    json={"id": "g3", "scope": "prompt", "prompt_id": A_PROMPT, "priority": 5,
+                          "serve": {"version": 2}}, headers=auth())
+    assert r.status_code == 200, r.text

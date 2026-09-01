@@ -83,6 +83,17 @@ class CreatePromptRequest(BaseModel):
 class VersionUpdateRequest(BaseModel):
     notes: Optional[str] = None
     status: Optional[Literal["active", "archived"]] = None
+    # Pre-1.1.0 clients set version labels here. Refuse with the reason rather than
+    # silently ignoring the field (pydantic's default would drop it and return 200).
+    label: Optional[str] = None
+
+    @field_validator("label")
+    @classmethod
+    def _label_removed(cls, value):
+        if value is None:
+            return None
+        raise ValueError("version labels were removed in 1.1.0 — rules and pins name "
+                         "versions by number")
 
 
 class CreateDraftRequest(BaseModel):
@@ -165,6 +176,18 @@ class RuleRequest(BaseModel):
     serve: dict[str, Any]
     status: Literal["active", "paused", "archived"] = "active"
     comment: str = ""
+    # Pre-1.1.0 payloads carried `scope`. "prompt" is tolerated (it is the only shape
+    # left); "global" must fail LOUDLY with the reason, not be silently ignored into a
+    # prompt-scoped rule — the one thing an agent working from stale instructions needs.
+    scope: Optional[str] = None
+
+    @field_validator("scope")
+    @classmethod
+    def _scope_removed(cls, value):
+        if value is None or value == "prompt":
+            return None
+        raise ValueError("global rules were removed in 1.1.0 — rules are scoped to one prompt "
+                         "(drop `scope`; set prompt_id)")
 
     @field_validator("when")
     @classmethod
@@ -179,13 +202,12 @@ class RuleRequest(BaseModel):
         return value
 
 
-
 class RuleBatchRequest(BaseModel):
     # A set of rule upserts applied as ONE atomic act (composer priority-shift plan, or a
     # two-rule reorder swap). Each element is the exact shape the single upsert takes; the
     # whole batch lands in one request/transaction so a mid-sequence failure can't leave
     # rules at colliding/half-applied priorities (DESIGN.md §7).
-    rules: list[RuleRequest]
+    rules: list[RuleRequest] = Field(max_length=200)
 
 
 class RuleStatusRequest(BaseModel):

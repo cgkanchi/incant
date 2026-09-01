@@ -39,6 +39,24 @@ unified, cleaner audience/content abstraction is planned for v1.5/v2.
   value; `upsert_rule` validates before touching the session; semver comparison drops
   `+build` metadata.
 
+- `GET /mgmt/prompts/{id}/diff` no longer requires `a_sha`/`b_sha`: each side defaults
+  to what the environment serves for that version (its live pointer), else its tip. The
+  MCP `diff_versions` tool now works as documented without shas.
+- `GET /prompts` and `GET /prompt/{id}/spec` omit archived versions — they cannot serve.
+- Removed fields fail loudly instead of being silently dropped: `scope: "global"` on a
+  rule and `label` on a version PATCH both return 422 with the reason; `scope: "prompt"`
+  is still tolerated. Malformed rule shapes (`"version": null`, a missing `serve`) are
+  422s, not 500s. Rule batches are capped at 200 upserts.
+- The migration guard matches removed constructs as JSON keys only — a flag literally
+  named `segment` does not block the upgrade — and its remediation advice is accurate
+  (offending rules must be restated or deleted; archiving does not clear the check).
+- Rollback runs the flags-only parser over every rule it would restore, refusing exactly
+  the states replay refuses; a refused replay is memoized so a retried bad pin costs no
+  control-plane queries.
+- SDK: `RuleMatch.id` is `None` on a pinned replay; `VersionPin.fallback`,
+  `Var.inferred_required`, `Flag.observed`/`suppressed` are surfaced; `incant-mcp`
+  requires `incant-sdk>=1.1`.
+
 ## 1.0.0 — 2026-08-31
 
 First stable release.

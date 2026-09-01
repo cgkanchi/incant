@@ -83,7 +83,8 @@ def parse_serve(data: dict[str, Any]) -> Serve:
         raise ValueError("serve target must name a version")
     if set(data) - {"version", "at", "sha"}:
         raise ValueError(f"unknown version target fields: {sorted(set(data) - {'version', 'at', 'sha'})!r}")
-    if isinstance(data["version"], bool) or int(data["version"]) < 1:
+    version = data.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise ValueError("serve version must be a positive integer")
     at = data.get("at", "live")
     if at not in _AT_VALUES:
@@ -93,7 +94,7 @@ def parse_serve(data: dict[str, Any]) -> Serve:
         raise ValueError("a SHA-pinned target requires a full 40-character lowercase SHA")
     if at != "sha" and sha is not None:
         raise ValueError("sha is only valid when at='sha'")
-    return ServeVersion(version=int(data["version"]), at=at, sha=sha)
+    return ServeVersion(version=version, at=at, sha=sha)
 
 
 def parse_rule(data: dict[str, Any]) -> Rule:
@@ -103,7 +104,7 @@ def parse_rule(data: dict[str, Any]) -> Rule:
     if not isinstance(rid, str) or not rid.strip() or len(rid) > 255:
         raise ValueError("rule id must be a non-empty string of at most 255 characters")
     # Pre-1.1.0 payloads/states carry `scope`; "prompt" is the only shape that survives.
-    if data.get("scope", "prompt") != "prompt":
+    if data.get("scope") not in (None, "prompt"):
         raise ValueError("global rules were removed in 1.1.0 — rules are scoped to one prompt")
     status = data.get("status", "active")
     if status not in _RULE_STATUSES:
@@ -111,15 +112,15 @@ def parse_rule(data: dict[str, Any]) -> Rule:
     prompt_id = data.get("prompt_id")
     if not isinstance(prompt_id, str) or not prompt_id.strip():
         raise ValueError("a rule requires prompt_id")
-    priority = int(data.get("priority", 0))
-    if not 0 <= priority <= 1_000_000:
-        raise ValueError("rule priority must be between 0 and 1000000")
+    priority = data.get("priority", 0)
+    if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 1_000_000:
+        raise ValueError("rule priority must be an integer between 0 and 1000000")
     return Rule(
         id=rid.strip(),
         prompt_id=prompt_id.strip(),
         priority=priority,
         when=parse_condition(data.get("when")),
-        serve=parse_serve(data["serve"]),
+        serve=parse_serve(data.get("serve")),
         status=status,
         comment=data.get("comment", ""),
     )

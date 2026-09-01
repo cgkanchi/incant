@@ -98,6 +98,10 @@ class AppContext:
     # Immutable once built (a revision's state never changes), so never invalidated.
     _historical: "OrderedDict[tuple[str, int], EnvSnapshot]" = field(
         default_factory=OrderedDict)
+    # Revisions whose recorded state can never be replayed (pre-1.1.0 shapes). A
+    # revision's state is immutable, so the refusal is too — memoized (LRU-bounded)
+    # so a renderer retrying a known-bad pin costs no control-plane queries.
+    _unreplayable: "OrderedDict[tuple[str, int], str]" = field(default_factory=OrderedDict)
     # DB health as last observed by the background poll (refresh_control_plane), NOT by
     # any request — the serving hot path never touches the DB to learn this. False means
     # the poller last saw an outage, so warm snapshots are served frozen (§10 "rules
@@ -306,6 +310,9 @@ class AppContext:
         if hit is not None:
             self._historical.move_to_end(key)
             return hit
+        refused = self._unreplayable.get(key)
+        if refused is not None:
+            raise ServingError(422, refused)
         try:
             state = self.targeting(session).state_at(env_id, rules_version)
         except SQLAlchemyError:
@@ -321,11 +328,12 @@ class AppContext:
         try:
             snap = snapshot_from_state(state, env_id, rules_version, current.servable)
         except ValueError as exc:
-            raise ServingError(
-                422,
-                f"rules_version {rules_version} of {env_id!r} cannot be replayed: {exc}; "
-                "replay with pin.versions instead — the response's versions map is SHA-exact",
-            )
+            msg = (f"rules_version {rules_version} of {env_id!r} cannot be replayed: {exc}; "
+                   "replay with pin.versions instead — the response's versions map is SHA-exact")
+            self._unreplayable[key] = msg
+            if len(self._unreplayable) > _HISTORICAL_CACHE_MAX:
+                self._unreplayable.popitem(last=False)
+            raise ServingError(422, msg)
         # Variable defaults ride along from the live snapshot: refinements are
         # authoring metadata, not targeting state (documented replay semantics).
         snap.refinement_defaults = current.refinement_defaults

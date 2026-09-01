@@ -2,7 +2,7 @@
 
 A prompt management platform for **non-devs to author, target, test, and develop
 prompts** and for **devs and agents to consume them** — the LaunchDarkly parallel: PMs
-define and ramp, services render. **Git** for content (with an opinionated structure on
+define and target, services render. **Git** for content (with an opinionated structure on
 top), **Jinja2** for rendering, **flag-based targeting** for who sees what.
 
 Three planes:
@@ -151,7 +151,8 @@ support/                        # project
 │   ├── v2.j2
 │   └── v3.j2
 ├── greeting/
-│   └── v1.j2
+│   ├── v1.j2
+│   └── v2.j2                   # committed, never published — exists, serves nowhere
 └── escalation/
     └── triage/                 # prompt: support/escalation/triage
         └── v1.j2
@@ -183,9 +184,9 @@ Any prompt includes any other by id:
 
 The include resolves **through the targeting engine, with the same flag context, in the
 same environment**: rules targeting the fragment pick its version, the live pointer
-picks the commit; no rule → the environment's default. "Roll out the new style rules to
-10% of enterprise" is targeting on the fragment prompt — every consumer follows,
-coherently, with no consumer edited.
+picks the commit; no rule → the environment's default. "Show the new style rules to the
+enterprise beta" is one rule on the fragment prompt — every consumer follows, coherently,
+with no consumer edited.
 
 - Any prompt may include any other in the deployment (RBAC governs who can *edit*, not who can include). Sharing fragments across deployments is deliberately not a feature — teams that share style share a deployment.
 - **Cycles:** validation-time static check over the include graph at current defaults,
@@ -233,7 +234,7 @@ pointer-class change: audited, optionally approval-gated (§7).
 
 **Tweak a live version** (req 3+4, the canonical scenario): edit `v2.j2` → review →
 commit. Prod's live pointer for v2 still pins the old SHA — nothing changed in serving.
-Now: rule "team X → `v2@tip`" → test → widen (`v2@tip` at 10%, 50%) → **make live**
+Now: rule "team X → `v2@tip`" → test → widen (the beta flag, then everyone) → **make live**
 (advance prod's v2 pointer to the new SHA) → delete the rule. The tip/live gap *is* the
 testing window.
 
@@ -344,7 +345,7 @@ system. A unified audience/content abstraction is planned for a later release.
     {"flag": "tier", "op": "in", "values": ["enterprise", "pro"]}
   ]},
   "serve": {"version": 3},           // at its live pointer; {"version": 3, "at": "tip"}
-                                     //   for the testing flow; {"at": "sha", "sha": …} to pin
+                                     //   for the testing flow; {"version": 3, "at": "sha", "sha": …} to pin
   "status": "active",                // active | paused | archived
   "comment": "Voice v2 beta — EXP-142"
 }
@@ -489,7 +490,8 @@ POST /prompt/{prompt_id}
   "variables":   {"customer_name": "Acme", "history": []},
   "environment": "prod",             // optional; defaults to the instance default env
   "pin": {                           // optional; exact replay of a historical render
-    "versions": {"support/system": "v2@8c1f2ab", "support/style/language-rules": "v1@2fe9c1a"},
+    "versions": {"support/system": {"version": 2, "commit": "8c1f2ab…"},   // full 40-char SHAs
+                 "support/style/language-rules": {"version": 1, "commit": "2fe9c1a…"}},
     "rules_version": 4172            // alternative: pin targeting state instead
   }
 }
@@ -500,7 +502,8 @@ POST /prompt/{prompt_id}
 {
   "prompt": "You are a friendly support agent for Acme...",
   "prompt_id": "support/system",
-  "matched_rule": {"scope": "prompt", "id": "voice-v2-beta"},   // or "default"
+  "matched_rule": {"scope": "prompt", "id": "voice-v2-beta"},   // "default" when no rule matched;
+                                                                //   {"scope": "pin", "id": null} on a pinned replay
   "versions": {                      // every prompt that contributed content, resolved
     "support/system": {"version": 2, "commit": "8c1f2ab"},
     "support/style/language-rules": {"version": 1, "commit": "2fe9c1a"}

@@ -302,7 +302,7 @@ def test_composer_suggests_flags_and_observed_values(server, page, bearer):
     page.click("text=/^Create rule$/")
     page.wait_for_timeout(1200)
     assert "Gold tier via suggestion" in page.inner_text("#main")
-    rules = bearer("GET", "/mgmt/envs/prod/rules?prompt_id=support%2Fsystem")["rules"]
+    rules = bearer("GET", "/mgmt/envs/prod/rules")["rules"]
     mine = next(r for r in rules if r.get("comment") == "Gold tier via suggestion")
     assert mine["when"] == {"flag": "tier", "op": "eq", "value": "gold"}, mine["when"]
 

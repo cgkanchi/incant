@@ -242,7 +242,6 @@ function composerVersionHtml(co) {
       ? "Serves the newest edits on this version — how you try changes before publishing them for everyone."
       : "Serves what's live now for this version."}</div></div>`;
 }
-function composerServeHtml(co) { return composerVersionHtml(co); }
 function slotOptions(co) {
   const active = activeOrderedRules(co.rules, co.editing ? co.origId : null);
   const nameOf = (r) => r.comment || r.id;
@@ -281,7 +280,7 @@ function composerBodyHtml(co) {
     <h3>${co.editing ? "Edit rule" : "New rule"}</h3>
     ${co.err ? `<div class="banner danger" style="margin:6px 0 14px"><span style="font-size:12.5px;font-weight:600">${esc(co.err)}</span></div>` : ""}
     <div class="cmp-sec"><div class="cmp-h">People who match…</div>${cbHtml(co.cb, "co")}</div>
-    <div class="cmp-sec"><div class="cmp-h">…should see</div>${composerServeHtml(co)}</div>
+    <div class="cmp-sec"><div class="cmp-h">…should see</div>${composerVersionHtml(co)}</div>
     <div class="cmp-sec"><div class="cmp-h">Position</div>
       <div class="cmp-pos"><span class="muted" style="font-size:12.5px">Checked</span>
         <select class="cb-sel" id="co-slot" data-act="cbPos">${slotOptions(co)}</select></div>
@@ -315,7 +314,7 @@ function buildComposerState({ rule, duplicate, targetPid, rulesData, versions })
     comment: rule ? (rule.comment || "") : "",
     cb: newCb(rule ? rule.when : null),
     versions: versions || [],
-    rules: rulesData.rules || [], defaults: rulesData.defaults || {}, protected: !!rulesData.protected,
+    rules: rulesData.rules || [], defaults: rulesData.defaults || {},
     err: "",
   };
   Object.assign(co, serveToComposer(rule ? rule.serve : null, versions, targetPid, co.defaults));

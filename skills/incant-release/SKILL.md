@@ -46,7 +46,7 @@ act → verify, with hard confirmation gates.
    against a real test context — "what people get now" vs "after". Source
    diffs justify a commit; rendered diffs justify a release.
 4. **Present the plan and stop.** Environment, prompt, exact sha to publish,
-   who's affected (everyone? a cohort? N%?), which rules are added/archived,
+   who's affected (everyone? a flag-defined cohort?), which rules are added/archived,
    whether the default moves, and the rollback path ("revert to `<sha>` via
    rollback_pointer"). **Wait for explicit confirmation.** For a protected
    environment, say so: the action will require echoing the prompt id (or env

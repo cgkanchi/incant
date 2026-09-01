@@ -61,7 +61,9 @@ def test_prompts_lists_the_library(client):
     assert {"support/system", "support/greeting",
             "support/style/language-rules"} <= ids
     system = next(p for p in client.prompts() if p.id == "support/system")
-    assert system.default_version == 2 and set(system.versions) >= {1, 2, 3}
+    # v1 is archived in the seed: archived versions cannot serve, so a render key
+    # never sees them listed.
+    assert system.default_version == 2 and set(system.versions) == {2, 3}
 
 
 def test_renderer_key_can_discover(renderer_client):
@@ -114,6 +116,10 @@ def test_pin_replays_exactly(renderer_client):
     replay = renderer_client.render("support/system", **args, pin=first.pin)
     assert replay.text == first.text
     assert replay.versions == first.versions
+    # A pinned replay bypasses targeting: the match reports the pin, not a rule.
+    from incant_sdk import RuleMatch
+    assert replay.matched_rule == RuleMatch(scope="pin", id=None)
+    assert first.matched_rule == RuleMatch(scope="prompt", id="beta-gets-v3")
 
 
 def test_evaluate_and_evaluate_all(renderer_client):
