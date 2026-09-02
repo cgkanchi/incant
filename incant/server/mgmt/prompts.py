@@ -310,8 +310,13 @@ def put_variable(
 ):
     _require(ident, "editor", project=_project_of(prompt_id))
     reg = app.registry(session, ident.name)
-    reg.set_refinement(prompt_id, version, req.name, type=req.type,
-                       required=req.required, default=req.default, description=req.description)
+    try:
+        reg.set_refinement(prompt_id, version, req.name, type=req.type,
+                           required=req.required, default=req.default, description=req.description)
+    except RegistryError as exc:
+        # The prompt or that version does not exist — a typo must 404, not 500 or a
+        # dormant refinement that activates if the version is created later.
+        raise HTTPException(404, str(exc))
     app.invalidate_after_commit(session)  # optional-var defaults are folded into snapshots
     return {"ok": True, "variables": _effective_variables(app, session, prompt_id, version)}
 
@@ -342,7 +347,10 @@ def put_test_context(
 ):
     _require(ident, "editor", project=_project_of(prompt_id))
     reg = app.registry(session, ident.name)
-    reg.set_test_context(prompt_id, req.name, req.flags, req.variables)
+    try:
+        reg.set_test_context(prompt_id, req.name, req.flags, req.variables)
+    except RegistryError as exc:
+        raise HTTPException(404, str(exc))
     return {"ok": True}
 
 

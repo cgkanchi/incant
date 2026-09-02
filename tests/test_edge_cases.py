@@ -421,3 +421,21 @@ def test_version_label_is_refused_with_reason(client):
     r = client.patch(f"/mgmt/prompts/{PID}/versions/2", json={"notes": "still fine"}, headers=auth())
     assert r.status_code == 200, r.text
 
+
+def test_existence_guard_routes_return_404_not_500(client):
+    # The refinement/test-context/kill routes map the service-level existence guards
+    # to 404 for an unknown prompt/version, rather than surfacing a raw 500.
+    r = client.put("/mgmt/prompts/support/ghost/variables/1",
+                   json={"name": "x", "type": "string"}, headers=auth())
+    assert r.status_code == 404, r.text
+    r = client.put("/mgmt/prompts/support/ghost/test-contexts",
+                   json={"name": "c", "flags": {}, "variables": {}}, headers=auth())
+    assert r.status_code == 404, r.text
+    r = client.post("/mgmt/envs/prod/kill", json={"engaged": True},
+                    params={"prompt_id": "support/ghost"}, headers=auth())
+    assert r.status_code == 404, r.text
+    # A refinement on a real prompt but a nonexistent version is also 404.
+    r = client.put(f"/mgmt/prompts/{PID}/variables/999",
+                   json={"name": "x", "type": "string"}, headers=auth())
+    assert r.status_code == 404, r.text
+

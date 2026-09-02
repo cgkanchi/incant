@@ -473,7 +473,11 @@ def kill_switch(
 ):
     _require(ident, "operator", project=_project_of(prompt_id), environment=env)
     tgt = app.targeting(session, ident.name)
-    tgt.set_kill(env, prompt_id, req.engaged)
+    try:
+        tgt.set_kill(env, prompt_id, req.engaged)
+    except TargetingError as exc:
+        # Killing a prompt that doesn't exist is a typo, not a 500 — refuse with 404.
+        raise HTTPException(404, str(exc))
     app.invalidate_after_commit(session, env)
     return {"ok": True, "engaged": req.engaged}
 
