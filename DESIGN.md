@@ -576,7 +576,11 @@ Pin semantics, precisely:
   replay would be a lie — they 409 instead), and never serve a **killed** prompt: a
   pin naming a currently killed prompt — or a `rules_version` replay of one — is
   refused (409, `error: "killed"`). The kill switch beats reproducibility exactly
-  as validation does; the unpinned path degrades to the environment default.
+  as validation does; the unpinned path degrades to the environment default. Like
+  the kill switch, §5 servability (and variable defaults) are judged against
+  **current** state on every replay: the reconstructed targeting is immutable and
+  memoized, but the validated-commit predicate attaches fresh each time — a SHA
+  validated after a replay was first cached serves rather than 409ing.
 - Unknown pin fields are refused (422), never silently ignored.
 - Both together are allowed: `versions` entries win per prompt.
 
@@ -609,7 +613,13 @@ A node's own writes never empty its snapshot cache: after the transaction commit
 rebuilds the affected snapshots in place (built fully, then swapped), so the next
 request is still a memory hit — the freeze posture below holds through the write
 itself; every other node converges on its next poll (`rules_version` /
-`content_version`, §7).
+`content_version`, §7). The swap never moves a snapshot backward: a poll pass planned
+from an older DB read yields to whatever a concurrent write already installed.
+Environment rows also carry an immutable **incarnation**, minted at creation and
+re-minted on rename — the version counters restart when an id is deleted and
+recreated, so nodes compare row identity, not just counters, and drop the dead
+snapshot (replay memos included) instead of mistaking the new environment for the
+cached one.
 
 | Failure | Behavior |
 |---|---|

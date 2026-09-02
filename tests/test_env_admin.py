@@ -226,6 +226,28 @@ def test_rename_moves_all_rows_preserves_version_and_authz(client):
     assert client.get("/mgmt/envs/staging/rules", headers=auth(old_key)).status_code == 403
 
 
+def test_rename_copies_content_version_and_mints_a_new_incarnation(client):
+    client.post("/mgmt/envs", json={"id": "relabel"}, headers=auth())
+    # A distinctive content_version: the old tuple-unpack dropped it, silently
+    # resetting content freshness to 1 for every node polling the renamed env.
+    with session_scope() as s:
+        row = s.get(models.Environment, "relabel")
+        row.content_version = 9
+        old_incarnation = row.incarnation
+
+    r = client.post("/mgmt/envs/relabel/rename", json={"new_id": "relabelled"},
+                    headers=auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["content_version"] == 9
+
+    with session_scope() as s:
+        row = s.get(models.Environment, "relabelled")
+        # The freshness key survives the rename; the cache identity deliberately
+        # does not — a rename is a new environment to every node's snapshot cache.
+        assert row.content_version == 9
+        assert row.incarnation and row.incarnation != old_incarnation
+
+
 # ── GET /mgmt/envs default marker ─────────────────────────────────────
 
 def test_list_envs_marks_exactly_one_default(client):

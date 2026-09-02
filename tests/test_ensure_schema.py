@@ -34,7 +34,8 @@ class FakeInspector:
         # don't have to spell them out; pass explicitly to model an older schema.
         self._columns = columns if columns is not None else {
             "rule_revisions": [{"name": "state"}],
-            "environments": [{"name": "content_version"}],
+            "environments": [{"name": "content_version"}, {"name": "incarnation"}],
+            "commit_validations": [{"name": "render_checked"}],
         }
 
     def get_table_names(self):
@@ -129,7 +130,8 @@ def test_everything_present_returns_head():
                          unique_constraints=ucs,
                          columns={"rule_revisions": [{"name": "state"}],
                                   "reviews": [{"name": "reviewer_principal_id"}],
-                                  "environments": [{"name": "content_version"}],
+                                  "environments": [{"name": "content_version"},
+                                                   {"name": "incarnation"}],
                                   "commit_validations": [{"name": "render_checked"}]})
     assert _adoption_revision(insp) == "head"
 
@@ -157,6 +159,19 @@ def test_content_version_present_but_render_flag_missing_adopts_at_b3d8():
                                   "environments": [{"name": "content_version"}],
                                   "commit_validations": [{"name": "status"}]})
     assert _adoption_revision(insp) == "b3d8f5a17c92"
+
+
+def test_render_flag_present_but_incarnation_missing_adopts_at_c9f4():
+    """render_checked exists (c9f4b2e87a31 ran) but environments has no incarnation →
+    d6a1f4c83b57 hasn't run; adopt at c9f4 so the identity column applies."""
+    ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
+    insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users", "observed_flags"],
+                         unique_constraints=ucs,
+                         columns={"rule_revisions": [{"name": "state"}],
+                                  "reviews": [{"name": "reviewer_principal_id"}],
+                                  "environments": [{"name": "content_version"}],
+                                  "commit_validations": [{"name": "render_checked"}]})
+    assert _adoption_revision(insp) == "c9f4b2e87a31"
 
 
 def test_observed_flags_present_but_segments_still_there_adopts_at_f2a7():
@@ -217,7 +232,7 @@ def test_review_uniqueness_detected_via_unique_index():
                               "column_names": ["draft_id", "reviewer"], "unique": True}]},
         columns={"rule_revisions": [{"name": "state"}],
                  "reviews": [{"name": "reviewer_principal_id"}],
-                 "environments": [{"name": "content_version"}],
+                 "environments": [{"name": "content_version"}, {"name": "incarnation"}],
                  "commit_validations": [{"name": "render_checked"}]},
     )
     assert _adoption_revision(insp) == "head"
@@ -278,6 +293,12 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         command.upgrade(db._alembic_config(), "67fb7465ee07")
         with db.engine().begin() as conn:
             conn.exec_driver_sql("DROP TABLE IF EXISTS alembic_version")
+            # Pre-existing environments, to prove the incarnation backfill gives each
+            # EXISTING row its own distinct identity (volatile default → per-row eval).
+            conn.exec_driver_sql(
+                "INSERT INTO environments (id, name, protected, track_tip, rules_version) "
+                "VALUES ('adopt-a', 'adopt-a', false, false, 1), "
+                "       ('adopt-b', 'adopt-b', false, false, 1)")
 
         insp = inspect(db.engine())
         assert "sessions" in insp.get_table_names()
@@ -290,8 +311,14 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         insp = inspect(db.engine())
         with db.engine().connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "c9f4b2e87a31"
+        assert version == "d6a1f4c83b57"
         assert "content_version" in {c["name"] for c in insp.get_columns("environments")}
+        assert "incarnation" in {c["name"] for c in insp.get_columns("environments")}
+        with db.engine().connect() as conn:
+            incarnations = conn.execute(
+                text("SELECT incarnation FROM environments ORDER BY id")).scalars().all()
+        assert len(incarnations) == 2 and all(incarnations)
+        assert incarnations[0] != incarnations[1]      # per-row backfill, no shared sentinel
         assert "observed_flags" in insp.get_table_names()
         assert "observed_flag_suppressions" in insp.get_table_names()
         assert "segments" not in insp.get_table_names()                      # 1.1.0: flags only
@@ -309,16 +336,18 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         assert "state" in {c["name"] for c in insp.get_columns("rule_revisions")}
         assert "users" in insp.get_table_names()
 
-        # The newest migration round-trips: its downgrade removes exactly what its
-        # upgrade added (column + check), and the re-upgrade lands back at head.
+        # The newest migrations round-trip: each downgrade removes exactly what its
+        # upgrade added (columns + check), and the re-upgrade lands back at head.
         command.downgrade(db._alembic_config(), "a9c4e17f2b60")
         insp = inspect(db.engine())
+        assert "incarnation" not in {c["name"] for c in insp.get_columns("environments")}
         assert "content_version" not in {c["name"] for c in insp.get_columns("environments")}
         assert "ck_environment_content_version" not in {
             c["name"] for c in insp.get_check_constraints("environments")}
         command.upgrade(db._alembic_config(), "head")
         insp = inspect(db.engine())
         assert "content_version" in {c["name"] for c in insp.get_columns("environments")}
+        assert "incarnation" in {c["name"] for c in insp.get_columns("environments")}
     finally:
         set_settings(saved)
         db.reset_engine()

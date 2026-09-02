@@ -227,8 +227,10 @@ def rename_env(
     ``environment_id``, so a rename is insert-new → repoint-children → delete-old, all in one
     transaction. Statement ORDER satisfies the FKs at every step: the new parent row must
     exist BEFORE we repoint the FK-bearing children at it, and the old parent can only be
-    deleted AFTER nothing references it. ``protected``/``track_tip``/``rules_version`` carry
-    over unchanged. A locked env requires ``confirm`` to echo the CURRENT id.
+    deleted AFTER nothing references it. ``protected``/``track_tip``/``rules_version``/
+    ``content_version`` carry over unchanged; ``incarnation`` does not — the new row is
+    a new identity to every node's snapshot cache. A locked env requires ``confirm`` to
+    echo the CURRENT id.
     """
     _require(ident, "admin")
     e = session.get(models.Environment, env)
@@ -246,10 +248,19 @@ def rename_env(
     if session.get(models.Environment, new_id) is not None:
         raise HTTPException(409, f"environment {new_id!r} already exists")
     _confirm_lock(session, env, env, req.confirm)  # locked env: echo the CURRENT id
-    protected, track_tip, rules_version = e.protected, e.track_tip, e.rules_version
+    protected, track_tip, rules_version, content_version = (
+        e.protected, e.track_tip, e.rules_version, e.content_version)
     # 1. New parent first (copies every setting; name := new id, matching create_env).
+    #    content_version MUST carry over: it is a poll freshness key, and letting the
+    #    model default reset it to 1 silently rewound content freshness — every node
+    #    kept (or rebuilt to) stale content until the next deployment-wide bump.
+    #    `incarnation` deliberately does NOT carry over: to the snapshot caches a
+    #    rename IS a new identity (the old id leaves the live set, the new id must be
+    #    built — replay memos included — from scratch), so the model default mints a
+    #    fresh one for the new row.
     session.add(models.Environment(id=new_id, name=new_id, protected=protected,
-                                   track_tip=track_tip, rules_version=rules_version))
+                                   track_tip=track_tip, rules_version=rules_version,
+                                   content_version=content_version))
     session.flush()  # materialize the new parent before repointing FKs at it
     # 2. Repoint every env-scoped child (FK-bearing + the two plain-string columns).
     for m in _ENV_SCOPED_MODELS:
@@ -261,12 +272,13 @@ def rename_env(
     record_audit(session, ident.name, "env.rename", "environment", new_id,
                  before={"id": env},
                  after={"id": new_id, "protected": protected, "track_tip": track_tip,
-                        "rules_version": rules_version})
+                        "rules_version": rules_version,
+                        "content_version": content_version})
     app.invalidate_after_commit(session, env)
     app.invalidate_after_commit(session, new_id)
     app.invalidate_auth_after_commit(session)  # env-scoped role bindings moved to the new id
     return {"id": new_id, "protected": protected, "track_tip": track_tip,
-            "rules_version": rules_version}
+            "rules_version": rules_version, "content_version": content_version}
 
 
 @router.get("/setup-status")

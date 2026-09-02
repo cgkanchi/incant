@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 from typing import Any, Optional
+from uuid import uuid4
 
 from sqlalchemy import (
     DDL,
@@ -21,6 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -202,6 +204,18 @@ class Environment(Base):
     # targeting revision per commit would flood targeting history with non-changes.
     content_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1")
+    # Immutable per-ROW identity, minted at insert and never updated. The freshness
+    # keys above restart at 1 when an environment is deleted and recreated under the
+    # same id, so the counters alone cannot tell a node "this row is not the one you
+    # cached" (the classic ABA) — a replica whose poll straddled the delete+recreate
+    # would keep the dead snapshot (and its §9 replay memos) forever. Nodes compare
+    # this value too and treat a change as evict-then-rebuild. A rename deliberately
+    # mints a NEW incarnation for the new row (see mgmt.admin.rename_env): to the
+    # caches, a rename is a new identity. Format is an opaque equality-only token:
+    # the ORM mints uuid4().hex, the server default a hyphenated uuid — both fine.
+    incarnation: Mapped[str] = mapped_column(
+        String, nullable=False, default=lambda: uuid4().hex,
+        server_default=text("gen_random_uuid()::text"))
 
 
 class PointerMove(Base):

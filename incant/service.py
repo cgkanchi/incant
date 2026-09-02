@@ -11,6 +11,7 @@ availability posture.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -86,6 +87,12 @@ class _CachedSnapshot:
     # due when EITHER differs from the DB's — one key alone missed every commit.
     rules_version: int
     content_version: int
+    # The environment ROW's immutable identity (models.Environment.incarnation). Both
+    # counters restart at 1 on a delete+recreate under the same id, so they cannot by
+    # themselves distinguish "the row I cached" from "a new row wearing its id" (ABA);
+    # a differing incarnation means the cached snapshot describes a DEAD environment
+    # and must be dropped — replay memos included — never "confirmed" as fresh.
+    incarnation: str
     snapshot: EnvSnapshot
     # Monotonic time of the last successful freshness check against the DB (build,
     # or a healthy poll confirming both keys unchanged). Feeds the §14
@@ -102,6 +109,12 @@ class _RefreshPlan:
     rebuilt: dict[str, _CachedSnapshot] = field(default_factory=dict)
     evicted: set[str] = field(default_factory=set)    # cached ids the DB no longer has
     confirmed: set[str] = field(default_factory=set)  # cached, keys unchanged, not forced
+    # Ids whose DB row's incarnation differs from the cached one (a delete+recreate,
+    # or a rename, happened between polls) → the STALE incarnation the cache held when
+    # this plan was built. Applying such an entry also drops the env's replay memos,
+    # and the apply-time value lets us tell "installing over the stale entry we
+    # planned against" from "the cache reincarnated AGAIN after this plan" (skip).
+    reincarnated: dict[str, str] = field(default_factory=dict)
 
 
 _HISTORICAL_CACHE_MAX = 64  # replayed (env, rules_version) snapshots kept in memory
@@ -111,14 +124,27 @@ _HISTORICAL_CACHE_MAX = 64  # replayed (env, rules_version) snapshots kept in me
 class AppContext:
     settings: Settings = field(default_factory=get_settings)
     _snapshots: dict[str, _CachedSnapshot] = field(default_factory=dict)
-    # §9 pin.rules_version replay: reconstructed historical snapshots, LRU-bounded.
-    # Immutable once built (a revision's state never changes), so never invalidated.
-    _historical: "OrderedDict[tuple[str, int], EnvSnapshot]" = field(
+    # §9 pin.rules_version replay: reconstructed historical snapshots, LRU-bounded,
+    # keyed by (env_id, incarnation, rules_version). The incarnation is in the key
+    # because revision numbers restart when an id is deleted and recreated — an old
+    # life's rules_version must never resolve to (or shadow) the new life's replay.
+    # The cached object is the IMMUTABLE historical targeting state only; its two
+    # CURRENT-state overlays (`servable`, `refinement_defaults`) are re-attached from
+    # the live snapshot on every :meth:`snapshot_at` return — freezing them at first
+    # build made a replay wrongly 409 a SHA validated later (see snapshot_at).
+    _historical: "OrderedDict[tuple[str, str, int], EnvSnapshot]" = field(
         default_factory=OrderedDict)
     # Revisions whose recorded state can never be replayed (pre-1.1.0 shapes). A
     # revision's state is immutable, so the refusal is too — memoized (LRU-bounded)
-    # so a renderer retrying a known-bad pin costs no control-plane queries.
-    _unreplayable: "OrderedDict[tuple[str, int], str]" = field(default_factory=OrderedDict)
+    # so a renderer retrying a known-bad pin costs no control-plane queries. Same
+    # key shape as _historical, incarnation included.
+    _unreplayable: "OrderedDict[tuple[str, str, int], str]" = field(default_factory=OrderedDict)
+    # Guards every mutation of the two OrderedDicts above. snapshot_at's LRU ops
+    # (get + move_to_end + popitem) run on request threads (Starlette's threadpool)
+    # while the poll thread evicts through _apply_refresh; unsynchronized, a
+    # concurrent move_to_end/popitem pair can raise KeyError — a sporadic 500 on a
+    # perfectly healthy replay. Critical sections are a few dict ops, never a build.
+    _replay_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # DB health as last observed by the background poll (refresh_control_plane), NOT by
     # any request — the serving hot path never touches the DB to learn this. False means
     # the poller last saw an outage, so warm snapshots are served frozen (§10 "rules
@@ -252,7 +278,7 @@ class AppContext:
             # that isn't.
             snap = build_snapshot(session, env_id)
             self._snapshots[env_id] = _CachedSnapshot(
-                env.rules_version, env.content_version, snap)
+                env.rules_version, env.content_version, env.incarnation, snap)
             return snap
         except SQLAlchemyError:
             raise ServingError(503, "node not ready: no cached targeting")
@@ -313,21 +339,28 @@ class AppContext:
         plan = _RefreshPlan()
         rows = session.execute(
             select(models.Environment.id, models.Environment.rules_version,
-                   models.Environment.content_version)
+                   models.Environment.content_version, models.Environment.incarnation)
         ).all()
-        live = {env_id for env_id, _, _ in rows}
+        live = {env_id for env_id, _, _, _ in rows}
         # list() copy: request threads write to the cache concurrently with the poll.
         plan.evicted = {e for e in list(self._snapshots) if e not in live}
         validated_index = None   # loaded on first build, then shared by the plan
-        for env_id, rules_version, content_version in rows:
+        for env_id, rules_version, content_version, incarnation in rows:
             cached = self._snapshots.get(env_id)
             if cached is None:
                 continue
-            if (cached.rules_version == rules_version
+            # "Unchanged" requires the same ROW, not just the same counters: a
+            # delete+recreate under this id restarts both counters, so identical
+            # values with a different incarnation are a brand-new environment that
+            # must be rebuilt (and its replay memos dropped), never confirmed.
+            if (cached.incarnation == incarnation
+                    and cached.rules_version == rules_version
                     and cached.content_version == content_version
                     and env_id not in forced):
                 plan.confirmed.add(env_id)
                 continue
+            if cached.incarnation != incarnation:
+                plan.reincarnated[env_id] = cached.incarnation
             if validated_index is None:
                 validated_index = load_validated_index(session)
             try:
@@ -335,12 +368,24 @@ class AppContext:
             except SQLAlchemyError:
                 raise
             except Exception:
+                if env_id in plan.reincarnated:
+                    # "Serve the last good snapshot" is only honest when that snapshot
+                    # describes THIS environment. Here it describes a deleted row that
+                    # happens to share the id — evict it (replay memos included) and
+                    # let the cold-miss path (or the next poll) build the new one.
+                    log.exception("snapshot rebuild failed for RECREATED environment "
+                                  "%r — evicting the previous incarnation's snapshot; "
+                                  "other environments continue", env_id)
+                    _record_snapshot_build_failure(env_id)
+                    plan.evicted.add(env_id)
+                    continue
                 log.exception("snapshot rebuild failed for environment %r — serving "
                               "its last good snapshot; other environments continue",
                               env_id)
                 _record_snapshot_build_failure(env_id)
                 continue
-            plan.rebuilt[env_id] = _CachedSnapshot(rules_version, content_version, snap)
+            plan.rebuilt[env_id] = _CachedSnapshot(
+                rules_version, content_version, incarnation, snap)
         return plan
 
     def _apply_refresh(self, plan: _RefreshPlan) -> None:
@@ -348,19 +393,60 @@ class AppContext:
         (a hot-path reader sees the old or the new snapshot, never a half-built one); an
         environment deleted on another node — or by the write that planned this — stops
         serving here too, replay states included; unchanged entries are stamped as
-        freshly confirmed against the DB (the §14 age gauge)."""
+        freshly confirmed against the DB (the §14 age gauge).
+
+        The swap is generation-checked: a plan is a detached read of an OLDER DB state,
+        and by the time it lands here a write may already have installed a NEWER
+        snapshot through :meth:`invalidate_after_commit`'s in-transaction build. The
+        cache must never move backward — a slow poll silently regressing a node to
+        pre-write rules/content — so an entry only installs over a same-incarnation
+        predecessor whose freshness keys it does not undercut. Equal keys still
+        install: a forced rebuild (env-settings edit) moves no counter yet must land."""
         for env_id in plan.evicted:
             self._snapshots.pop(env_id, None)
-            for key in [k for k in list(self._historical) if k[0] == env_id]:
-                self._historical.pop(key, None)
+            self._drop_replay_states(env_id)
             log.warning("environment %r no longer exists — evicted from the snapshot cache", env_id)
-        for env_id, entry in plan.rebuilt.items():
-            self._snapshots[env_id] = entry
         now = time.monotonic()
+        for env_id, entry in plan.rebuilt.items():
+            current = self._snapshots.get(env_id)
+            if current is not None:
+                if current.incarnation != entry.incarnation:
+                    # The cache reincarnated AFTER this plan was built (a request
+                    # cold-built the recreated env mid-plan): unless the cached entry
+                    # is exactly the stale incarnation this plan set out to replace,
+                    # the plan's entry describes a row that no longer exists —
+                    # installing it would resurrect a deleted environment.
+                    if current.incarnation != plan.reincarnated.get(env_id):
+                        continue
+                elif (current.rules_version > entry.rules_version
+                      or current.content_version > entry.content_version):
+                    # A concurrent write already installed something strictly newer.
+                    # Keep it; the plan's DB read still proves the env exists, so
+                    # re-confirm for the §14 age gauge rather than letting it climb.
+                    current.confirmed_at = now
+                    continue
+            if env_id in plan.reincarnated:
+                # Same id, different row (delete+recreate, or a rename minting a new
+                # identity): the §9 replay memos belong to the DEAD row — an old
+                # life's rules_version must not resolve against the new one.
+                self._drop_replay_states(env_id)
+            self._snapshots[env_id] = entry
         for env_id in plan.confirmed:
             cached = self._snapshots.get(env_id)
             if cached is not None:
                 cached.confirmed_at = now
+
+    def _drop_replay_states(self, env_id: str) -> None:
+        """Forget every §9 replay memo for an environment — the reconstructed
+        snapshots AND the memoized refusals (a recreated env's revision numbers
+        restart, so a stale refusal would 422 a perfectly replayable pin). Runs on
+        the poll thread while request threads do LRU ops in :meth:`snapshot_at`;
+        the shared lock keeps the OrderedDicts coherent."""
+        with self._replay_lock:
+            for key in [k for k in self._historical if k[0] == env_id]:
+                del self._historical[key]
+            for key in [k for k in self._unreplayable if k[0] == env_id]:
+                del self._unreplayable[key]
 
     def _publish_snapshot_ages(self) -> None:
         """§14 incant_rules_snapshot_age_seconds — refreshed by every poll pass, on
@@ -382,17 +468,36 @@ class AppContext:
         honestly (422 with the ``pin.versions`` alternative) rather than
         approximated. Checkpoint revisions resolve O(1); the rest reconstruct from
         the nearest older checkpoint (bounded by the checkpoint interval). The DB
-        reads sit off the common path (replays only) and the result is memoized —
-        history never changes."""
+        reads sit off the common path (replays only) and the *historical targeting
+        state* is memoized — history never changes. The snapshot's two CURRENT-state
+        overlays are NOT part of history and are re-attached on every call:
+        ``servable`` (the validated-commit predicate) and ``refinement_defaults``
+        grow over time, and freezing them at first build made a memoized replay
+        wrongly 409 a ``pin.versions`` SHA validated after the memo (or serve a
+        stale variable default). Both re-attachments are reference swaps from the
+        in-memory current snapshot — the path stays DB-free on a hit."""
         current = self.get_snapshot(session, env_id)
         if rules_version == current.rules_version:
             return current
-        key = (env_id, rules_version)
-        hit = self._historical.get(key)
+        # The memo key carries the environment's incarnation: revision numbers restart
+        # when an id is deleted and recreated, so an old life's rules_version must
+        # never resolve to (or refuse for) the new life. get_snapshot above ensured a
+        # cache entry exists; in the narrow race where the poll evicts it right here
+        # we just miss the memo for this one request (worst case a rebuild).
+        entry = self._snapshots.get(env_id)
+        incarnation = entry.incarnation if entry is not None else ""
+        key = (env_id, incarnation, rules_version)
+        with self._replay_lock:
+            hit = self._historical.get(key)
+            if hit is not None:
+                self._historical.move_to_end(key)
+            refused = self._unreplayable.get(key)
         if hit is not None:
-            self._historical.move_to_end(key)
-            return hit
-        refused = self._unreplayable.get(key)
+            # Shallow copy with the overlays refreshed (see docstring). The memoized
+            # object itself is never mutated: a request thread mid-render keeps a
+            # consistent view, and `replace` costs a handful of reference copies.
+            return replace(hit, servable=current.servable,
+                           refinement_defaults=current.refinement_defaults)
         if refused is not None:
             raise ServingError(422, refused)
         try:
@@ -412,17 +517,21 @@ class AppContext:
         except ValueError as exc:
             msg = (f"rules_version {rules_version} of {env_id!r} cannot be replayed: {exc}; "
                    "replay with pin.versions instead — the response's versions map is SHA-exact")
-            self._unreplayable[key] = msg
-            if len(self._unreplayable) > _HISTORICAL_CACHE_MAX:
-                self._unreplayable.popitem(last=False)
+            with self._replay_lock:
+                self._unreplayable[key] = msg
+                if len(self._unreplayable) > _HISTORICAL_CACHE_MAX:
+                    self._unreplayable.popitem(last=False)
             raise ServingError(422, msg)
         # Variable defaults ride along from the live snapshot: refinements are
         # authoring metadata, not targeting state (documented replay semantics).
+        # Like `servable`, this is a CURRENT-state overlay — the memoized copy's value
+        # is superseded by the refresh above on every later hit.
         snap.refinement_defaults = current.refinement_defaults
-        self._historical[key] = snap
-        self._historical.move_to_end(key)
-        if len(self._historical) > _HISTORICAL_CACHE_MAX:
-            self._historical.popitem(last=False)
+        with self._replay_lock:
+            self._historical[key] = snap
+            self._historical.move_to_end(key)
+            if len(self._historical) > _HISTORICAL_CACHE_MAX:
+                self._historical.popitem(last=False)
         return snap
 
     def auto_advance_tips(self, session: Session, actor: str, prompt_id: str,
@@ -538,7 +647,8 @@ class AppContext:
         # the FIRST render after /readyz went green would do a cold snapshot build (a DB
         # read), so a node that just reported ready would 503 if Postgres died the instant
         # after. With it, that first render is a pure memory hit off already-warm content.
-        self._snapshots[env_id] = _CachedSnapshot(env.rules_version, env.content_version, snap)
+        self._snapshots[env_id] = _CachedSnapshot(
+            env.rules_version, env.content_version, env.incarnation, snap)
 
     # ── serving ──────────────────────────────────────────────────────
 
