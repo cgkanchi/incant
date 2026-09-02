@@ -297,7 +297,8 @@ def _adoption_revision(inspector) -> str:
       * e9a1c4f27b63 — immutable principal-id columns on drafts/reviews/comments;
       * f2a7c9d41e58 — the ``observed_flags`` table;
       * a9c4e17f2b60 — flags-only targeting (``segments`` table gone);
-      * b3d8f5a17c92 — the ``environments.content_version`` column.
+      * b3d8f5a17c92 — the ``environments.content_version`` column;
+      * c9f4b2e87a31 — the ``commit_validations.render_checked`` column.
 
     We never return anything older than the baseline: a populated schema is assumed to
     contain at least ``da3e34b2b8fe``'s tables (that is what "has tables but no
@@ -322,6 +323,8 @@ def _adoption_revision(inspector) -> str:
             c["name"] for c in inspector.get_columns("environments")
         }:
             return "a9c4e17f2b60"
+        if "render_checked" not in {c["name"] for c in inspector.get_columns("commit_validations")}:
+            return "b3d8f5a17c92"  # content_version present, render flag not yet
         return "head"
     if not _has_unique_columns(inspector, "reviews", ["draft_id", "reviewer"]):
         return "a3f1c8e29b41"

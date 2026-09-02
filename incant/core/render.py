@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextvars
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
@@ -41,13 +42,18 @@ DEPTH_LIMIT = 32
 # (service.py) has no settings of its own to hand down.
 MAX_RENDER_BYTES = 2 * 1024 * 1024
 _max_render_bytes = MAX_RENDER_BYTES
+MAX_RENDER_SECONDS = 5.0
+_max_render_seconds = MAX_RENDER_SECONDS  # 0 disables the deadline
 
 
-def configure_limits(*, max_render_bytes: int | None = None) -> None:
+def configure_limits(*, max_render_bytes: int | None = None,
+                     max_render_seconds: float | None = None) -> None:
     """Set process-wide render limits (server startup; tests restore the default)."""
-    global _max_render_bytes
+    global _max_render_bytes, _max_render_seconds
     if max_render_bytes is not None:
         _max_render_bytes = int(max_render_bytes)
+    if max_render_seconds is not None:
+        _max_render_seconds = float(max_render_seconds)
 
 
 @dataclass
@@ -377,8 +383,30 @@ def _render_compiled(
             render_vars[name] = Undefined(name=name)
 
     token = _current.set(ctx)
+    # Stream the render: generate() yields chunks as the template writes them, so the
+    # byte cap and the wall-clock deadline cut a runaway template off MID-FLIGHT
+    # instead of after the complete string has been materialized. A single giant
+    # expression still arrives as one chunk (the overshoot is bounded by one write),
+    # but loops — the realistic runaway shape — are checked every iteration. Both
+    # raise RenderError (not a new type) so every existing mapping holds: 422 on the
+    # serving and preview paths, a failed validation at commit time.
+    deadline = (time.monotonic() + _max_render_seconds) if _max_render_seconds else None
+    parts: list[str] = []
+    size = 0
     try:
-        text = tmpl.render(render_vars)
+        for chunk in tmpl.generate(render_vars):
+            size += len(chunk.encode("utf-8"))
+            if size > _max_render_bytes:
+                raise RenderError(
+                    f"rendered output is {size} bytes so far, over the "
+                    f"{_max_render_bytes}-byte render limit", prompt_id=prompt_id,
+                )
+            if deadline is not None and time.monotonic() > deadline:
+                raise RenderError(
+                    f"render exceeded the {_max_render_seconds:g}s time budget",
+                    prompt_id=prompt_id,
+                )
+            parts.append(chunk)
     except UndefinedError as exc:
         raise MissingVariable(_undefined_name(exc), prompt_id) from exc
     except (IncludeCycle, IncludeDepthExceeded):
@@ -387,15 +415,7 @@ def _render_compiled(
         raise RenderError(str(exc), prompt_id=prompt_id, lineno=getattr(exc, "lineno", None))
     finally:
         _current.reset(token)
-
-    # A RenderError (not a new type) so every existing mapping holds: 422 on the
-    # serving and preview paths, a failed validation at commit time.
-    size = len(text.encode("utf-8"))
-    if size > _max_render_bytes:
-        raise RenderError(
-            f"rendered output is {size} bytes, over the {_max_render_bytes}-byte "
-            "render limit", prompt_id=prompt_id,
-        )
+    text = "".join(parts)
 
     return RenderResult(
         text=text,

@@ -129,7 +129,8 @@ def test_everything_present_returns_head():
                          unique_constraints=ucs,
                          columns={"rule_revisions": [{"name": "state"}],
                                   "reviews": [{"name": "reviewer_principal_id"}],
-                                  "environments": [{"name": "content_version"}]})
+                                  "environments": [{"name": "content_version"}],
+                                  "commit_validations": [{"name": "render_checked"}]})
     assert _adoption_revision(insp) == "head"
 
 
@@ -143,6 +144,19 @@ def test_flags_only_applied_but_content_version_missing_adopts_at_a9c4():
                                   "reviews": [{"name": "reviewer_principal_id"}],
                                   "environments": [{"name": "rules_version"}]})  # pre-b3d8
     assert _adoption_revision(insp) == "a9c4e17f2b60"
+
+
+def test_content_version_present_but_render_flag_missing_adopts_at_b3d8():
+    """content_version exists (b3d8f5a17c92 ran) but commit_validations has no
+    render_checked → c9f4b2e87a31 hasn't run; adopt at b3d8 so the column applies."""
+    ucs = {**_prefix_unique_via_constraint(), **_review_unique_via_constraint()}
+    insp = FakeInspector(tables=_CORE_TABLES + ["sessions", "users", "observed_flags"],
+                         unique_constraints=ucs,
+                         columns={"rule_revisions": [{"name": "state"}],
+                                  "reviews": [{"name": "reviewer_principal_id"}],
+                                  "environments": [{"name": "content_version"}],
+                                  "commit_validations": [{"name": "status"}]})
+    assert _adoption_revision(insp) == "b3d8f5a17c92"
 
 
 def test_observed_flags_present_but_segments_still_there_adopts_at_f2a7():
@@ -203,7 +217,8 @@ def test_review_uniqueness_detected_via_unique_index():
                               "column_names": ["draft_id", "reviewer"], "unique": True}]},
         columns={"rule_revisions": [{"name": "state"}],
                  "reviews": [{"name": "reviewer_principal_id"}],
-                 "environments": [{"name": "content_version"}]},
+                 "environments": [{"name": "content_version"}],
+                 "commit_validations": [{"name": "render_checked"}]},
     )
     assert _adoption_revision(insp) == "head"
 
@@ -275,7 +290,7 @@ def test_ensure_schema_adopts_and_upgrades_partial_postgres_schema():
         insp = inspect(db.engine())
         with db.engine().connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "b3d8f5a17c92"
+        assert version == "c9f4b2e87a31"
         assert "content_version" in {c["name"] for c in insp.get_columns("environments")}
         assert "observed_flags" in insp.get_table_names()
         assert "observed_flag_suppressions" in insp.get_table_names()

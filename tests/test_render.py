@@ -347,3 +347,26 @@ def test_output_over_the_render_budget_is_a_render_error(tiny_render_budget):
 def test_render_budget_default_is_generous():
     from incant.core.render import MAX_RENDER_BYTES, _max_render_bytes
     assert _max_render_bytes == MAX_RENDER_BYTES == 2 * 1024 * 1024
+
+
+def test_render_wall_clock_budget_cuts_a_runaway_loop():
+    # A caller-supplied outer list x a large inner loop burns time while emitting
+    # almost no output — the byte cap never fires, so the deadline must. Checked
+    # between template writes: each outer iteration emits one chunk.
+    from incant.core.render import MAX_RENDER_SECONDS, configure_limits
+    configure_limits(max_render_seconds=0.05)
+    try:
+        content = DictContent({(SYS, "c1"):
+            "{% for a in xs %}.{% for b in ys %}{% endfor %}{% endfor %}"})
+        snap = snapshot(versions={SYS: {1: vinfo(1, live="c1")}}, defaults={SYS: 1})
+        with pytest.raises(RenderError) as e:
+            render(snap, SYS, {}, {"xs": list(range(5000)), "ys": list(range(20000))}, content)
+        assert "time budget" in str(e.value)
+    finally:
+        configure_limits(max_render_seconds=MAX_RENDER_SECONDS)
+
+
+def test_render_time_budget_default_is_generous():
+    from incant.core.render import MAX_RENDER_SECONDS, _max_render_seconds
+    assert _max_render_seconds == MAX_RENDER_SECONDS == 5.0
+

@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import hmac
 
+from ..core.ids import validate_project_id
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -200,10 +201,10 @@ def initial_setup(
     # first prompt's prefix can also claim it later. Same slug rules as env ids.
     project = (req.project or "").strip().lower()
     if project:
-        import re
-        if not re.fullmatch(r"[a-z0-9]([a-z0-9_-]*[a-z0-9])?", project) or len(project) > 32:
-            raise HTTPException(422, "project name: 1–32 lowercase letters, digits, "
-                                     "'-' or '_' (starting and ending alphanumeric)")
+        try:
+            validate_project_id(project)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
         from ..registry import RegistryService
         RegistryService(session, get_app().git, get_app().content).ensure_project(project)
     record_audit(session, user.email, "auth.setup", "user", user.id,

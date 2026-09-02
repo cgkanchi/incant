@@ -87,6 +87,11 @@ class CommitValidation(Base):
     status: Mapped[str] = mapped_column(String)                        # valid | invalid
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     extracted_variables: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Whether the §5 test-context render actually ran for this verdict. False means the
+    # verdict is STATIC-ONLY (compile/includes/cycles) — the reason says why the render
+    # was skipped. Persisted so publish can warn long after the commit response is gone.
+    render_checked: Mapped[bool] = mapped_column(Boolean, default=False)
+    render_skipped_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     validated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

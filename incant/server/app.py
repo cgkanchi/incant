@@ -308,6 +308,14 @@ async def _reconcile_loop(ctx) -> None:
 def _backup_pass(ctx) -> None:
     """One synchronous pusher pass on its own session (run via _writer_pass — a remote
     push blocks on the network and must not stall the event loop)."""
+    # _writer_pass gated on the flag at pass START; re-verify ownership LIVE right
+    # before the push. A mirror push force-overwrites the remote's lineage — the one
+    # operation where a split-brain writer destroys data rather than duplicating
+    # work — so it gets the narrowest possible check window. (Monitoring, not true
+    # fencing: an in-flight push can still straddle a loss. Documented in DEPLOYING.)
+    if not writer_role_held():
+        log.warning("backup push skipped: writer role no longer verifiably held")
+        return
     with session_scope() as s:
         ctx.backup.push_pending(s)
 
@@ -696,7 +704,8 @@ def create_app() -> FastAPI:
     settings = get_settings()
     # The core is a pure library and reads no settings; hand it the deployment's render
     # budget here, once, before any warm or request can render.
-    configure_limits(max_render_bytes=settings.max_render_bytes)
+    configure_limits(max_render_bytes=settings.max_render_bytes,
+                     max_render_seconds=settings.max_render_seconds)
     app = FastAPI(
         title="Incant",
         version="1.1.0",

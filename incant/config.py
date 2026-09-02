@@ -158,6 +158,7 @@ class Settings(BaseSettings):
     # request; over the cap renders fail as a 422 render error, never a 500.
     max_request_bytes: int = Field(default=1_048_576, ge=4096)
     max_render_bytes: int = Field(default=2_097_152, ge=1024)
+    max_render_seconds: float = Field(default=5.0, ge=0.0)   # 0 disables the deadline
 
     @model_validator(mode="after")
     def _cross_field(self) -> "Settings":

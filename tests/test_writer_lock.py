@@ -215,3 +215,31 @@ def test_postgres_outage_on_reclaim_is_not_contention(node, monkeypatch):
     node.appmod._writer_role_pass(node.app)
     assert db.writer_role_held() is True
     assert metrics.writer_lock_held._value.get() == 1 and not node.terminated
+
+
+def test_backup_pass_reverifies_ownership_before_the_push(monkeypatch):
+    # The mirror push force-overwrites the remote lineage — the one operation where a
+    # split-brain writer destroys data rather than duplicating work — so _backup_pass
+    # re-checks LIVE ownership right before pushing, not only the pass-start flag.
+    import importlib
+    from contextlib import nullcontext
+
+    appmod = importlib.import_module("incant.server.app")
+
+    class FakeBackup:
+        pushed = 0
+
+        def push_pending(self, s):
+            FakeBackup.pushed += 1
+
+    class Ctx:
+        backup = FakeBackup()
+
+    monkeypatch.setattr(appmod, "session_scope", nullcontext)
+    monkeypatch.setattr(appmod, "writer_role_held", lambda: False)
+    appmod._backup_pass(Ctx())
+    assert FakeBackup.pushed == 0
+    monkeypatch.setattr(appmod, "writer_role_held", lambda: True)
+    appmod._backup_pass(Ctx())
+    assert FakeBackup.pushed == 1
+

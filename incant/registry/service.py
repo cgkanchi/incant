@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..core import ExtractedVars, extract
-from ..core.ids import validate_prompt_id
+from ..core.ids import validate_project_id, validate_prompt_id
 from ..gitstore import ContentStore, GitStore, validate_source
 from ..gitstore.store import ConcurrentUpdate
 from ..targeting.service import bump_content_version
@@ -86,6 +86,10 @@ class RegistryService:
         call must match. Multi-project is deliberately a multi-deployment (and,
         later, a schema-sharding) story, not an in-database one — it keeps RBAC,
         keys, and the library free of a cross-project mental model."""
+        try:
+            validate_project_id(project_id)
+        except ValueError as exc:
+            raise RegistryError(str(exc)) from exc
         p = self.s.get(models.Project, project_id)
         if p is None:
             existing = self.s.execute(select(models.Project)).scalars().first()
@@ -615,6 +619,8 @@ class RegistryService:
                 prompt_id=d.prompt_id, version_number=d.version_number,
                 status=result.status, error=result.error,
                 extracted_variables=result.extracted_variables,
+                render_checked=result.render_checked,
+                render_skipped_reason=result.render_skipped_reason,
             )
             self.s.add(cv)
             # Every publish changes what snapshots are built from — a new version row

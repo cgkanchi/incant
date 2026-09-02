@@ -205,6 +205,8 @@ def adopt_content_tree(session: Session, git: GitStore) -> AdoptResult | None:
             prompt_id=pid, version_number=number,
             status=result.status, error=result.error,
             extracted_variables=result.extracted_variables,
+            render_checked=False,
+            render_skipped_reason="adopted from the repo tree; test contexts not run at adoption",
         ))
         valid += int(result.ok)
         invalid += int(not result.ok)
@@ -434,6 +436,8 @@ def recover_pending_promotions(session: Session, git: GitStore) -> PendingRecove
                     sha=new_sha, blob_sha=git.blob_sha(cv.path, ref=new_sha) or "",
                     path=cv.path, prompt_id=cv.prompt_id, version_number=cv.version_number,
                     status=status, error=error, extracted_variables=variables,
+                    render_checked=cv.render_checked,
+                    render_skipped_reason=f"render verdict inherited from {original[:12]}",
                 ))
             staged.append((draft_id, original, new_sha, parent))
             rebased += 1

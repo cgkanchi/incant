@@ -192,3 +192,54 @@ def test_live_pointer_include_cycle_is_a_verdict_not_a_500(tmp_path):
         assert v["status"] == "invalid" and v["render_checked"] is True
         assert "include cycle" in v["error"] and "support/a" in v["error"]
         assert "ctx1" in v["error"]
+
+
+# ── the render-check state outlives the commit response ──────────────
+
+
+def test_render_check_state_is_persisted_and_make_live_warns(ctx):
+    from sqlalchemy import select
+
+    from incant.server.mgmt.targeting import _render_check_warning
+
+    # Commit WITHOUT the default env: the ROW must remember the skip — the commit
+    # response that reported it is long gone by the time anyone publishes.
+    with session_scope() as s:
+        reg = ctx.registry(s, "sam")
+        reg.create_prompt("support/note")
+        reg.set_test_context("support/note", "ctx1", {}, {"who": "Sam"})
+        d = reg.create_draft("support/note", version_number=1, author="sam",
+                             content="Hello {{ who }}")
+        out = reg.commit_draft(d.id, author="sam")
+    with session_scope() as s:
+        row = s.execute(select(models.CommitValidation).where(
+            models.CommitValidation.sha == out.sha)).scalar_one()
+        assert row.render_checked is False
+        assert "prod" in row.render_skipped_reason
+        # Configured contexts + a static-only verdict ⇒ making it live deserves a warning.
+        warn = _render_check_warning(s, "support/note", out.sha)
+        assert warn and "static-only" in warn and out.sha[:12] in warn
+
+    # A prompt with NO contexts: static-only IS the full check — no warning.
+    with session_scope() as s:
+        reg = ctx.registry(s, "sam")
+        reg.create_prompt("support/bare2")
+        d = reg.create_draft("support/bare2", version_number=1, author="sam",
+                             content="plain")
+        out2 = reg.commit_draft(d.id, author="sam")
+    with session_scope() as s:
+        assert _render_check_warning(s, "support/bare2", out2.sha) is None
+
+    # Once the env exists and the render runs, the row says so and the warning is gone.
+    _add_prod()
+    with session_scope() as s:
+        reg = ctx.registry(s, "sam")
+        d = reg.create_draft("support/note", version_number=2, author="sam",
+                             content="Hello again {{ who }}")
+        out3 = reg.commit_draft(d.id, author="sam")
+    with session_scope() as s:
+        row = s.execute(select(models.CommitValidation).where(
+            models.CommitValidation.sha == out3.sha)).scalar_one()
+        assert row.render_checked is True and row.render_skipped_reason is None
+        assert _render_check_warning(s, "support/note", out3.sha) is None
+

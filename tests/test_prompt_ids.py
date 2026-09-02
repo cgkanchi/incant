@@ -13,7 +13,12 @@ import pytest
 from sqlalchemy import func, select
 
 from incant import models
-from incant.core.ids import PROMPT_ID_MAX, is_valid_prompt_id, validate_prompt_id
+from incant.core.ids import (
+    PROMPT_ID_MAX,
+    is_valid_prompt_id,
+    validate_project_id,
+    validate_prompt_id,
+)
 from incant.db import session_scope
 from incant.registry import RegistryError
 
@@ -141,3 +146,27 @@ def test_list_files_returns_raw_paths_for_unusual_bytes(tmp_path):
         g.commit_version(pid, 1, "x", author_name="A", author_email="a@x", message="c")
     assert g.list_files() == sorted(
         ['support/we"ird/v1.j2', "support/ünïcode/v1.j2", "support/plain/v1.j2"])
+
+
+# ── project ids: one segment of the same grammar ─────────────────────
+
+
+@pytest.mark.parametrize("pid", ["support", "acme", "a1", "x" * 64, "a.b_c-d"])
+def test_project_grammar_accepts(pid):
+    assert validate_project_id(pid) == pid
+
+
+@pytest.mark.parametrize("pid", ["", "Support", "a/b", "-x", "x-", "x" * 65, "a b", ".."])
+def test_project_grammar_refuses(pid):
+    with pytest.raises(ValueError):
+        validate_project_id(pid)
+
+
+def test_projects_endpoint_refuses_a_wedging_id(client):
+    from .test_server import auth
+
+    # "Support" would make every valid (lowercase) prompt id conflict with the
+    # one-project rule forever — the wedge the grammar exists to prevent.
+    r = client.post("/mgmt/projects", json={"id": "Support"}, headers=auth())
+    assert r.status_code == 422 and "project id" in r.text, r.text
+

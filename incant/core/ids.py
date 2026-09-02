@@ -47,6 +47,23 @@ def is_valid_prompt_id(prompt_id: str) -> bool:
     return len(segments) >= 2 and all(_SEGMENT_RE.fullmatch(seg) for seg in segments)
 
 
+PROJECT_ID_MAX = 64
+PROJECT_ID_GRAMMAR = (
+    "a project id is one lowercase segment: letters, digits, '.', '_' or '-', starting "
+    f"and ending with a letter or digit; at most {PROJECT_ID_MAX} characters"
+)
+
+
+def validate_project_id(project_id: str) -> str:
+    """A project id is exactly one prompt-id segment (it IS the first segment of every
+    prompt id) — validated on its own so the FIRST project created cannot wedge the
+    deployment with a name no valid prompt id can ever start with."""
+    if (not isinstance(project_id, str) or not project_id
+            or len(project_id) > PROJECT_ID_MAX or not _SEGMENT_RE.fullmatch(project_id)):
+        raise ValueError(f"invalid project id {project_id!r} — {PROJECT_ID_GRAMMAR}")
+    return project_id
+
+
 def validate_prompt_id(prompt_id: str) -> str:
     """Return ``prompt_id`` unchanged if it satisfies the grammar; raise ``ValueError``
     carrying the grammar otherwise (callers surface it as 422 / RegistryError)."""

@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from ..core.ids import validate_prompt_id
+from ..core.ids import validate_project_id, validate_prompt_id
 from ..core.parse import parse_condition, parse_serve
 from ..gitstore.store import validate_auth_ref, validate_remote_url
 
@@ -313,6 +313,14 @@ class ProjectRequest(BaseModel):
     id: str
     review_policy: int = 0
     allow_self_review: bool = True
+
+    @field_validator("id")
+    @classmethod
+    def _valid_project_id(cls, v: str) -> str:
+        # The project id is the first segment of every prompt id: an incompatible name
+        # (uppercase, empty, "Support") would make every valid prompt id conflict with
+        # the one-project rule — a wedged deployment.
+        return validate_project_id(v)
 
 
 class ProjectSettingsRequest(BaseModel):

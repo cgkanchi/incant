@@ -118,6 +118,20 @@ fixing):
   and a failed upgrade retries on the next cache reload, not per request.
 - One validated-commit index is loaded per refresh pass / boot and shared across
   environments (was one full scan and one copy per environment).
+- Render budgets actually bound the work: the output cap and a new wall-clock budget
+  (`INCANT_MAX_RENDER_SECONDS`, default 5 s, 0 disables) are checked between template
+  writes as the render streams, so a runaway loop is cut off mid-flight instead of
+  after the full string materializes.
+- The backup pass re-verifies advisory-lock ownership immediately before the mirror
+  push; the docs now say plainly that monitoring narrows but does not eliminate the
+  split-brain window (fencing generations planned with the content catalog).
+- `render_checked` / `render_skipped_reason` are persisted on `commit_validations`
+  (migration `c9f4b2e87a31`), and making a sha live warns when its stored verdict
+  skipped CONFIGURED test contexts — the static-only "valid" no longer looks like a
+  fully-checked one at publish time.
+- Project ids share the prompt-segment grammar at every entry point (API, setup
+  screen, registry): the first project can no longer be created with a name no valid
+  prompt id can start with, which wedged the deployment permanently.
 - Docs: content reaches replicas within `INCANT_BACKUP_POLL_SECONDS` +
   `INCANT_CONTENT_FETCH_SECONDS` (~45 s worst case), covered by the §10 within-version
   fallback — not "one fetch interval"; the boot migration creates `pg_trgm` itself

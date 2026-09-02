@@ -5,6 +5,12 @@ One deployment = one project = one canonical repo + one Postgres database, with
 boot and re-checked every control-poll tick — see "The single-writer lock") and any
 number of `INCANT_MODE=serve` replicas.
 
+Monitoring narrows the split-brain window to about one poll tick; it is not true
+fencing — an operation already in flight when the role is lost can complete. The
+backup mirror push re-verifies ownership immediately before pushing (the one
+operation where a second writer destroys remote lineage). Fencing generations are
+planned alongside the shared content catalog.
+
 ## Topology
 
 ```
@@ -185,7 +191,8 @@ Two caps bound what a single request can cost, independent of any template:
 | Setting | Default | What it bounds |
 |---|---|---|
 | `INCANT_MAX_REQUEST_BYTES` | `1048576` (1 MiB) | any request body — refused with 413 by Content-Length up front, or cut off at the cap while a chunked body streams |
-| `INCANT_MAX_RENDER_BYTES` | `2097152` (2 MiB) | rendered output — a template looping over a caller-supplied list fails with a 422 render error instead of emitting tens of MB |
+| `INCANT_MAX_RENDER_BYTES` | `2097152` (2 MiB) | rendered output, checked as the template streams — a runaway loop is cut off mid-render, not after materializing |
+| `INCANT_MAX_RENDER_SECONDS` | `5.0` | render wall-clock budget, checked between template writes; `0` disables |
 
 1 MiB is headroom: renders carry a few KB of variables and mgmt drafts a few KB of
 template. Set the **reverse proxy's body limit to the same value** (nginx

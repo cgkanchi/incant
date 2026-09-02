@@ -342,6 +342,24 @@ def pointer_timeline(
     ]}
 
 
+def _render_check_warning(session: Session, prompt_id: str, sha: str) -> str | None:
+    """§5: making a sha live whose configured test-context render never ran deserves a
+    loud warning — the stored verdict was static-only (snapshot unavailable at commit
+    time), and the commit response that said so is long gone."""
+    row = session.execute(select(models.CommitValidation).where(
+        models.CommitValidation.sha == sha,
+        models.CommitValidation.prompt_id == prompt_id)).scalars().first()
+    if row is None or row.render_checked:
+        return None
+    if session.execute(select(models.TestContext.id).where(
+            models.TestContext.prompt_id == prompt_id).limit(1)).first() is None:
+        return None  # nothing was configured — static-only IS the full check
+    reason = f" ({row.render_skipped_reason})" if row.render_skipped_reason else ""
+    return (f"validation of {sha[:12]} skipped the test-context render{reason} — the "
+            "verdict is static-only; re-commit once the default environment builds to "
+            "run the configured contexts")
+
+
 @router.post("/envs/{env}/pointers")
 def make_live(
     env: str, req: PointerRequest,
@@ -360,8 +378,12 @@ def make_live(
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
     app.invalidate_after_commit(session, env)
-    return {"status": outcome.status, "move_id": outcome.move_id,
-            "rules_version": outcome.rules_version}
+    out = {"status": outcome.status, "move_id": outcome.move_id,
+           "rules_version": outcome.rules_version}
+    warn = _render_check_warning(session, req.prompt_id, req.to_sha)
+    if warn:
+        out["warnings"] = [warn]
+    return out
 
 
 @router.post("/envs/{env}/publish")
@@ -412,9 +434,13 @@ def publish(
     except TargetingError as exc:
         raise HTTPException(400, str(exc))
     app.invalidate_after_commit(session, env)
-    return {"status": outcome.status, "move_id": outcome.move_id,
-            "archived": archived,
-            "rules_version": session.get(models.Environment, env).rules_version}
+    out = {"status": outcome.status, "move_id": outcome.move_id,
+           "archived": archived,
+           "rules_version": session.get(models.Environment, env).rules_version}
+    warn = _render_check_warning(session, req.prompt_id, req.to_sha)
+    if warn:
+        out["warnings"] = [warn]
+    return out
 
 
 @router.post("/envs/{env}/defaults")

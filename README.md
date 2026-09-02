@@ -243,7 +243,8 @@ Chrome/Chromium binary if yours lives elsewhere.
 | `INCANT_OBSERVED_FLAGS_VALUE_CAP` | `50000` | distinct values per (env, flag) before the flag is suppressed as high-cardinality |
 | `INCANT_OBSERVED_FLAGS_TTL_DAYS` | `30` | values unseen this long are pruned (hourly) |
 | `INCANT_MAX_REQUEST_BYTES` | `1048576` (1 MiB) | any request body — 413 up front by Content-Length, or cut off at the cap while a chunked body streams; match the reverse proxy's body limit |
-| `INCANT_MAX_RENDER_BYTES` | `2097152` (2 MiB) | rendered-output cap — an over-budget render is a 422 render error, never a multi-MB response |
+| `INCANT_MAX_RENDER_BYTES` | `2097152` (2 MiB) | rendered-output cap, checked as the template streams — an over-budget render is a 422 render error, never a multi-MB response |
+| `INCANT_MAX_RENDER_SECONDS` | `5.0` | render wall-clock budget, checked between template writes; `0` disables |
 
 ## Deploying
 
