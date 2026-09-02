@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..core import ExtractedVars, extract
 from ..core.ids import validate_project_id, validate_prompt_id
-from ..gitstore import ContentStore, GitStore, validate_source
+from ..gitstore import ContentStore, GitError, GitStore, validate_source
 from ..gitstore.store import ConcurrentUpdate
 from ..targeting.service import bump_content_version
 
@@ -58,6 +58,17 @@ class ConcurrencyError(RegistryError):
         # re-confirm; carry the endpoints so the handler can compute it.
         self.base_sha = base_sha
         self.current_sha = current_sha
+
+
+class DraftDiverged(ConcurrencyError):
+    """The draft's git ref no longer agrees with the DB's recorded revision
+    (``Draft.draft_sha``). Staged draft writes advance the git ref before the outer
+    DB transaction commits, so a failed outer commit can leave git holding NEWER
+    text than the revision the DB (and therefore the recorded approvals) describe.
+    Committing in that state would publish bytes nobody reviewed — commit_draft
+    refuses instead, and the caller re-opens/re-saves the draft to re-sync both
+    sides. base_sha stays None on purpose: the HTTP handler's diff rendering is for
+    version-file conflicts, not for this git/DB disagreement."""
 
 
 @dataclass
@@ -535,6 +546,27 @@ class RegistryService:
     ) -> CommitOutcome:
         d = self._locked_draft(draft_id)
         self._require_draft_status(d, ("open", "approved"), "commit")
+        # The bytes committed below come from GIT (the draft ref's HEAD, via
+        # draft_content), but the review policy is checked against the DB: approvals
+        # count only while reviewed_sha == d.draft_sha (_policy_met/approvals). Draft
+        # writes advance the git ref BEFORE their outer DB transaction commits, so a
+        # failed outer commit can leave git holding newer text than d.draft_sha — and
+        # approvals cast against the recorded (older) revision must never authorize
+        # publishing text nobody reviewed. Refuse on any git/DB disagreement, before
+        # any other check runs on state that may be describing the wrong bytes.
+        try:
+            ref_head = self.git.head(self.git.draft_ref(draft_id))
+        except GitError:
+            # A missing ref is the same disagreement (the boot sweep discards such
+            # drafts); without this, draft_content would quietly commit "".
+            ref_head = None
+        if ref_head != d.draft_sha:
+            raise DraftDiverged(
+                f"draft {draft_id!r}'s git content ({(ref_head or 'missing')[:12]}) has "
+                f"diverged from its recorded revision ({(d.draft_sha or 'none')[:12]}) — "
+                "likely a previously failed save. Re-open the draft and re-save its "
+                "content, then review and commit again."
+            )
         version = self.s.execute(select(models.Version).where(
             models.Version.prompt_id == d.prompt_id,
             models.Version.number == d.version_number,
@@ -713,6 +745,22 @@ class RegistryService:
         ).scalars())
 
     def set_refinement(self, prompt_id: str, version_number: int, name: str, **fields):
+        # A refinement recorded against a prompt/version that doesn't exist is
+        # dormant config: a typo'd write would silently activate if that prompt or
+        # version is created later. Refuse at write time, where the author can fix
+        # it. (Service-level check on purpose — refinements have no FK to versions.)
+        if not self.prompt_exists(prompt_id):
+            raise RegistryError(f"unknown prompt {prompt_id!r}")
+        version_exists = self.s.execute(
+            select(models.Version.id).where(
+                models.Version.prompt_id == prompt_id,
+                models.Version.number == version_number,
+            )
+        ).first() is not None
+        if not version_exists:
+            raise RegistryError(
+                f"unknown version {version_number} for prompt {prompt_id!r} — commit "
+                "the version before refining its variables")
         existing = self.s.execute(
             select(models.VariableRefinement).where(
                 models.VariableRefinement.prompt_id == prompt_id,
@@ -739,6 +787,11 @@ class RegistryService:
         ).scalars())
 
     def set_test_context(self, prompt_id: str, name: str, flags: dict, variables: dict):
+        # Same dormant-config hazard as set_refinement: a test context saved under a
+        # typo'd prompt id would silently start gating validation the moment a prompt
+        # with that name appears. The prompt must already exist.
+        if not self.prompt_exists(prompt_id):
+            raise RegistryError(f"unknown prompt {prompt_id!r}")
         existing = self.s.execute(
             select(models.TestContext).where(
                 models.TestContext.prompt_id == prompt_id, models.TestContext.name == name

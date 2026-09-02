@@ -186,6 +186,41 @@ def test_stdio_transport_end_to_end(server):
     assert ev["version"] == 2 and ev["matched_rule"]["id"] == "team-x-tip"
 
 
+# ── safety annotations (Finding F11) ─────────────────────────────────────────
+
+def test_tool_safety_annotations_do_not_understate_destructive_actions():
+    """A host may gate on destructiveHint, so a combined tool must carry its most
+    destructive action's class: archive/discard/delete/overwrite ⇒ destructive;
+    only purely additive writes stay non-destructive. No live server needed —
+    annotations are declared at build time."""
+    m = create_server("http://127.0.0.1:9", "unused-key")  # no HTTP at build time
+    tools = {t.name: t for t in asyncio.run(m.list_tools())}
+
+    read_only = {"list_prompts", "get_prompt", "list_rules", "get_publish_history",
+                 "get_targeting_history", "get_audit", "list_environments",
+                 "render_prompt", "evaluate_targeting", "diff_versions"}
+    additive = {"create_prompt", "commit_draft", "review_draft"}
+    destructive = {
+        "edit_draft",           # action='discard'; 'update' can replace content
+        "set_prompt_metadata",  # 'version' can archive; refine/test_context overwrite
+        "upsert_rule",          # overwrites an existing rule's live targeting
+        "set_rule_status",      # 'paused'/'archived' drop a cohort to the default
+        "upsert_segment",       # overwrites a live audience definition
+        "publish_prompt", "rollback_pointer", "set_default", "kill_switch",
+        "rollback_targeting",
+    }
+    assert set(tools) == read_only | additive | destructive  # nothing unclassified
+
+    for name in sorted(read_only):
+        assert tools[name].annotations.read_only_hint is True, name
+    for name in sorted(additive):
+        a = tools[name].annotations
+        assert a.read_only_hint is False and a.destructive_hint is False, name
+    for name in sorted(destructive):
+        a = tools[name].annotations
+        assert a.read_only_hint is False and a.destructive_hint is True, name
+
+
 def test_renderer_key_falls_back_to_serving_listing(server):
     import urllib.request
     req = urllib.request.Request(

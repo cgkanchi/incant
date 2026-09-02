@@ -629,6 +629,15 @@ class TargetingService:
 
     def set_kill(self, env_id: str, prompt_id: str, engaged: bool) -> models.KillSwitch:
         env = self._env(env_id)
+        # A kill row for a prompt the registry doesn't know is dormant config: it
+        # would take effect the moment a prompt with that (typo'd) name is created.
+        # A kill switch must name a real prompt — fail loudly at write time instead.
+        # Service-level check on purpose: KillSwitch has no FK to prompts, and the
+        # models are owned by another change stream.
+        if self.s.get(models.Prompt, prompt_id) is None:
+            raise TargetingError(
+                f"unknown prompt {prompt_id!r} — a kill switch must name an existing "
+                "prompt")
         existing = self.s.execute(
             select(models.KillSwitch).where(
                 models.KillSwitch.environment_id == env_id,

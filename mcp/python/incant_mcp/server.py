@@ -22,6 +22,11 @@ from incant_sdk import IncantError
 
 from ._client import Mgmt
 
+# Safety classes for tool annotations. WRITE is for purely additive tools —
+# nothing existing can be archived, discarded, deleted, or overwritten by any of
+# the tool's documented actions. A combined tool takes the annotation of its most
+# destructive action (a host may gate on destructiveHint, so understating one
+# action would let it run ungated).
 READ = ToolAnnotations(readOnlyHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
 DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
@@ -211,7 +216,9 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
         except Exception as exc:
             raise _err(exc)
 
-    @mcp.tool(annotations=WRITE)
+    # DESTRUCTIVE: action='discard' abandons a draft and 'update' replaces its
+    # content (unconditionally when base_revision is omitted).
+    @mcp.tool(annotations=DESTRUCTIVE)
     def edit_draft(action: str, prompt_id: str | None = None,
                    version_number: int | None = None, draft_id: str | None = None,
                    content: str | None = None, base_revision: str | None = None,
@@ -298,7 +305,10 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
         except Exception as exc:
             raise _err(exc)
 
-    @mcp.tool(annotations=WRITE)
+    # DESTRUCTIVE: action='version' can archive a version (status='archived'
+    # retires it from serving/drafts) or move its label; 'refine'/'test_context'
+    # overwrite an existing refinement/test context of the same name.
+    @mcp.tool(annotations=DESTRUCTIVE)
     def set_prompt_metadata(action: str, prompt_id: str, version: int | None = None,
                             notes: str | None = None,
                             status: str | None = None, name: str | None = None,
@@ -381,7 +391,9 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
         except Exception as exc:
             raise _err(exc)
 
-    @mcp.tool(annotations=WRITE)
+    # DESTRUCTIVE: upserting an existing rule id overwrites that rule's live
+    # targeting (condition/serve/priority) in place.
+    @mcp.tool(annotations=DESTRUCTIVE)
     def upsert_rule(rule: dict, environment: str | None = None) -> dict:
         """Create or update a targeting rule. Shape: {id, prompt_id, priority,
         when: <condition>, serve: {version, at: 'live'|'tip'|'sha' [, sha]},
@@ -397,7 +409,9 @@ def create_server(url: str, key: str, *, read_only: bool = False) -> MCPServer:
         except Exception as exc:
             raise _err(exc)
 
-    @mcp.tool(annotations=WRITE)
+    # DESTRUCTIVE: 'paused'/'archived' turn a live rule off — its cohort drops to
+    # the environment default immediately.
+    @mcp.tool(annotations=DESTRUCTIVE)
     def set_rule_status(rule_id: str, status: str,
                         environment: str | None = None) -> dict:
         """Flip a rule's status: 'active', 'paused', or 'archived'. Archiving a

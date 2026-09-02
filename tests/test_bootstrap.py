@@ -187,3 +187,64 @@ def test_unsafe_bootstrap_remote_or_key_fails_the_boot(tmp_path):
     with pytest.raises(RuntimeError, match="BOOTSTRAP_REMOTE.*remote-helper"):
         with _boot(tmp_path / "b", bootstrap_remote="ext::sh -c id"):
             pass
+
+
+# ── seed-example: concurrency + atomicity (Finding F10) ──────────────────────
+
+def test_concurrent_seed_requests_serialize_exactly_one_wins(tmp_path):
+    """Two racing seed POSTs used to both pass the empty-library check. The
+    transaction-level advisory lock serializes them and the post-lock re-check
+    refuses the loser — exactly one 200, one 409, one seeded dataset."""
+    import threading
+
+    with _boot(tmp_path) as client:
+        results: dict[str, int] = {}
+        barrier = threading.Barrier(2)
+
+        def post(name: str) -> None:
+            barrier.wait()  # maximize overlap: both requests start together
+            results[name] = client.post("/mgmt/seed-example", headers=auth()).status_code
+
+        threads = [threading.Thread(target=post, args=(n,)) for n in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        assert sorted(results.values()) == [200, 409], results
+
+        # One dataset, not two: the seeded lineage exists exactly once.
+        vs = client.get("/mgmt/prompts/support/system/versions?environment=prod",
+                        headers=auth())
+        assert vs.status_code == 200, vs.text
+        assert sorted(v["version"] for v in vs.json()["versions"]) == [1, 2, 3]
+
+
+def test_failed_seed_rolls_back_completely_and_retry_succeeds(tmp_path, monkeypatch):
+    """A mid-seed failure must leave NO committed prompts (the whole seed shares
+    the request transaction) — otherwise the partial library would 409 every
+    retry forever."""
+    from incant.registry.service import RegistryService
+
+    with _boot(tmp_path) as client:
+        def boom(self, *a, **k):
+            raise RuntimeError("mid-seed failure (injected)")
+
+        # set_test_context runs late in the seed — after every prompt/version/rule
+        # landed in the (uncommitted) transaction — so this exercises a worst-case
+        # partial seed.
+        monkeypatch.setattr(RegistryService, "set_test_context", boom)
+        with pytest.raises(RuntimeError, match="mid-seed"):
+            client.post("/mgmt/seed-example", headers=auth())
+
+        # Everything rolled back: the library is still empty...
+        s0 = client.get("/mgmt/setup-status", headers=auth()).json()
+        assert s0["prompts"] == 0
+
+        # ...so a retry is ACCEPTED and completes (before the fix the partial
+        # seed's prompts made every retry refuse with 409).
+        monkeypatch.undo()
+        r = client.post("/mgmt/seed-example", headers=auth())
+        assert r.status_code == 200, r.text
+        assert r.json()["renderer_key"].startswith("incant_sk_")
+        s1 = client.get("/mgmt/setup-status", headers=auth()).json()
+        assert s1["prompts"] > 0

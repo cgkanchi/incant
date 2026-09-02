@@ -9,7 +9,11 @@ refinements, and test contexts.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import Iterator
+
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from . import models
 from .db import session_scope
@@ -56,16 +60,38 @@ def _author(ctx: AppContext, s, prompt_id, version, content, author, message, *,
     return out
 
 
-def seed(ctx: AppContext | None = None) -> str:
+def seed(ctx: AppContext | None = None, *, session: Session | None = None) -> str:
     """Plant the design's example dataset. Callable from the CLI (fresh context)
     or in-process from the mgmt seed-example endpoint (the running app's context).
     Seeds into the deployment's existing project when one is already named (the
-    setup screen's optional project field), else creates "support"."""
+    setup screen's optional project field), else creates "support".
+
+    ``session``: when given, the ENTIRE seed runs inside that session's one
+    transaction — nothing here commits; the caller owns the boundary. The mgmt
+    seed-example endpoint passes its request session so a mid-seed failure rolls
+    the whole dataset back instead of stranding a partial library (each staged
+    git publish chains on the session's pending-promotion machinery and only
+    promotes to main when the caller commits; a rollback discards the pending
+    refs). Without it (the CLI path) every block commits separately, as before —
+    the interactive operator can inspect and rerun, and the CLI has no outer
+    transaction to join."""
     if ctx is None:
         ctx = AppContext()
         ctx.initialize()
 
-    with session_scope() as s:
+    if session is None:
+        scope = session_scope
+    else:
+        caller_session = session
+
+        @contextmanager
+        def scope() -> Iterator[Session]:
+            # Single-transaction mode: flush (never commit) at each block's end so
+            # later blocks read earlier writes while atomicity stays with the caller.
+            yield caller_session
+            caller_session.flush()
+
+    with scope() as s:
         # One project per deployment: adopt the bound one, or name it "support".
         existing = s.execute(select(models.Project.id)).scalars().first()
     project = existing or "support"
@@ -73,7 +99,7 @@ def seed(ctx: AppContext | None = None) -> str:
     v2_warm = SYSTEM_V2_WARM.replace("support/", f"{project}/")
     v3_voice = SYSTEM_V3_VOICE.replace("support/", f"{project}/")
 
-    with session_scope() as s:
+    with scope() as s:
         ensure_bootstrap_admin(s, ctx.settings.bootstrap_admin_key)
         # Environments — the example's demo state is ENFORCED, not just created:
         # boot pre-creates the default env unprotected, and the dataset's story
@@ -90,7 +116,7 @@ def seed(ctx: AppContext | None = None) -> str:
         # example's demo state (policy 1) regardless of how the project began.
         p.review_policy = 0
 
-    with session_scope() as s:
+    with scope() as s:
         # Shared fragment first (referenced by support/system).
         _author(ctx, s, f"{project}/style/language-rules", 1, LANGUAGE_RULES_V1, "Rae", "language rules v1")
         _author(ctx, s, f"{project}/style/language-rules", 2,
@@ -99,7 +125,7 @@ def seed(ctx: AppContext | None = None) -> str:
         ctx.targeting(s, "Rae").set_default("prod", f"{project}/style/language-rules", 1)
         ctx.targeting(s, "Rae").set_default("staging", f"{project}/style/language-rules", 1)
 
-    with session_scope() as s:
+    with scope() as s:
         # support/system v1 (archived), v2 (live + tip ahead +2), v3 (the beta voice).
         _author(ctx, s, f"{project}/system", 1,
                 "You are a support agent for {{ customer_name }}.", "Jamie", "v1 initial")
@@ -107,7 +133,7 @@ def seed(ctx: AppContext | None = None) -> str:
             models.Version.prompt_id == f"{project}/system", models.Version.number == 1)).scalar_one()
         v.status = "archived"
 
-    with session_scope() as s:
+    with scope() as s:
         # v2 first commit = live pointer target
         _author(ctx, s, f"{project}/system", 2, SYSTEM_V2_FORMAL, "Dana",
                 "v2 formal baseline")
@@ -122,7 +148,7 @@ def seed(ctx: AppContext | None = None) -> str:
         ctx.targeting(s, "Sam").set_default("prod", f"{project}/system", 2)
         ctx.targeting(s, "Sam").set_default("staging", f"{project}/system", 2)
 
-    with session_scope() as s:
+    with scope() as s:
         # v3: the new voice, tested with a beta cohort before it becomes the default
         out3 = _author(ctx, s, f"{project}/system", 3, v3_voice, "Maya",
                        "v3 voice rewrite", make_live=True)
@@ -130,7 +156,7 @@ def seed(ctx: AppContext | None = None) -> str:
         ctx.targeting(s, "Maya").make_live("staging", f"{project}/system", 3, out3.sha,
                                            comment="v3 to staging")
 
-    with session_scope() as s:
+    with scope() as s:
         _author(ctx, s, f"{project}/greeting", 1,
                 "Hello {{ customer_name }} — thanks for reaching out. How can I help?",
                 "Maya", "greeting v1")
@@ -143,7 +169,7 @@ def seed(ctx: AppContext | None = None) -> str:
                 "Dana", "triage v1")
         ctx.targeting(s, "Dana").set_default("prod", f"{project}/escalation/triage", 1)
 
-    with session_scope() as s:
+    with scope() as s:
         tgt = ctx.targeting(s, "Dana")
         # v3 needs a prod live pointer for "v3 @ live" rule targets to resolve.
         v3 = s.execute(select(models.CommitValidation).where(
@@ -170,7 +196,7 @@ def seed(ctx: AppContext | None = None) -> str:
             "serve": {"version": 2, "at": "tip"},
         })
 
-    with session_scope() as s:
+    with scope() as s:
         reg = ctx.registry(s, "system")
         reg.set_test_context(f"{project}/system", "enterprise-us",
                              {"tier": "enterprise", "region": "us"},
@@ -182,7 +208,7 @@ def seed(ctx: AppContext | None = None) -> str:
                            description="The customer's company or name.")
         reg.set_refinement(f"{project}/system", 2, "history", type="list", required=False, default=[])
 
-    with session_scope() as s:
+    with scope() as s:
         # Review policy on support; an open draft to populate the review/editor screens.
         proj = s.get(models.Project, project)
         proj.review_policy = 1
@@ -191,7 +217,7 @@ def seed(ctx: AppContext | None = None) -> str:
                          title="Warm tone + shared style fragment", content=v2_warm)
 
     # A renderer service key scoped to (support, prod).
-    with session_scope() as s:
+    with scope() as s:
         import uuid
         raw = "incant_sk_" + uuid.uuid4().hex
         pid = f"p_render_{project}"

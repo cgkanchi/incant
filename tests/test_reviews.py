@@ -98,3 +98,61 @@ def test_add_review_normal_upsert_is_single_row(app):
             select(models.Review).where(models.Review.draft_id == draft_id)
         ).scalars().all()
         assert len(rows) == 1 and rows[0].state == "approved"
+
+
+# ── git/DB draft agreement: the commit gate (Finding F1) ─────────────────────
+#
+# commit_draft reads the BYTES from git (the draft ref's HEAD) but checks the
+# review policy against the DB (approvals bound to Draft.draft_sha). Draft writes
+# advance the git ref before their outer DB transaction commits, so a failed
+# outer commit can leave git ahead of the DB — and approvals cast against the
+# recorded revision must not authorize publishing text nobody reviewed.
+
+def test_commit_refuses_when_git_draft_ref_diverges_from_db(app):
+    from incant.registry.service import DraftDiverged
+
+    draft_id = _open_draft(app)
+    with session_scope() as s:
+        # One-approval policy; bob approves the CURRENT (recorded) revision.
+        s.get(models.Project, "support").review_policy = 1
+    with session_scope() as s:
+        app.registry(s, "bob").add_review(draft_id, reviewer="bob", state="approved")
+        approved_sha = app.registry(s, "bob").get_draft(draft_id).draft_sha
+
+    # Simulate the failed-outer-commit residue: the git ref advances (the staged
+    # write landed) while the DB row still records the approved revision.
+    app.git.write_draft(draft_id, "support/system", 1, "unreviewed {{ y }}",
+                        author_name="sam")
+    assert app.git.head(app.git.draft_ref(draft_id)) != approved_sha
+
+    with session_scope() as s:
+        with pytest.raises(DraftDiverged, match="diverged"):
+            app.registry(s, "sam").commit_draft(draft_id, author="sam")
+
+    # Nothing landed: the draft is not committed and no commit was validated —
+    # the unreviewed bytes never became publishable.
+    with session_scope() as s:
+        assert app.registry(s, "sam").get_draft(draft_id).status != "committed"
+        assert s.execute(select(models.CommitValidation)).scalars().all() == []
+
+
+def test_commit_recovers_after_resync_and_matching_draft_commits(app):
+    from incant.registry.service import DraftDiverged
+
+    draft_id = _open_draft(app)
+    app.git.write_draft(draft_id, "support/system", 1, "diverged {{ y }}",
+                        author_name="sam")
+    with session_scope() as s:
+        with pytest.raises(DraftDiverged):
+            app.registry(s, "sam").commit_draft(draft_id, author="sam")
+
+    # The prescribed recovery — re-save through the service — re-syncs git and DB
+    # (put_draft_content records the new revision), after which a matching draft
+    # commits normally.
+    with session_scope() as s:
+        reg = app.registry(s, "sam")
+        reg.put_draft_content(draft_id, "resynced {{ x }}", author="sam")
+        out = reg.commit_draft(draft_id, author="sam")
+        assert out.validation["status"] == "valid"
+    with session_scope() as s:
+        assert app.registry(s, "sam").get_draft(draft_id).status == "committed"

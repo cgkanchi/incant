@@ -310,6 +310,18 @@ def setup_status(
     }
 
 
+# Serializes concurrent example seeds (transaction-level advisory lock, so it
+# releases automatically at commit OR rollback). ASCII "IncS" — distinct from
+# db.py's full-writer session lock ("Inc2" = 0x496E6332).
+_SEED_LOCK_KEY = 0x496E6353
+
+
+def _refuse_if_library_nonempty(session: Session) -> None:
+    if session.execute(select(models.Prompt.id).limit(1)).first() is not None:
+        raise HTTPException(409, "the library already has prompts — the example "
+                                 "dataset only loads into an empty deployment")
+
+
 @router.post("/seed-example")
 def seed_example(
     app: AppContext = Depends(app_context),
@@ -318,17 +330,32 @@ def seed_example(
 ):
     """Load the design's example dataset into an EMPTY library — the fastest way
     to see the product. One-shot and gated: refused the moment any prompt exists,
-    so it can never pollute a real instance."""
+    so it can never pollute a real instance.
+
+    Concurrency + atomicity: two racing POSTs could once both pass the empty check
+    and double-seed, and a mid-seed failure stranded a partial library (whose
+    prompts then made every retry refuse). Now the whole seed (a) serializes on a
+    transaction-level advisory lock with the emptiness re-checked after acquiring
+    it, and (b) runs inside THIS request's one transaction (seed(session=...)), so
+    any failure rolls the entire dataset back — get_session rolls back on the
+    exception, which also releases the lock. Staged git publishes only promote to
+    main when this transaction commits; a rollback discards their pending refs
+    (stray draft refs are swept by boot reconcile)."""
     _require(ident, "admin")
-    if session.execute(select(models.Prompt.id).limit(1)).first() is not None:
-        raise HTTPException(409, "the library already has prompts — the example "
-                                 "dataset only loads into an empty deployment")
+    _refuse_if_library_nonempty(session)  # fast path: refuse before waiting on the lock
+    session.execute(select(func.pg_advisory_xact_lock(_SEED_LOCK_KEY)))
+    # Re-check AFTER the lock: a concurrent seed's commit (which released its lock)
+    # becomes visible to this READ COMMITTED transaction's next statement.
+    _refuse_if_library_nonempty(session)
     from ...seed import seed as run_seed
-    renderer_key = run_seed(app)
+    renderer_key = run_seed(app, session=session)
     # The seed lands in the deployment's bound project (or names it "support").
     project = session.execute(select(models.Project.id)).scalars().first()
     record_audit(session, ident.name, "seed.example", "project", project or "support")
-    app.invalidate()
+    # Nothing is committed yet (single transaction), so snapshot/auth invalidation
+    # must wait for the commit — an immediate invalidate could let a concurrent
+    # request cache a rebuild of the still-empty pre-commit state.
+    app.invalidate_after_commit(session)
     app.invalidate_auth_after_commit(session)
     return {"ok": True, "renderer_key": renderer_key, "project": project,
             "note": "store the renderer key now; it is not shown again"}
