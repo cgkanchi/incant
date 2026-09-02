@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from ..core.ids import validate_project_id, validate_prompt_id
 from ..core.parse import parse_condition, parse_serve
@@ -107,8 +107,11 @@ class VersionUpdateRequest(BaseModel):
 
 
 class CreateDraftRequest(BaseModel):
-    version_number: Optional[int] = None      # None => allocate a new version
-    seed_from_version: Optional[int] = None
+    # StrictInt + ge=1: pydantic's lax mode coerces True → 1 (bool is an int
+    # subclass) and "3" → 3, so a mistyped body would silently become a real
+    # version number; 0/negative would only surface deep in the registry.
+    version_number: Optional[StrictInt] = Field(default=None, ge=1)  # None => allocate a new version
+    seed_from_version: Optional[StrictInt] = Field(default=None, ge=1)
     # With seed_from_version: seed from that version's content AT THIS COMMIT rather
     # than its tip. The UI passes the live pointer's sha when creating a new version,
     # so unpublished (possibly deliberately rolled-back) tip edits don't resurrect.
@@ -138,7 +141,9 @@ class DraftRenderRequest(BaseModel):
 class ReviewRequest(BaseModel):
     # `reviewer` is ignored — the reviewer is the authenticated principal.
     reviewer: Optional[str] = None
-    state: str = "approved"                     # "approved" | "changes_requested"
+    # Literal, not str: an unknown state must 422 here rather than travel to the
+    # DB CHECK constraint (a 500 wearing an IntegrityError).
+    state: Literal["approved", "changes_requested"] = "approved"
 
 
 class CommentRequest(BaseModel):

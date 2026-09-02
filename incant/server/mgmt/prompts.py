@@ -383,7 +383,16 @@ def diff_versions(
     if mode == "rendered":
         reg = app.registry(session)
         tcs = reg.get_test_contexts(prompt_id)
-        tc = next((t for t in tcs if t.name == test_context), tcs[0] if tcs else None)
+        if test_context:
+            # A NAMED context must match or refuse — silently falling back to the
+            # FIRST context would show the reviewer a diff for a different scenario
+            # than the one they asked for.
+            tc = next((t for t in tcs if t.name == test_context), None)
+            if tc is None:
+                raise HTTPException(
+                    404, f"unknown test context {test_context!r} for {prompt_id}")
+        else:
+            tc = tcs[0] if tcs else None  # unnamed: default to the first, as before
         flags = tc.flags if tc else {}
         variables = tc.variables if tc else {}
         try:

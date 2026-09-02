@@ -131,10 +131,14 @@ class EnvSnapshot:
 
     # -- convenience accessors --------------------------------------------
 
+    # Rules sort by (priority, id): id is the stable tiebreak so two rules at the SAME
+    # priority resolve identically on every rebuild and every replica — sorting by
+    # priority alone left equal-priority order to whatever sequence the rows arrived in
+    # (Python's sort is stable, so input order leaked through).
     def prompt_rules(self, prompt_id: str) -> list[Rule]:
         return sorted(
             (r for r in self.rules if r.prompt_id == prompt_id and r.status == "active"),
-            key=lambda r: r.priority,
+            key=lambda r: (r.priority, r.id),
         )
 
     def version_info(self, prompt_id: str, version: int) -> VersionInfo | None:

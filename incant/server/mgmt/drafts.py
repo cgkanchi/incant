@@ -120,10 +120,15 @@ def render_draft(
     source = reg.draft_content(draft_id)
     flags, variables = req.flags, req.variables
     if req.test_context:
-        for tc in reg.get_test_contexts(d.prompt_id):
-            if tc.name == req.test_context:
-                flags, variables = tc.flags, tc.variables
-                break
+        tc = next((t for t in reg.get_test_contexts(d.prompt_id)
+                   if t.name == req.test_context), None)
+        if tc is None:
+            # A NAMED context that doesn't exist must refuse, not silently fall back
+            # to the request's flags/variables — the reviewer would be testing a
+            # different scenario than the one they asked for.
+            raise HTTPException(
+                404, f"unknown test context {req.test_context!r} for {d.prompt_id}")
+        flags, variables = tc.flags, tc.variables
     try:
         text = app.render_draft_source(session, req.environment, d.prompt_id, source, flags, variables)
     except ServingError as exc:
@@ -169,7 +174,15 @@ def diff_draft(
             tc, ctx_name = None, "custom"
         else:
             tcs = reg.get_test_contexts(d.prompt_id)
-            tc = next((t for t in tcs if t.name == test_context), tcs[0] if tcs else None)
+            if test_context:
+                # A NAMED context must match or refuse — falling back to the first
+                # context would diff a different scenario than the one asked for.
+                tc = next((t for t in tcs if t.name == test_context), None)
+                if tc is None:
+                    raise HTTPException(
+                        404, f"unknown test context {test_context!r} for {d.prompt_id}")
+            else:
+                tc = tcs[0] if tcs else None  # unnamed: default to the first, as before
             fl = tc.flags if tc else {}
             vb = tc.variables if tc else {}
             ctx_name = tc.name if tc else None

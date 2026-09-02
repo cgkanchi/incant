@@ -316,10 +316,16 @@ class GitStore:
         except GitError:
             return []
         rows: list[CommitInfo] = []
-        for line in out.splitlines():
+        # split("\n"), NOT splitlines(): the subject (%s) is user-controlled and may
+        # contain \x1c/\x1d/\x1e, which splitlines() treats as line breaks — git
+        # itself never puts a newline in %s (embedded newlines fold to spaces), so
+        # plain "\n" is the only true line boundary here.
+        for line in out.split("\n"):
             if not line.strip():
                 continue
-            sha, an, ae, ai, subj = line.split("\x1f")
+            # %s is deliberately the LAST field: cap the split so a subject that
+            # itself contains \x1f keeps its bytes instead of raising on unpack.
+            sha, an, ae, ai, subj = line.split("\x1f", 4)
             rows.append(CommitInfo(sha, an, ae, ai, subj))
         return rows
 
@@ -382,12 +388,19 @@ class GitStore:
             if path.endswith(suffix):
                 decided.add(path)
 
-        for record in out.split("\x1e"):
+        # Records split on "\n\x1e", not bare "\x1e": the subject (%s) is
+        # user-controlled and may contain a literal \x1e, but git NEVER emits a
+        # newline inside %s (embedded newlines fold to spaces), so \x1e preceded by
+        # a newline can only be a true record boundary. A subject's own \x1e stays
+        # inside its header line, where the capped field split below keeps it (and
+        # any \x1f bytes) in `subj` — %s is deliberately the last field.
+        for record in out.split("\n\x1e"):
+            record = record.removeprefix("\x1e")  # the very first record has no leading \n
             record = record.strip("\n")
             if not record:
                 continue
             header, *changes = record.split("\n")
-            sha, an, ae, ai, subj = header.split("\x1f")
+            sha, an, ae, ai, subj = header.split("\x1f", 4)
             info = CommitInfo(sha, an, ae, ai, subj)
             for line in changes:
                 if not line.strip():

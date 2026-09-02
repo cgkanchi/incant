@@ -316,7 +316,10 @@ def test_version_metadata_and_archive_lifecycle_endpoint(client):
     r = client.post("/prompt/support/system", headers=auth(client.renderer_key),
                     json={"environment": "prod", "flags": {"tier": "vip"},
                           "variables": {"customer_name": "Acme", "history": []}})
-    assert r.json()["matched_rule"] == {"scope": "prompt", "id": "to-v3"}
+    # Both rules sit at priority 1 and serve v3; equal priorities now break ties by
+    # rule id (deterministic), so "archived-target" < "to-v3" wins the match.
+    assert r.json()["matched_rule"] == {"scope": "prompt", "id": "archived-target"}
+    assert r.json()["versions"]["support/system"]["version"] == 3
 
 
 def test_overview_flags_unpublished_newer_version(client):

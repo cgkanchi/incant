@@ -67,13 +67,26 @@ def _parse_pin(pin: dict | None) -> tuple[dict | None, int | None]:
             rules_version = rv
     else:
         versions = pin  # bare versions map (back-compat)
+    # `pin.versions` must be an object — a string/list would AttributeError on
+    # .items() below (a 500 for what is purely a caller-shape mistake).
+    if not isinstance(versions, dict):
+        raise HTTPException(
+            422, "pin.versions must be an object mapping prompt ids to "
+                 f"{{version, commit}} entries, got {type(versions).__name__}")
     out: dict[str, tuple[int, str]] = {}
-    for pid, entry in (versions or {}).items():
+    for pid, entry in versions.items():
         try:
-            version = int(entry["version"])
+            version = entry["version"]
             commit = str(entry["commit"])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError):
             raise HTTPException(422, f"invalid pin entry for {pid!r}")
+        # Strict positive int only: int() would truncate 1.9 → 1 and bool is an int
+        # subclass (True → 1), either of which silently "replays" a version the
+        # caller never served — the opposite of what a §9 pin promises.
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise HTTPException(
+                422, f"pin for {pid!r}: version must be a positive integer, "
+                     f"got {version!r}")
         if not _FULL_SHA.fullmatch(commit):
             raise HTTPException(
                 422,

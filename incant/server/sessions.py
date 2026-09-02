@@ -260,6 +260,10 @@ def change_password(
     """Change the signed-in user's own password (cookie + CSRF). Requires the
     current password, and signs out every OTHER session — a stolen session must not
     survive the owner rotating their credential."""
+    # Same gate the sign-in/invite doors use: wrong current-password attempts are
+    # recorded below, so without the gate a stolen session could brute-force the
+    # current password unthrottled (each failure counted, never enforced).
+    _throttle_gate(request)
     ident = _authenticate(request, session, None, allow_cookie=True)
     row = lookup_session(session, request.cookies.get(SESSION_COOKIE) or "")
     if row is None:

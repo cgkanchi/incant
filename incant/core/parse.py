@@ -21,10 +21,20 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REMOVED_CONDITION_KEYS = {"segment"}
 _REMOVED_SERVE_KEYS = {"label", "rollout"}
 
+# Both this parser and the evaluator recurse over the condition tree, so an unbounded
+# ~1200-deep {"not": {...}} chain would hit Python's recursion limit — a 500 at rule
+# save AND at every snapshot rebuild once stored. No legitimate targeting condition
+# approaches this; cap it with a clean ValueError that maps to a 422 through RuleRequest.
+_MAX_CONDITION_DEPTH = 100
 
-def parse_condition(data: Any) -> Condition:
+
+
+def parse_condition(data: Any, _depth: int = 0) -> Condition:
     if data is None:
         return None
+    if _depth >= _MAX_CONDITION_DEPTH:
+        raise ValueError(
+            f"condition nested too deep (more than {_MAX_CONDITION_DEPTH} levels)")
     if not isinstance(data, dict):
         raise ValueError(f"condition must be an object or null, got {type(data).__name__}")
     if _REMOVED_CONDITION_KEYS & set(data):
@@ -36,15 +46,15 @@ def parse_condition(data: Any) -> Condition:
     if "all" in data:
         if set(data) != {"all"} or not isinstance(data["all"], list):
             raise ValueError("an 'all' condition must contain only a list-valued 'all'")
-        return All(tuple(parse_condition(c) for c in data["all"]))
+        return All(tuple(parse_condition(c, _depth + 1) for c in data["all"]))
     if "any" in data:
         if set(data) != {"any"} or not isinstance(data["any"], list):
             raise ValueError("an 'any' condition must contain only a list-valued 'any'")
-        return Any_(tuple(parse_condition(c) for c in data["any"]))
+        return Any_(tuple(parse_condition(c, _depth + 1) for c in data["any"]))
     if "not" in data:
         if set(data) != {"not"}:
             raise ValueError("a 'not' condition must contain only 'not'")
-        return Not(parse_condition(data["not"]))
+        return Not(parse_condition(data["not"], _depth + 1))
     # "flag"
     allowed = {"flag", "op", "value", "values"}
     if set(data) - allowed:

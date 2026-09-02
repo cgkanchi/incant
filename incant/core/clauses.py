@@ -26,6 +26,20 @@ def _semver_tuple(v: Any) -> tuple[int, ...] | None:
         return None
 
 
+def _eq(a: Any, b: Any) -> bool:
+    """Equality that never crosses the bool/number line.
+
+    bool is an int subclass, so Python's ``==`` says ``True == 1`` and
+    ``False == 0`` — which would silently place a user whose flag is a number
+    into a cohort keyed on a boolean (and vice versa). Exactly one side being a
+    bool is therefore never a match; otherwise plain ``==`` (which already keeps
+    strings distinct from numbers, and int/float numerically comparable).
+    """
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return a == b
+
+
 def eval_clause(clause: Clause, flags: Mapping[str, Any]) -> bool:
     op = clause.op
     present = clause.flag in flags
@@ -41,14 +55,16 @@ def eval_clause(clause: Clause, flags: Mapping[str, Any]) -> bool:
     vs = clause.values
 
     try:
+        # eq/neq and membership go through _eq so True never matches 1 (nor False, 0);
+        # ordering operators (gt/lt/semver) keep Python semantics untouched.
         if op == "eq":
-            return actual == v
+            return _eq(actual, v)
         if op == "neq":
-            return actual != v
+            return not _eq(actual, v)
         if op == "in":
-            return actual in vs
+            return any(_eq(actual, x) for x in vs)
         if op == "not_in":
-            return actual not in vs
+            return not any(_eq(actual, x) for x in vs)
         if op == "contains":
             return v in actual  # substring / membership
         if op == "starts_with":

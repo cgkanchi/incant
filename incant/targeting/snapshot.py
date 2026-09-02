@@ -216,10 +216,14 @@ def build_snapshot(
     ).scalars().all():
         refinement_defaults[(r.prompt_id, r.version_number)][r.name] = r.default
 
-    # Rules
+    # Rules — ordered (priority, id) so the snapshot's rule list is deterministic at
+    # build time too: without an ORDER BY, Postgres returns rows in whatever order the
+    # planner likes, and equal-priority rules could differ across rebuilds/replicas.
+    # (EnvSnapshot re-sorts with the same key; this keeps snapshots byte-comparable.)
     rules: list[CoreRule] = []
     for r in session.execute(
         select(models.Rule).where(models.Rule.environment_id == env_id)
+        .order_by(models.Rule.priority, models.Rule.id)
     ).scalars().all():
         rules.append(parse_rule({
             "id": r.id, "prompt_id": r.prompt_id,
