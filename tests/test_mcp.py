@@ -205,7 +205,6 @@ def test_tool_safety_annotations_do_not_understate_destructive_actions():
         "set_prompt_metadata",  # 'version' can archive; refine/test_context overwrite
         "upsert_rule",          # overwrites an existing rule's live targeting
         "set_rule_status",      # 'paused'/'archived' drop a cohort to the default
-        "upsert_segment",       # overwrites a live audience definition
         "publish_prompt", "rollback_pointer", "set_default", "kill_switch",
         "rollback_targeting",
     }

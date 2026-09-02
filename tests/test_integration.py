@@ -702,7 +702,8 @@ def test_pre_1_1_state_cannot_be_replayed_or_restored(app):
             app.snapshot_at(s, "prod", legacy_rv)
         assert ei.value.status == 422 and "label" in str(ei.value.detail)
         # …memoized: a retried bad pin is answered without touching the control plane.
-        assert ("prod", legacy_rv) in app._unreplayable
+        # (the key carries the env's incarnation between env id and rules_version.)
+        assert any(k[0] == "prod" and k[-1] == legacy_rv for k in app._unreplayable)
         with pytest.raises(ServingError) as ei2:
             app.snapshot_at(s, "prod", legacy_rv)
         assert ei2.value.detail == ei.value.detail

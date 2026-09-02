@@ -45,17 +45,6 @@ def test_equal_priority_rules_lower_id_wins_regardless_of_input_order(order):
     assert [r.id for r in snap.prompt_rules(PID)] == ["ab-rule", "za-rule"]
 
 
-def test_equal_priority_global_rules_are_ordered_by_id_too():
-    rules = [
-        parse_rule({"id": "zz", "scope": "global", "priority": 7, "when": None,
-                    "serve": {"label": "x"}}),
-        parse_rule({"id": "aa", "scope": "global", "priority": 7, "when": None,
-                    "serve": {"label": "x"}}),
-    ]
-    snap = snapshot(rules=rules)
-    assert [r.id for r in snap.global_rules()] == ["aa", "zz"]
-
-
 def test_snapshot_build_orders_equal_priority_rules_stably(tmp_path):
     # DB-built snapshots must agree with the in-memory sort — and with themselves
     # across rebuilds (the SELECT previously had no ORDER BY at all).

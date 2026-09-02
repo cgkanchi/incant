@@ -137,6 +137,46 @@ fixing):
   fallback — not "one fetch interval"; the boot migration creates `pg_trgm` itself
   (trusted on PG13+; PG12 or allow-listed managed instances must pre-create it).
 
+**Second review pass — correctness, determinism and coherence.**
+
+- **Delete-and-recreate of an environment id no longer serves stale content.** Each
+  environment carries an immutable `incarnation` (migration `d6a1f4c83b57`); a node
+  rebuilds — and drops the old life's replay cache — when the identity changes, closing
+  the ABA where identical `(rules_version, content_version)` counters hid a recreated
+  environment. `rename_env` now carries `content_version` and mints a fresh incarnation.
+- **A slow control-plane poll can no longer overwrite a newer snapshot:** cache swaps are
+  generation-checked and never move an environment backward.
+- **`pin.rules_version` replays judge servability against current state:** the replay
+  cached the validated-commit set and variable defaults at first build, wrongly rejecting
+  (409) a pin naming a later-validated SHA and serving stale defaults; those overlays now
+  refresh from current state each replay. The replay caches are also lock-guarded (a
+  sporadic 500 under concurrency).
+- **Equal-priority rules resolve deterministically** — ties break on rule id in both the
+  evaluator and the snapshot build's SQL ordering, so replicas and rebuilds agree.
+- **Boolean flags no longer compare equal to `0`/`1`** in `eq`/`neq`/`in`/`not_in`: a
+  `true` flag never lands in a cohort keyed on the number `1`.
+- **`commit_draft` refuses when a draft's git content has diverged from its recorded
+  revision** (a failed save's residue), so recorded approvals can never authorize
+  publishing bytes nobody reviewed; re-open/re-save recovers.
+- **Variable refinements, test contexts and kill switches require the named prompt (and,
+  for refinements, version) to exist** — a typo now fails with 404 at the route instead of
+  creating dormant config that activates if that object is later created.
+- **Example seeding is atomic and concurrency-safe:** concurrent seed requests serialize
+  on a Postgres advisory lock (exactly one wins), and a mid-seed failure rolls the whole
+  dataset back so a retry is accepted rather than refused forever.
+- Malformed serving pins (`versions` not an object, a non-integer/`0`/negative/boolean
+  version), draft version numbers and review states are 422s, not 500s or a database
+  constraint error; condition trees are capped at 100 nesting levels (422, not
+  `RecursionError`).
+- History endpoints no longer 500 on commit messages containing field/record separator
+  bytes; git subject parsing is bounded and framing-safe.
+- Naming a nonexistent test context in a draft render or a rendered diff returns 404
+  instead of silently rendering a different scenario. Password change is behind the same
+  per-IP failed-auth throttle as sign-in.
+- MCP tools that can archive, discard or overwrite live state (`edit_draft`,
+  `set_prompt_metadata`, `upsert_rule`, `set_rule_status`) are annotated destructive so
+  hosts gate them correctly.
+
 ## 1.0.0 — 2026-08-31
 
 First stable release.
